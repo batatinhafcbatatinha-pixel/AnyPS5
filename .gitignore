@@ -118,3 +118,4 @@ cookies.txt
 
 # port launcher configuration of this fork
 !/launcher.json
+!/docs/screenshots/*.jpg
