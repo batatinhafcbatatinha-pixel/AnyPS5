@@ -46,13 +46,13 @@
           "pt": "Resolução do jogo",
           "en": "Game resolution",
           "default": 1,
-          "help_pt": "A saída de vídeo que o jogo vê. 1080p desenha bem menos pixels que 4K (mais rápido).",
-          "help_en": "The video output the game sees. 1080p draws far fewer pixels than 4K (faster).",
+          "help_pt": "A saída de vídeo que o console informa ao jogo. Jogos que escolhem a própria resolução ignoram.",
+          "help_en": "The video output the console reports to the game. Games that pick their own resolution ignore it.",
           "choices": [
             {
               "v": 1,
-              "pt": "1080p (mais rápido)",
-              "en": "1080p (faster)"
+              "pt": "1080p",
+              "en": "1080p"
             },
             {
               "v": 2,

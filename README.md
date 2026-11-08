@@ -1,65 +1,96 @@
-**English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [Català](docs/user/README.ca.md) | [Italiano](docs/user/README.it.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md) | [Bahasa Indonesia](docs/user/README.id.md)
+# AnyPS5 (fork with the port launcher)
 
-## This fork: play with the launcher (Windows)
+Fork of [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), a relinker that converts PlayStation 5 executables
+into native Windows and Linux programs (no emulation: the PS5's Zen 2 code runs as it is, the system libraries are
+reimplemented). This fork adds the launcher the other recompilers use, so a game is converted and started from
+**your own decrypted dump** with a few clicks. No game content (dump, executable, data or converted code) is in this
+repository.
 
-Fork of [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5) with the [port launcher](https://github.com/batatinhafcbatatinha-pixel/port-installer)
-used by the other recompilers. No game content is in this repository: the game comes from **your own decrypted dump**.
+## How to play a game
 
-1. `git clone --recurse-submodules https://github.com/batatinhafcbatatinha-pixel/AnyPS5.git` (or **Code > Download ZIP**)
-   and run **`Launcher.cmd`** (it downloads `Launcher.exe` from the port-installer releases the first time).
-2. **File > Add game folders** with the folder that holds your dumps (a dump folder has `eboot.bin` and
-   `sce_sys/param.json`; fake-signed files with `.esbak` backups and decrypted SELF containers both work).
-3. Select the game and **Install**: [`tools/ps5port`](tools/ps5port/ps5port.py) unwraps the executable and modules,
-   converts them with the AnyPS5 relinker (pinned release, downloaded into `.local/tools`) and links the game files
-   in place, nothing copied. It takes a few minutes and needs only Python.
-4. **Play**. **Configure** holds the PC settings (window/fullscreen, game resolution, V-Sync, performance panel,
-   console language, volume, vibration); in the game F10 toggles the performance panel, F11 fullscreen, F12 saves a screenshot.
+Windows 10/11 x64 with a Vulkan GPU and a CPU with AVX2. About 1 GB free per game and a few minutes for the first
+conversion; the game itself is not copied.
 
-Ports live in `.local/ports/<title id>/` (saves, trophies and screenshots in `build/out`); `ps5port.py env --port <dir>`
-prints the AnyPS5 variables the PC settings give.
+1. Get this repository, either way:
+   - `git clone --recurse-submodules https://github.com/batatinhafcbatatinha-pixel/AnyPS5.git`, or
+   - **Code > Download ZIP** and unpack it, or
+   - only [`Launcher.exe`](https://github.com/batatinhafcbatatinha-pixel/port-installer/releases/latest/download/Launcher.exe):
+     run it, pick AnyPS5 and a folder, and it downloads this repository there.
+2. Run **`Launcher.cmd`** (it downloads `Launcher.exe` from the
+   [port-installer releases](https://github.com/batatinhafcbatatinha-pixel/port-installer/releases) the first time).
+3. **File > Add game folders** with the folder that holds your dumps (or drop that folder on the window). A dump
+   folder has `eboot.bin` and `sce_sys/param.json`; the game is recognised by its title id (`PPSA01949`). Fake-signed
+   files with `.esbak` backups and decrypted SELF containers both work; an encrypted dump does not.
+4. Confirm **Install**. The launcher installs Python if it is missing, links the dump into the game's folder (nothing is
+   copied) and [`tools/ps5port`](tools/ps5port/ps5port.py) converts `eboot.bin` and every module with the AnyPS5
+   relinker (pinned release, downloaded into `.local/tools`). No C++ Build Tools are needed. Log: **Log** and
+   `.local/ports/<title id>/setup-log.txt`.
+5. **PLAY**. **Configure** holds the PC settings: window or fullscreen, the output resolution the game is told,
+   V-Sync mode, performance panel and its corner, console language, volume, mute in background, vibration. In the game:
+   F10 performance panel, F11 fullscreen, F12 screenshot, F5/F6/F8 volume and mute.
 
-# About
+Every PS5 game takes the same generic path; there are no per-game profiles. Tested so far:
 
-Tool for automatic executables porting to Linux and Windows.
+| Game | Dump | State |
+| --- | --- | --- |
+| Dreaming Sarah | PPSA02929 | title menu at 60 fps; PC settings checked in game |
+| Control Ultimate Edition | PPSA01949 | reaches gameplay at about 2 fps |
 
-The relinker-only build runs on macOS, including Apple silicon.
+## Differences from upstream
 
-[**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
+- [`tools/ps5port/ps5port.py`](tools/ps5port/ps5port.py): `build` (unwrap the SELF containers, find the module folders,
+  relink for Windows, fill `app0/` with junctions and links to the dump), `play` (PC settings as AnyPS5 variables, log
+  in `build/out/game-log.txt`), `env` (print those variables)
+- launcher + one-click convert/play (`Launcher.cmd`, `launcher.json`, [port-installer](https://github.com/batatinhafcbatatinha-pixel/port-installer)
+  submodule in `tools/port-installer`)
+- the AnyPS5 code itself is upstream's, unchanged
 
-![anyps5_collage1](https://github.com/user-attachments/assets/ed2f0b2d-33d3-46d7-ab88-767ca872fc99)
+## Building
 
-Includes a [relinker](core/relinker) that converts executable to the target system's native format and implementations of [system prx libraries](core/libs/prx) suitable for dynamic linking. No emulation or separate runtime process.
+Nothing is compiled to play: the launcher uses the relinker and Windows system libraries of AnyPS5 release v0.1.4.
+One game without the launcher (the same steps it runs; `-Source` is your dump folder, the port folder is made by the
+launcher's generic path, or copy `setup.json`/`installer.json` from another port):
 
-[**Discord**](https://discord.gg/x9naWVzC6A), [Usage](docs/user/USAGE.md), [Build instructions](docs/dev/BUILD.md), [Architecture](docs/dev/ARCHITECTURE.md), [Technical debt of the project](docs/dev/TechnicalDebt.md), [code style conventions](docs/dev/CONVENTIONS.md), [contributing](CONTRIBUTING.md)
+```bat
+git clone --recurse-submodules https://github.com/batatinhafcbatatinha-pixel/AnyPS5.git
+cd AnyPS5
+powershell -ExecutionPolicy Bypass -File tools\port-installer\setup\setup.ps1 -GameDir .local\ports\PPSA01949 -ToolsDir .local\tools -Source "D:\Dumps\PPSA01949-app0"
+.local\ports\PPSA01949\Play.cmd
+```
 
-## Status
+`ps5port.py build` uses a local AnyPS5 build instead of the release when `ANYPS5_RELINKER` and `ANYPS5_LIBS` point to
+its `relinker.exe` and `libs` folder. Building AnyPS5 itself: [docs/dev/BUILD.md](docs/dev/BUILD.md).
 
-[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![shader forms decoded, counted from the code](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![implemented in 7 days](https://boykopovar.github.io/AnyPS5/badge-week.svg)](https://boykopovar.github.io/AnyPS5/history.html)
+## Screenshots
 
-[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
+Each game at the furthest point it reaches today.
 
-[Progress history](https://boykopovar.github.io/AnyPS5/history.html)
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/screenshots/dreaming-sarah.jpg" alt="Dreaming Sarah" width="100%"><br>
+      <b>Dreaming Sarah</b><br>
+      <sub>PS5 &middot; title menu</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/screenshots/control.jpg" alt="Control Ultimate Edition" width="100%"><br>
+      <b>Control Ultimate Edition</b><br>
+      <sub>PS5 &middot; gameplay, Federal Bureau of Control lobby</sub>
+    </td>
+  </tr>
+</table>
 
-<sub>* System libraries: percentage of the functions known to the project so far (declared in [core/libs/prx](core/libs/prx)), not of every PS5 system function. The total grows as more functions are declared.</sub>
+## Upstream
 
-Unsupported or unexpected states throw a C++ exception, usually `std::runtime_error`. An exception that nothing catches prints its `what()` to stderr and ends the process.
+This repository is a fork of [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5); its documentation is in that
+project's README ([translations](docs/user/)), [usage](docs/user/USAGE.md), [input mapping](docs/user/INPUT_MAPPING.md),
+[architecture](docs/dev/ARCHITECTURE.md) and [progress](https://boykopovar.github.io/AnyPS5/progress.html).
 
-The [shader recompiler](core/shader/recompiler/Recompiler.cpp) successfully produces SPIR-V (validated via [Spirv-Tools](3rdparty/SPIRV-Tools) when built with `ANYPS5_ENABLE_SPIRV_TOOLS`).
-
-## Compatibility
-
-Per-game status and test reports live in the [Game bring-up](https://github.com/boykopovar/AnyPS5/discussions/categories/game-bring-up) discussions, one thread per title.
-
-## Input mapping
-
-SDL-mapped game controllers are supported, including analog sticks and triggers. Keyboard and mouse controls can be configured with an `anyps5-input.ini` file. See [input mapping](docs/user/INPUT_MAPPING.md) for the supported devices and configuration format.
-
-## Disclaimer
-
-This project is intended for interoperability, research, preservation, and compatibility purposes. It does not include, distribute, or require copyrighted software, firmware, cryptographic keys, or proprietary libraries. Users are responsible for ensuring that any binaries used with this project are obtained and used in accordance with applicable laws and their respective license terms.
-
-AnyPS5 is an independent project and is not affiliated with, authorized or endorsed by Sony Interactive Entertainment. "PlayStation" and "PS5" are trademarks of Sony Interactive Entertainment Inc.
+AnyPS5 is intended for interoperability, research, preservation and compatibility. It does not include, distribute or
+require copyrighted software, firmware, cryptographic keys or proprietary libraries. It is not affiliated with,
+authorized or endorsed by Sony Interactive Entertainment; "PlayStation" and "PS5" are trademarks of Sony Interactive
+Entertainment Inc.
 
 ## License
 
-This project is licensed under the GNU General Public License version 2 only.
+GNU General Public License version 2 only, as upstream ([LICENSE](LICENSE)).
