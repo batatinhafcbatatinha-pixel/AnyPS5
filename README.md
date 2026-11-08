@@ -1,5 +1,23 @@
 **English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [Català](docs/user/README.ca.md) | [Italiano](docs/user/README.it.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md) | [Bahasa Indonesia](docs/user/README.id.md)
 
+## This fork: play with the launcher (Windows)
+
+Fork of [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5) with the [port launcher](https://github.com/batatinhafcbatatinha-pixel/port-installer)
+used by the other recompilers. No game content is in this repository: the game comes from **your own decrypted dump**.
+
+1. `git clone --recurse-submodules https://github.com/batatinhafcbatatinha-pixel/AnyPS5.git` (or **Code > Download ZIP**)
+   and run **`Launcher.cmd`** (it downloads `Launcher.exe` from the port-installer releases the first time).
+2. **File > Add game folders** with the folder that holds your dumps (a dump folder has `eboot.bin` and
+   `sce_sys/param.json`; fake-signed files with `.esbak` backups and decrypted SELF containers both work).
+3. Select the game and **Install**: [`tools/ps5port`](tools/ps5port/ps5port.py) unwraps the executable and modules,
+   converts them with the AnyPS5 relinker (pinned release, downloaded into `.local/tools`) and links the game files
+   in place, nothing copied. It takes a few minutes and needs only Python.
+4. **Play**. **Configure** holds the PC settings (window/fullscreen, game resolution, V-Sync, performance panel,
+   console language, volume, vibration); in the game F10 toggles the performance panel, F11 fullscreen, F12 saves a screenshot.
+
+Ports live in `.local/ports/<title id>/` (saves, trophies and screenshots in `build/out`); `ps5port.py env --port <dir>`
+prints the AnyPS5 variables the PC settings give.
+
 # About
 
 Tool for automatic executables porting to Linux and Windows.
