@@ -240,7 +240,7 @@ def build(port):
     out.mkdir(parents=True, exist_ok=True)
     for old in list(out.glob('app*.json')) + [out / 'app.exe', out / 'app0', out / 'libs']:
         remove_tree(old)
-    cmd = [str(relinker), '--windows']
+    cmd = [str(relinker), '--windows'] + os.environ.get('PS5PORT_RELINK_FLAGS', '').split()
     for d in extra:
         cmd += ['--module-dir', d if d != '' else '.']
     cmd += [str((src / 'eboot.elf').resolve()), 'app.exe']
