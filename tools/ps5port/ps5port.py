@@ -316,6 +316,11 @@ def settings_env(port, game):
     res = {1: '1920x1080', 2: '3840x2160'}.get(number(v, 'res', 1))
     if res:
         env['APS5_OUTPUT_RESOLUTION'] = res
+    fps_limit = number(v, 'fps_limit', 0)
+    if fps_limit > 0:
+        env['ANYPS5_FPS_LIMIT'] = str(fps_limit)
+    if number(v, 'upscale', 0) == 1:
+        env['ANYPS5_UPSCALE'] = 'fsr'
     overlay_page = number(v, 'show_fps', 0)
     if overlay_page in (1, 2):
         env['ANYPS5_OVERLAY'] = str(overlay_page)

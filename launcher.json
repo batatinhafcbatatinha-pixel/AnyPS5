@@ -92,6 +92,56 @@
             }
           ],
           "restart": true
+        },
+        {
+          "key": "fps_limit",
+          "pt": "Limite de quadros",
+          "en": "Frame limit",
+          "default": 0,
+          "help_pt": "Máximo de quadros por segundo que a janela apresenta. Limitar reduz o uso de CPU, GPU e energia quando o jogo passa do limite. Requer um runtime AnyPS5 mais novo que o v0.1.4 (build local via ANYPS5_RELINKER/ANYPS5_LIBS); o v0.1.4 ignora esta opção.",
+          "help_en": "Most frames per second the window presents. A limit lowers CPU, GPU and power use when the game runs above it. Needs an AnyPS5 runtime newer than v0.1.4 (a local build through ANYPS5_RELINKER/ANYPS5_LIBS); v0.1.4 ignores this setting.",
+          "choices": [
+            {
+              "v": 0,
+              "pt": "Sem limite",
+              "en": "No limit"
+            },
+            {
+              "v": 30,
+              "pt": "30 fps",
+              "en": "30 fps"
+            },
+            {
+              "v": 60,
+              "pt": "60 fps",
+              "en": "60 fps"
+            },
+            {
+              "v": 120,
+              "pt": "120 fps",
+              "en": "120 fps"
+            }
+          ]
+        },
+        {
+          "key": "upscale",
+          "pt": "Ampliação da imagem",
+          "en": "Upscaling",
+          "default": 0,
+          "help_pt": "Como a imagem do jogo é ampliada quando a janela é maior que ela. FSR 1 dá mais nitidez que o bilinear; com Resolução do jogo em 1080p num monitor maior, o jogo renderiza menos pixels e o FSR amplia. Requer um runtime AnyPS5 mais novo que o v0.1.4 (build local via ANYPS5_RELINKER/ANYPS5_LIBS); o v0.1.4 ignora esta opção.",
+          "help_en": "How the game's image is scaled when the window is larger than it. FSR 1 is sharper than bilinear; with Game resolution at 1080p on a larger monitor the game renders fewer pixels and FSR scales them up. Needs an AnyPS5 runtime newer than v0.1.4 (a local build through ANYPS5_RELINKER/ANYPS5_LIBS); v0.1.4 ignores this setting.",
+          "choices": [
+            {
+              "v": 0,
+              "pt": "Bilinear",
+              "en": "Bilinear"
+            },
+            {
+              "v": 1,
+              "pt": "AMD FSR 1",
+              "en": "AMD FSR 1"
+            }
+          ]
         }
       ]
     },
