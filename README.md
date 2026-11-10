@@ -31,7 +31,7 @@ conversion; the game itself is not copied.
 
 Every PS5 game takes the same generic path; there are no per-game profiles. Tested so far:
 
-| Game | Dump | State |
+| Game | Title ID | State |
 | --- | --- | --- |
 | title C | TITLE_ID | title menu at 60 fps; PC settings checked in game |
 | title B | TITLE_ID | reaches gameplay at about 2 fps |
@@ -94,3 +94,10 @@ Entertainment Inc.
 ## License
 
 GNU General Public License version 2 only, as upstream ([LICENSE](LICENSE)).
+
+## Legal
+
+Use only games you own and dumped yourself from your own console or disc. This project does not include, link to or
+explain how to obtain keys, firmware, decryption or dumping tools, jailbreaks or game files, and it does not
+circumvent any protection: it only reads files the user already has. Not affiliated with or endorsed by Sony
+Interactive Entertainment, Microsoft, or any game publisher; all trademarks belong to their owners.
