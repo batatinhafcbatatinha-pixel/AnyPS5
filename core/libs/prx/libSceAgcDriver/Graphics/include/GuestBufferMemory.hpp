@@ -217,6 +217,26 @@ enum class ResidentFlush : std::uint8_t { Access, Pending, ImageStore, GpuComman
 bool ResidentStagingOverlaps(std::uint64_t address, std::size_t bytes);
 bool FlushResidentStaging(std::uint64_t address, std::size_t bytes, ResidentFlush reason, const char* cause = nullptr, bool honourClaims = true);
 void FlushAllResidentStaging(VkDevice device);
+struct ResidentSource {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    std::shared_ptr<Buffer> keep;
+};
+std::optional<ResidentSource> ResidentSourceFor(VkDevice device, VkBuffer import, std::uint64_t address, std::size_t bytes);
+void CountResidentSourceFallback(std::uint64_t bytes);
+class ResidentRangeClaim {
+public:
+    ResidentRangeClaim(VkDevice device, std::uint64_t address, std::size_t bytes);
+    ~ResidentRangeClaim();
+    ResidentRangeClaim(const ResidentRangeClaim&) = delete;
+    ResidentRangeClaim& operator=(const ResidentRangeClaim&) = delete;
+    bool Claimed() const { return claimed; }
+
+private:
+    std::vector<const Buffer*> buffers;
+    const std::vector<const Buffer*>* previous = nullptr;
+    bool claimed = false;
+};
 void DropResidentStaging(VkDevice device);
 
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
