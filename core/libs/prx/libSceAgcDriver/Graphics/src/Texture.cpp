@@ -4826,6 +4826,20 @@ bool& GpuOrderedSkipped() {
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited, VkDevice device) {
+    bool resident = false;
+    if (ResidentStagingOverlaps(address, bytes)) {
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
+        const bool images = AnyPendingOverlaps(range) || AnyShadowedOverlaps(address, bytes);
+        resident = FlushResidentStaging(address, bytes, ResidentFlush::Pending, reason, !images);
+    }
+    bool publishedHere = false;
+    const bool stored = FlushPendingImages(address, bytes, except, reason, scope, &publishedHere, waited, device);
+    if (published != nullptr) *published = publishedHere;
+    if (stored || publishedHere) static_cast<void>(FlushResidentStaging(address, bytes, ResidentFlush::ImageStore, reason, false));
+    return stored || resident;
+}
+
+bool StorageTexture::FlushPendingImages(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited, VkDevice device) {
     static_cast<void>(FlushDepthPlanes(address, bytes));
     if (published != nullptr) *published = false;
     const auto nothingToStore = [&] {
@@ -5217,7 +5231,8 @@ void StorageTexture::awaitStoredSave(const std::vector<bool>* layers) {
 }
 
 bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason, bool waited) {
-    if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
+    if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return FlushResidentStaging(address, bytes, ResidentFlush::Pending, reason);
+    static_cast<void>(FlushResidentStaging(address, bytes, ResidentFlush::Pending, reason, false));
     std::lock_guard gpu(GuestMemory::GpuMutex());
     if (PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited) == 0) return false;
     waitForIdlePublish(reason);

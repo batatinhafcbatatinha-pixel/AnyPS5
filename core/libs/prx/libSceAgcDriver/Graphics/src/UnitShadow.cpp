@@ -567,6 +567,7 @@ PublishOnCpuScope::~PublishOnCpuScope() {
 }
 
 std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason, bool waited) {
+    if (ResidentStagingOverlaps(address, bytes)) static_cast<void>(FlushResidentStaging(address, bytes, ResidentFlush::Pending, ReasonNames[static_cast<std::size_t>(reason)], !AnyShadowedOverlaps(address, bytes)));
     if (!UnitShadowEnabled() || scope == PublishScope::None || bytes == 0) return 0;
     if (!waited && Recorder::InCompletion() && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Store) {
         // The store's own stamp makes the unit stale; a publish recorded now would land over the
@@ -583,6 +584,7 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
     }
     std::size_t units = 0;
     for (const auto& shadow : shadows) units += publishRange(shadow, address, end, scope, reason);
+    if (units != 0) static_cast<void>(FlushResidentStaging(address, bytes, ResidentFlush::ImageStore, ReasonNames[static_cast<std::size_t>(reason)], false));
     return units;
 }
 

@@ -1166,12 +1166,14 @@ struct VulkanDevice::State {
             // slabs (kept by the publishing batch) are freed by the recorder's teardown.
             if (recorder) {
                 try {
+                    Graphics::FlushAllResidentStaging(device);
                     Graphics::PublishAllShadows(context, Graphics::PublishReason::Teardown);
                     recorder->Sync();
                 } catch (const std::exception& error) {
                     std::fprintf(stderr, "[gpu] unit shadow teardown: %s\n", error.what());
                 }
             }
+            Graphics::DropResidentStaging(device);
             Graphics::DestroyShadows(device);
             recorder.reset();
             // Cached graphics pipelines (with their framebuffers, modules, render passes and layouts)
@@ -2919,8 +2921,10 @@ void VulkanDevice::PrepareForReplacement() {
     }
     DriverDetail::AwaitLibraryPrebuilds();
     Graphics::FlushCachedTextures(state->device);
+    Graphics::FlushAllResidentStaging(state->device);
     Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Teardown);
     WaitIdle();
+    Graphics::DropResidentStaging(state->device);
     Graphics::DestroyShadows(state->device);
     // The replacement's draws never find this device's pipelines (the store keys on the device), and
     // the device lives on until the driver stops: destroy them now rather than then.
@@ -3158,6 +3162,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (import == nullptr || import->address == 0) return false;
     if (Graphics::AnyShadowedOverlaps(address, bytes)) Graphics::PublishShadow(address, bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
     if (!recorder.QueuesSampleDumps()) recorder.FlushStoresOverlapping(address, bytes);
+    static_cast<void>(Graphics::FlushResidentStaging(address, bytes, Graphics::ResidentFlush::GpuCommand, "sample-dump"));
     recorder.FlushKeyStoresOverlapping(address, bytes);
     if (!recorder.DumpSamples(import->address + (address - import->base), address)) return false;
     recorder.NotePendingWrite(address, bytes);
@@ -3299,6 +3304,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     }
     // A queued label store over the range lands before the fill (program order).
     recorder.FlushStoresOverlapping(address, bytes);
+    static_cast<void>(Graphics::FlushResidentStaging(address, bytes, Graphics::ResidentFlush::GpuCommand, "fill"));
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
@@ -3602,6 +3608,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // A queued label store in either range lands before the transfer reads or writes it.
     recorder.FlushStoresOverlapping(source, bytes);
     recorder.FlushStoresOverlapping(destination, bytes);
+    static_cast<void>(Graphics::FlushResidentStaging(destination, bytes, Graphics::ResidentFlush::GpuCommand, "copy-destination"));
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     // The class range covers the barriers too; the program-keyed range inside it is the transfer.

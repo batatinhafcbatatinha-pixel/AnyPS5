@@ -2880,6 +2880,7 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     if (import == nullptr) return false;
     recorder.FlushKeyStoresOverlapping(address, bytes);
     recorder.FlushStoresOverlapping(address, bytes);
+    static_cast<void>(FlushResidentStaging(address, bytes, ResidentFlush::GpuCommand, "htile-store"));
     const auto commands = recorder.Commands();
     const auto timing = recorder.BeginGpuTiming(Recorder::CommandClass::Fill);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);

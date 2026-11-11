@@ -213,6 +213,12 @@ HostImportsProof HostImportsIdentity(const Context& context);
 void SetDeviceLocalFullForTests(bool full);
 std::uint64_t StagingShadowsRefused();
 
+enum class ResidentFlush : std::uint8_t { Access, Pending, ImageStore, GpuCommand, OverlapRead, Overlap, Rebind, CpuWrite, Budget, Retire, Teardown, Count };
+bool ResidentStagingOverlaps(std::uint64_t address, std::size_t bytes);
+bool FlushResidentStaging(std::uint64_t address, std::size_t bytes, ResidentFlush reason, const char* cause = nullptr, bool honourClaims = true);
+void FlushAllResidentStaging(VkDevice device);
+void DropResidentStaging(VkDevice device);
+
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
 // one mirror with its top bit set, 0 when no read-only mirror whose registered range still exists
@@ -357,6 +363,17 @@ public:
     // calls RecordCopyBacks (a dispatch or a recorded draw), since a staged region's results reach
     // guest memory by that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
+    class ResidentClaim {
+    public:
+        explicit ResidentClaim(const GuestBufferMemory& memory);
+        ~ResidentClaim();
+        ResidentClaim(const ResidentClaim&) = delete;
+        ResidentClaim& operator=(const ResidentClaim&) = delete;
+
+    private:
+        std::vector<const Buffer*> buffers;
+        const std::vector<const Buffer*>* previous = nullptr;
+    };
     void DisallowAddressStaging() { addressStaging = false; }
     void AllowAdjustedRegions() { adjustedRegions = true; }
     bool HoldsMirror(const std::shared_ptr<ImageMirror>& mirror) const;
@@ -528,6 +545,13 @@ private:
         bool unstaged = false;
         bool overlay = false;
         bool adaptiveInPlace = false;
+        std::uint64_t bufferBase = 0;
+        bool resident = false;
+        bool copiedIn = false;
+        std::uint64_t copyGeneration = 0;
+        std::uint64_t residentId = 0;
+        std::shared_ptr<Buffer> residentBuffer;
+        std::uint64_t residentBase = 0;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -582,12 +606,18 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    static std::uint64_t bufferOffset(const Region& region) { return region.bufferBase != 0 ? region.begin - region.bufferBase : 0; }
+    void prepareResident(bool addressable, std::vector<const Buffer*>& claims);
+    bool residentHit(Region& region);
+    void flushForeignResident();
+    bool deferCopyBack(Region& region, std::span<const std::pair<std::uint64_t, std::uint64_t>> merged, bool& registered);
     void takeHeapReferences();
     void releaseHeapReferences() noexcept;
     Context context;
     bool stagingAllowed = false;
     bool addressStaging = true;
     bool adjustedRegions = false;
+    bool builtAddressable = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
