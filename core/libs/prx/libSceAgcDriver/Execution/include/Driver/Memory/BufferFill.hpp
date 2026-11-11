@@ -73,6 +73,58 @@ inline std::optional<PatternFillRange> DecodePatternFillRange(std::span<const st
     return PatternFillRange{base(0), base(4), base(8), invocations, userData[6]};
 }
 
+inline constexpr std::size_t BlockPatternFillKernelWords = 29;
+inline constexpr std::uint64_t BlockPatternFillKernelHash = 0x7d7c1da93441423aull;
+
+inline constexpr std::uint64_t HashKernelWords(std::span<const std::uint32_t> code) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto word : code) {
+        for (std::uint32_t shift = 0; shift < 32u; shift += 8u) {
+            hash ^= (word >> shift) & 0xffu;
+            hash *= 0x100000001b3ull;
+        }
+    }
+    return hash;
+}
+
+inline bool MatchesBlockPatternFillKernel(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
+    if (userData.size() != 8 || compute.numThreads != std::array<std::uint32_t, 3>{64, 1, 1} || !compute.groupIdEnable[0] || compute.threadIdComponentCount != 1) return false;
+    if (code.size() < BlockPatternFillKernelWords || code[BlockPatternFillKernelWords - 1] != 0xbf810000u || HashKernelWords(code.first(BlockPatternFillKernelWords)) != BlockPatternFillKernelHash) return false;
+    if ((userData[1] & 0xffff0000u) != 0x00040000u || userData[3] != 0x00014004u) return false;
+    if ((userData[5] & 0xffff0000u) != 0x00100000u || userData[7] != 0x0004dfacu) return false;
+    return userData[2] >= 1 && userData[6] >= 2;
+}
+
+struct BlockPatternFillRange {
+    std::uint64_t destination, block, invocations;
+    std::uint32_t records;
+
+    static constexpr std::size_t BlockBytes = 24;
+
+    [[nodiscard]] std::optional<std::size_t> Bytes(std::uint32_t count, std::uint32_t mask) const {
+        if (mask > 3u) return std::nullopt;
+        const auto bytes = std::min({invocations, std::uint64_t{count}, std::uint64_t{records}}) * 4u;
+        if (destination % 16 != 0 || bytes % 16 != 0) return std::nullopt;
+        if (bytes != 0 && block < destination + bytes && destination < block + BlockBytes) return std::nullopt;
+        return static_cast<std::size_t>(bytes);
+    }
+
+    [[nodiscard]] static std::array<std::uint32_t, 4> Pattern(std::span<const std::uint32_t, 4> values, std::uint32_t mask) {
+        std::array<std::uint32_t, 4> pattern{};
+        for (std::uint32_t index = 0; index < 4u; ++index) pattern[index] = values[index & mask];
+        return pattern;
+    }
+};
+
+inline std::optional<BlockPatternFillRange> DecodeBlockPatternFillRange(std::span<const std::uint32_t> userData, std::span<const std::uint32_t> packet) {
+    if (userData.size() != 8 || packet.size() < 5 || packet[2] != 1 || packet[3] != 1) return std::nullopt;
+    const std::uint64_t invocations = (packet[4] & 0x20u) != 0 ? packet[1] : std::uint64_t{packet[1]} * 64u;
+    if (invocations > (std::uint64_t{1} << 32u)) return std::nullopt;
+    const auto base = [&](std::size_t word) { return userData[word] | (static_cast<std::uint64_t>(userData[word + 1] & 0xffffu) << 32u); };
+    if (base(0) % 4 != 0 || base(4) % 4 != 0) return std::nullopt;
+    return BlockPatternFillRange{base(0), base(4), invocations, userData[2]};
+}
+
 }
 
 #endif
