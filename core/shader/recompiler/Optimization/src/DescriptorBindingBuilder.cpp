@@ -29,7 +29,8 @@ static_assert(PipelineSpecialization::MirrorUnnormalizedBase + ShaderInfo::MaxSa
 static_assert(PipelineSpecialization::VolumeGatherBase + ShaderInfo::MaxImages <= PipelineSpecialization::GuestExtentBase);
 static_assert(PipelineSpecialization::GuestExtentBase + ShaderInfo::MaxImages <= PipelineSpecialization::RenderScaleUnnormalizedBase);
 static_assert(PipelineSpecialization::RenderScaleUnnormalizedBase + ShaderInfo::MaxSamplers <= PipelineSpecialization::FragmentScaleBase);
-static_assert(PipelineSpecialization::FragmentScaleBase + PipelineSpecialization::FragmentScaleWords <= PipelineSpecialization::ImageComponentBase);
+static_assert(PipelineSpecialization::FragmentScaleBase + PipelineSpecialization::FragmentScaleWords <= PipelineSpecialization::GridScaleBase);
+static_assert(PipelineSpecialization::GridScaleBase + PipelineSpecialization::GridScaleWords <= PipelineSpecialization::ImageComponentBase);
 static_assert(PipelineSpecialization::MinLodBase + ShaderInfo::MaxImages <= PipelineSpecialization::SamplerLodBiasBase);
 static_assert(PipelineSpecialization::SamplerLodBiasBase + ShaderInfo::MaxSamplers <= PipelineSpecialization::FmaskFormatBase);
 static_assert(PipelineSpecialization::FmaskFormatBase + ShaderInfo::MaxImages <= PipelineSpecialization::VolumeGatherBase);

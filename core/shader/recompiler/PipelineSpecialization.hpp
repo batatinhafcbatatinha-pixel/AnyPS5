@@ -57,6 +57,8 @@ inline constexpr std::uint32_t GuestExtentBase = 58304u;
 inline constexpr std::uint32_t RenderScaleUnnormalizedBase = 58432u;
 inline constexpr std::uint32_t FragmentScaleBase = 58496u;
 inline constexpr std::uint32_t FragmentScaleWords = 2u;
+inline constexpr std::uint32_t GridScaleBase = 58498u;
+inline constexpr std::uint32_t GridScaleWords = 4u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;
@@ -68,6 +70,10 @@ inline constexpr bool IsWorkgroupOffset(std::uint32_t id) {
 
 inline constexpr bool IsFragmentScale(std::uint32_t id) {
     return id >= FragmentScaleBase && id < FragmentScaleBase + FragmentScaleWords;
+}
+
+inline constexpr bool IsGridScale(std::uint32_t id) {
+    return id >= GridScaleBase && id < GridScaleBase + GridScaleWords;
 }
 
 }

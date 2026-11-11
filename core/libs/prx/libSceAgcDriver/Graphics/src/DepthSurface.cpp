@@ -907,6 +907,7 @@ public:
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        TwinUse(commands);
         const VkImageSubresourceRange range{aspects, 0, 1, 0, 1};
         constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -970,10 +971,11 @@ public:
             if (sampleShadow == nullptr) createSampleShadow();
             refreshSampleShadow(drawn, stencil);
         }
+        HostUse();
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
         const auto viewType = multisampled ? multisampleViewType : resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
         const auto sampledImage = useSampleShadow ? sampleShadow : owned;
-        auto texture = std::make_shared<Texture>(context, useSampleShadow ? sampleShadow->image : image, hostFormat, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components, viewType, 0, sampledImage);
+        auto texture = std::make_shared<Texture>(context, useSampleShadow ? sampleShadow->image : SampledImage(), hostFormat, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components, viewType, 0, sampledImage);
         if (multisampled) {
             Require(copySource || samplingActive, "native multisample depth sampling requires its creation-time owner");
             texture->MarkRefreshedPerUse();
@@ -1037,6 +1039,8 @@ public:
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        source.TwinUse(commands);
+        TwinUse(commands);
         constexpr VkAccessFlags all = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, all, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         VkImageCopy region{};
@@ -1329,6 +1333,7 @@ public:
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        TwinUse(commands);
         if (recorder != nullptr) recorder->Keep(storage);
         VkBufferImageCopy depthRegion{0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
         VkBufferImageCopy colorRegion = depthRegion;
@@ -1653,6 +1658,126 @@ public:
     mutable std::uint64_t mirrorBytes = 0;
     mutable std::uint64_t stencilMirrorBytes = 0;
 
+    bool Scaled() const { return scaled; }
+    VkImage SampledImage() const { return scaled ? hostImage : image; }
+    VkExtent2D HostExtent() const { return scaled ? hostExtent : target.extent; }
+
+    VkImageAspectFlags blitAspects() const {
+        const bool stencil = hostFormat == VK_FORMAT_D16_UNORM_S8_UINT || hostFormat == VK_FORMAT_D24_UNORM_S8_UINT || hostFormat == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        return VK_IMAGE_ASPECT_DEPTH_BIT | (stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+    }
+
+    template <typename Record>
+    void recordNow(Record&& record) const {
+        auto* recorder = RecorderFor(context);
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        record(commands);
+        if (batch) batch->SubmitAndWait();
+    }
+
+    void recordDepthResample(VkCommandBuffer commands, bool toHost) const {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkOffset3D guest{static_cast<std::int32_t>(target.extent.width), static_cast<std::int32_t>(target.extent.height), 1};
+        const VkOffset3D host{static_cast<std::int32_t>(hostExtent.width), static_cast<std::int32_t>(hostExtent.height), 1};
+        VkImageBlit region{};
+        region.srcSubresource = {blitAspects(), 0, 0, 1};
+        region.dstSubresource = region.srcSubresource;
+        region.srcOffsets[1] = toHost ? guest : host;
+        region.dstOffsets[1] = toHost ? host : guest;
+        context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, toHost ? image : hostImage, VK_IMAGE_LAYOUT_GENERAL, toHost ? hostImage : image, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        NoteScaleResample(toHost, toHost ? hostBytes : DepthSliceBytes(target.extent, 4u));
+    }
+
+    void TwinUse(VkCommandBuffer commands) const {
+        if (!scaled) return;
+        if (twinStale) recordDepthResample(commands, false);
+        twinStale = false;
+        hostStale = true;
+    }
+
+    void HostUse() const {
+        if (!scaled || !hostStale) return;
+        recordNow([&](VkCommandBuffer commands) { recordDepthResample(commands, true); });
+        hostStale = false;
+    }
+
+    void NoteAttached() const {
+        if (scaled) twinStale = true;
+    }
+
+    bool createHost() {
+        VkFormatProperties properties{};
+        context.formatProperties(context.physical, hostFormat, &properties);
+        constexpr VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        if ((properties.optimalTilingFeatures & blit) != blit) return false;
+        hostExtent = ScaledExtent(target.extent);
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = hostFormat;
+        info.extent = {hostExtent.width, hostExtent.height, 1};
+        info.mipLevels = 1;
+        info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (sampleable ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u);
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &hostImage), "vkCreateImage scaled depth");
+        VkMemoryRequirements requirements{};
+        context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, hostImage, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        hostMemory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory scaled depth target");
+        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, hostImage, hostMemory, 0), "vkBindImageMemory scaled depth");
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = hostImage;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = hostFormat;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u), 0, 1, 0, 1};
+        Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &hostView), "vkCreateImageView scaled depth");
+        hostBytes = requirements.size;
+        NoteScaledSurface(static_cast<std::int64_t>(DepthSliceBytes(target.extent, 4u)), static_cast<std::int64_t>(hostBytes), 1);
+        recordNow([&](VkCommandBuffer commands) {
+            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = hostImage;
+            barrier.subresourceRange = {blitAspects(), 0, 1, 0, 1};
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+        });
+        return true;
+    }
+
+    void SetScaled(bool wanted) {
+        if (wanted == scaled || target.samples != 1u) return;
+        if (wanted) {
+            if (hostImage == VK_NULL_HANDLE && !createHost()) {
+                RefuseScale(target.address, "depth format");
+                return;
+            }
+            if (twinView == VK_NULL_HANDLE) twinView = view;
+            scaled = true;
+            recordNow([&](VkCommandBuffer commands) { recordDepthResample(commands, true); });
+            view = hostView;
+        } else {
+            recordNow([&](VkCommandBuffer commands) { recordDepthResample(commands, false); });
+            scaled = false;
+            view = twinView;
+            RefuseScale(target.address, "depth demoted");
+            NoteScaleDemotion();
+        }
+        hostStale = false;
+        twinStale = false;
+        textures.clear();
+    }
+
     std::uint64_t MirrorBytes() const;
     std::uint64_t StencilMirrorBytes() const;
 
@@ -1662,6 +1787,15 @@ public:
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImage hostImage = VK_NULL_HANDLE;
+    VkDeviceMemory hostMemory = VK_NULL_HANDLE;
+    VkImageView hostView = VK_NULL_HANDLE;
+    VkImageView twinView = VK_NULL_HANDLE;
+    VkExtent2D hostExtent{};
+    VkDeviceSize hostBytes = 0;
+    bool scaled = false;
+    mutable bool hostStale = false;
+    mutable bool twinStale = false;
     std::shared_ptr<std::atomic<bool>> active = std::make_shared<std::atomic<bool>>(true);
     bool sampleable = true;
     bool samplingActive = false;
@@ -1943,6 +2077,7 @@ private:
         std::unique_ptr<CommandBatch> batch;
         if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        TwinUse(commands);
         const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         VkBufferImageCopy region{0, 0, 0, {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
@@ -2014,6 +2149,7 @@ private:
         const bool passes = toStorage && !stencil && target.samples == 1 && depthToStoragePass(context, hostFormat, storage->ImageFormat());
         if (!direct && !passes && plane.staging == nullptr) plane.staging = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        TwinUse(commands);
         if (recorder != nullptr) recorder->Keep(storage);
         const std::uint32_t timing = recorder != nullptr ? recorder->BeginGpuTiming(Recorder::CommandClass::Copy) : 0u;
         const VkBufferImageCopy planeRegion{0, 0, 0, {stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
@@ -2106,6 +2242,18 @@ private:
         textures.clear();
         if (transferView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, transferView, nullptr);
         transferView = VK_NULL_HANDLE;
+        if (twinView != VK_NULL_HANDLE) view = twinView;
+        if (hostView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, hostView, nullptr);
+        hostView = VK_NULL_HANDLE;
+        twinView = VK_NULL_HANDLE;
+        if (hostImage) {
+            context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, hostImage, nullptr);
+            NoteScaledSurface(static_cast<std::int64_t>(DepthSliceBytes(target.extent, 4u)), static_cast<std::int64_t>(hostBytes), -1);
+        }
+        if (hostMemory) MemoryAccounting::Free(context, hostMemory);
+        hostImage = VK_NULL_HANDLE;
+        hostMemory = VK_NULL_HANDLE;
+        scaled = false;
         if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
         if (owned != nullptr) owned.reset();
         else {
@@ -3463,7 +3611,44 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     }
     if (stencilWritten || created || stencilRebound) surface->MarkStencilStale();
     drawnDepth = surface;
+    if (const auto request = ScaleRequestScope::Current(); request != ScaleRequest::Keep && target.samples == 1u && RenderScaleEnabled()) surface->SetScaled(request == ScaleRequest::Allow && ScaleCandidateExtent(target.address, DepthSliceBytes(target.extent, 4u), target.extent));
+    surface->HostUse();
+    surface->NoteAttached();
     return surface->view;
+}
+
+std::optional<VkExtent2D> DepthSurfaceHostExtent(const Context& context, const DepthTarget& target) {
+    if (!RenderScaleEnabled()) return std::nullopt;
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (surface->active->load(std::memory_order_acquire) && surface->context.device == context.device && !surface->retired && surface->target.address == target.address && surface->Scaled()) return surface->HostExtent();
+    }
+    return std::nullopt;
+}
+
+bool DemoteDepthSurfaceAt(const Context& context, std::uint64_t address) {
+    if (!RenderScaleEnabled()) return false;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::lock_guard lock(surfacesMutex());
+    bool demoted = false;
+    for (const auto& surface : surfaces()) {
+        if (!surface->Scaled() || surface->context.device != context.device || (surface->target.address != address && surface->target.stencilAddress != address)) continue;
+        surface->SetScaled(false);
+        demoted = true;
+    }
+    return demoted;
+}
+
+VkImageView DemoteDepthSurface(const Context& context, const DepthTarget& target) {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::lock_guard lock(surfacesMutex());
+    VkImageView view = VK_NULL_HANDLE;
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || surface->context.device != context.device || surface->retired || surface->target.address != target.address) continue;
+        surface->SetScaled(false);
+        view = surface->view;
+    }
+    return view;
 }
 
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target) {
@@ -4213,6 +4398,7 @@ std::shared_ptr<StorageTexture> layeredDepthStorage(const Context& context, Dept
     const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
     const auto bytesPerTexel = d16 ? 2u : 4u;
     surface.RequireStorable(resource);
+    surface.SetScaled(false);
     Require(!DescribeSurface(resource).levelMajor, "depth planes of a PS4 layered surface with several mip levels (stored level by level) are not implemented");
     auto& entry = layeredStorages()[{context.device, resource.baseAddress, resource.width, resource.height, layers, resource.format, static_cast<int>(resource.tileMode), static_cast<int>(resource.dimension), resource.baseArray}];
     if (entry == nullptr) entry = std::make_unique<LayeredDepthStorage>(context, resource, target, bytesPerTexel, resource.baseArray, layers);

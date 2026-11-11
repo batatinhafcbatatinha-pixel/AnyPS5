@@ -638,6 +638,7 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
 
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
+    if (request.target.renderScale && request.shader.stage == ShaderStage::Compute) program.Info().gridScalable = ProveGridPointwise(program);
 }
 
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program) {
@@ -733,6 +734,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.registrationModule = registration;
     if (request.shader.stage == ShaderStage::Mesh && request.graphics) result.meshBarycentrics = request.graphics->meshBarycentrics;
     result.layerReplaySafe = LayerReplaySafe(program);
+    result.gridScalable = program.Info().gridScalable;
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
     result.bdaWrites = program.Info().bdaWrites;
     if (stencilReplay) {
@@ -852,7 +854,7 @@ std::vector<std::uint32_t> specializeWords(const CompiledShaderArtifact& artifac
             }
             const auto found = supplied.find(words[cursor + 3u]);
             if (found == supplied.end()) throw std::runtime_error("missing prepared specialization value");
-            if (found->first == PipelineSpecialization::MeshLayerBase || found->first == PipelineSpecialization::MeshLayerCount || PipelineSpecialization::IsFragmentScale(found->first)) {
+            if (found->first == PipelineSpecialization::MeshLayerBase || found->first == PipelineSpecialization::MeshLayerCount || PipelineSpecialization::IsFragmentScale(found->first) || PipelineSpecialization::IsGridScale(found->first)) {
                 retained.insert(words[cursor + 1u]);
                 cursor += count;
                 continue;
@@ -1200,6 +1202,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .stencilReplaySafe = artifact.stencilReplaySafe,
         .bdaWrites = artifact.bdaWrites,
         .layerReplaySafe = artifact.layerReplaySafe,
+        .gridScalable = artifact.gridScalable,
         .stencilReferenceDword = artifact.stencilReferenceDword,
         .variantId = artifact.variantId
     };
@@ -1264,7 +1267,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         }
     }
     const bool fragmentScale = request.target.renderScale && request.shader.stage == ShaderStage::Fragment;
-    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || depthRemap || fragmentScale || request.shader.stage == ShaderStage::Mesh) {
+    const bool gridScale = request.target.renderScale && artifact.gridScalable;
+    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || depthRemap || fragmentScale || gridScale || request.shader.stage == ShaderStage::Mesh) {
         {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
@@ -1280,6 +1284,9 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             constants.push_back({PipelineSpecialization::MeshLayerCount, 0xffffffffu});
             if (fragmentScale) {
                 for (std::uint32_t word = 0; word < PipelineSpecialization::FragmentScaleWords; ++word) constants.push_back({PipelineSpecialization::FragmentScaleBase + word, 0u});
+            }
+            if (gridScale) {
+                for (std::uint32_t word = 0; word < PipelineSpecialization::GridScaleWords; ++word) constants.push_back({PipelineSpecialization::GridScaleBase + word, 0u});
             }
             std::size_t index = 0;
             if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});

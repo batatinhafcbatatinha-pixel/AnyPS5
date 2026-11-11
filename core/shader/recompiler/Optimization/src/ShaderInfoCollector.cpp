@@ -6,10 +6,64 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace ShaderRecompiler {
 namespace {
+
+bool CrossLaneOpcode(IrOpcode opcode) {
+    switch (opcode) {
+    case IrOpcode::Barrier:
+    case IrOpcode::ReadFirstLane:
+    case IrOpcode::ReadLane:
+    case IrOpcode::WriteLane:
+    case IrOpcode::LaneId:
+    case IrOpcode::DppMoveU32:
+    case IrOpcode::DppUpdateU32:
+    case IrOpcode::WqmU64:
+    case IrOpcode::Permlane16U32:
+    case IrOpcode::BpermuteU32:
+    case IrOpcode::PermuteU32:
+    case IrOpcode::HalfSwapU32:
+    case IrOpcode::SwizzleU32:
+    case IrOpcode::DataAppend:
+    case IrOpcode::DataConsume:
+    case IrOpcode::DataOrderedCount:
+    case IrOpcode::DataOrderedSwap:
+    case IrOpcode::LoadShared:
+    case IrOpcode::StoreShared:
+    case IrOpcode::EmitVertex:
+    case IrOpcode::Discard:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool MemoryOperandUse(const IrValue& user, const IrValue* value) {
+    const bool memory = ImageOpcodeInfoOf(user.Opcode()).access != ImageAccess::None || BufferAccessOf(user.Opcode()) != BufferAccess::None || AddressOpcodeInfoOf(user.Opcode()).access != AddressAccess::None;
+    if (!memory || user.ArgumentCount() == 0u) return false;
+    for (std::size_t index = 0; index + 1u < user.ArgumentCount(); ++index) {
+        if (user.Argument(index) == value) return true;
+    }
+    return false;
+}
+
+bool BallotReachesMemory(const IrValue* ballot) {
+    std::vector<const IrValue*> pending{ballot};
+    std::unordered_set<const IrValue*> visited{ballot};
+    while (!pending.empty()) {
+        const auto* value = pending.back();
+        pending.pop_back();
+        for (const IrValue* user : value->Uses()) {
+            if (MemoryOperandUse(*user, value)) return true;
+            if (visited.insert(user).second) pending.push_back(user);
+        }
+    }
+    return false;
+}
 
 [[noreturn]] void Fail(const std::string& message) {
     throw std::runtime_error("shader info collection failed: " + message);
@@ -655,6 +709,32 @@ void ShaderInfoCollector::Collect(IrProgram& program, const ShaderStageInputInfo
     CollectSamplerUses(program, next);
     program.Info() = std::move(next);
     program.Metadata().shaderInfoComplete = true;
+}
+
+bool ProveGridPointwise(const IrProgram& program) {
+    if (program.Resources().stage != IrShaderStage::Compute || program.Info().sharedMemoryBytes != 0u) return false;
+    for (const auto& image : program.Info().images) {
+        if ((image.written || image.atomic) && !RenderScaleMapsImage(image)) return false;
+    }
+    for (const auto& block : program.Blocks()) {
+        for (const IrValue* inst : block->Instructions()) {
+            const auto opcode = inst->Opcode();
+            if (CrossLaneOpcode(opcode) || SharedAccessOf(opcode) != SharedAccess::None) return false;
+            const auto buffer = BufferAccessOf(opcode);
+            if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic) return false;
+            const auto address = AddressOpcodeInfoOf(opcode).access;
+            if (address == AddressAccess::Write || address == AddressAccess::Atomic) return false;
+            if (ImageOpcodeInfoOf(opcode).access == ImageAccess::Atomic) return false;
+            if (opcode == IrOpcode::GetBuiltin) {
+                const auto* kind = inst->Argument(0)->Resolve();
+                if (kind == nullptr || !kind->HasImmediate()) return false;
+                const auto builtin = static_cast<StageInputKind>(kind->ImmediateU32());
+                if (builtin != StageInputKind::WorkgroupId && builtin != StageInputKind::LocalInvocationId && builtin != StageInputKind::GlobalInvocationId && builtin != StageInputKind::DispatchThreadLimit) return false;
+            }
+            if (opcode == IrOpcode::Ballot && BallotReachesMemory(inst)) return false;
+        }
+    }
+    return true;
 }
 
 void ShaderInfoCollector::Collect(IrProgram& program) const {

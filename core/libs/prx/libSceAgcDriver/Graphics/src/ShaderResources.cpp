@@ -858,12 +858,17 @@ PendingLookup pendingLookupSource(const Context& context, const GuestTextureReso
     return lookup;
 }
 
-std::shared_ptr<Texture> unscaledTexture(const Context& context, std::shared_ptr<Texture> texture, const std::function<std::shared_ptr<Texture>()>& lookup) {
-    if (texture == nullptr || texture->StorageSource() == nullptr || !texture->StorageSource()->Scaled()) return texture;
+std::shared_ptr<Texture> unscaledTexture(const Context& context, std::shared_ptr<Texture> texture, const std::function<std::shared_ptr<Texture>()>& lookup, std::uint64_t address) {
+    if (texture == nullptr) return texture;
+    if (texture->StorageSource() == nullptr || !texture->StorageSource()->Scaled()) {
+        if (!DemoteDepthSurfaceAt(context, address)) return texture;
+        texture.reset();
+        return lookup();
+    }
     const auto descriptor = texture->StorageSource()->Descriptor();
     texture.reset();
     {
-        const ScaleRequestScope refuse(ScaleRequest::Refuse);
+        const ScaleRequestScope refuse(ScaleRequest::Refuse, "sampled binding");
         static_cast<void>(cachedStorageTexture(context, {}, descriptor, 0));
     }
     return lookup();
@@ -1428,9 +1433,13 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             it = cache.entries.end();
         }
         const auto request = ScaleRequestScope::Current() == ScaleRequest::Keep && written ? ScaleRequest::Allow : ScaleRequestScope::Current();
-        if (request == ScaleRequest::Refuse) RefuseScale(resource.baseAddress);
-        if (it != cache.entries.end() && it->texture->Scaled() && (request == ScaleRequest::Refuse || ScaleRefused(resource.baseAddress))) {
+        if (request == ScaleRequest::Refuse) RefuseScale(resource.baseAddress, ScaleRequestScope::Reason());
+        if (it != cache.entries.end() && it->texture->Scaled() && (request == ScaleRequest::Refuse || !ScaleCandidate(resource, mip))) {
             evicted.push_back(evictStorage(cache, it, true, "render scale refused"));
+            NoteScaleDemotion();
+            it = cache.entries.end();
+        } else if (it != cache.entries.end() && !it->texture->Scaled() && request == ScaleRequest::Allow && !it->texture->Dirty() && ScaleCandidate(resource, mip) && !DepthSurfaceOverlaps(context.device, resource.baseAddress, it->texture->GuestBytes())) {
+            evicted.push_back(evictStorage(cache, it, true, "render scale promotion"));
             it = cache.entries.end();
         }
         if (it != cache.entries.end()) {
@@ -1451,6 +1460,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
                 VkExtent2D hostExtent{};
                 if (request == ScaleRequest::Allow && ScaleCandidate(resource, mip) && !DepthSurfaceOverlaps(context.device, resource.baseAddress, guestBytes)) hostExtent = ScaledExtent({resource.width, resource.height});
                 created = StorageTexture::Create(context, *context.detiler, resource, mip, hostExtent);
+                if (hostExtent.width != 0 && !created->Scaled()) RefuseScale(resource.baseAddress, "format");
             }
             created->AdoptHandOver(std::move(handOver));
             CachedStorageTexture entry{key, mip, std::move(created)};
@@ -4107,7 +4117,7 @@ bool ShaderResources::reresolveElements(const std::vector<std::size_t>& elements
         const auto resource = DecodeTextureResource(words);
         const VkImageViewType multisampleViewType = element.shape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
         auto texture = cachedTexture(context, words, resource, ViewComponents(resource), 0, element.depthCompare, multisampleViewType);
-        texture = unscaledTexture(context, std::move(texture), [&] { return cachedTexture(context, words, resource, ViewComponents(resource), 0, element.depthCompare, multisampleViewType); });
+        texture = unscaledTexture(context, std::move(texture), [&] { return cachedTexture(context, words, resource, ViewComponents(resource), 0, element.depthCompare, multisampleViewType); }, resource.baseAddress);
         if (texture == nullptr) return false;
         if (texture != textures[i]) replaced.emplace_back(i, std::move(texture));
     }
@@ -5778,7 +5788,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 texture = DepthSurfaceAt(resource.baseAddress) ? DepthSurfaceFirstSample(context, words, resource, components) : MultisampleTargetFirstSample(context, resource, components);
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType, layerRows);
-            if (element >= binding.imageScalable.size() || !binding.imageScalable[element]) texture = unscaledTexture(context, std::move(texture), [&] { return cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType, layerRows); });
+            if (element >= binding.imageScalable.size() || !binding.imageScalable[element]) texture = unscaledTexture(context, std::move(texture), [&] { return cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType, layerRows); }, resource.baseAddress);
             if (resource.dimension == TextureDimension::k2DMsaa) multisampleSources.push_back(resource.baseAddress);
             bool baseLevel = false;
             if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
@@ -5865,7 +5875,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else {
-            const ScaleRequestScope scaleScope(element < binding.imageScalable.size() && binding.imageScalable[element] ? ScaleRequest::Keep : ScaleRequest::Refuse);
+            const ScaleRequestScope scaleScope(element < binding.imageScalable.size() && binding.imageScalable[element] ? ScaleRequest::Keep : ScaleRequest::Refuse, "binding");
             storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, written));
         }
         storageMips.push_back(mip);
@@ -6322,7 +6332,7 @@ void ShaderResources::resolveImageTables() {
                     continue;
                 }
                 try {
-                    const ScaleRequestScope scaleScope(ScaleRequest::Refuse);
+                    const ScaleRequestScope scaleScope(ScaleRequest::Refuse, "image table");
                     storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, true));
                 } catch (const std::runtime_error& error) {
                     table.map[faults + element] = rejectTableElement(table, words, error.what());
@@ -7111,6 +7121,119 @@ bool ShaderResources::ReadsImage(const StorageTexture* image) const {
         if (texture != nullptr && texture->StorageSource() == image) return true;
     }
     return std::any_of(storageTextures.begin(), storageTextures.end(), [&](const auto& storage) { return storage.get() == image; });
+}
+
+
+namespace {
+
+thread_local bool gridScaleEligible = false;
+thread_local std::array<std::uint32_t, 3> gridScaleLocal{};
+
+struct GridScaleCounters {
+    std::atomic<std::uint64_t> scaled{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GridScaleRefusal::Count)> refused{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+GridScaleCounters& GridScaleStats() {
+    static GridScaleCounters counters;
+    return counters;
+}
+
+}
+
+GridScaleScope::GridScaleScope(bool eligible, std::array<std::uint32_t, 3> localThreads) : previousEligible(gridScaleEligible), previousLocal(gridScaleLocal) {
+    gridScaleEligible = eligible;
+    gridScaleLocal = localThreads;
+}
+
+GridScaleScope::~GridScaleScope() {
+    gridScaleEligible = previousEligible;
+    gridScaleLocal = previousLocal;
+}
+
+bool GridScaleScope::Eligible() {
+    return gridScaleEligible;
+}
+
+std::array<std::uint32_t, 3> GridScaleScope::LocalThreads() {
+    return gridScaleLocal;
+}
+
+void NoteGridScale(bool scaled, GridScaleRefusal reason) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& counters = GridScaleStats();
+    if (scaled) counters.scaled.fetch_add(1, std::memory_order_relaxed);
+    else counters.refused[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !counters.lastReport.compare_exchange_strong(last, now)) return;
+    static constexpr std::array<const char*, static_cast<std::size_t>(GridScaleRefusal::Count)> names{"shader not scalable", "dispatch not eligible", "image table", "no written image", "written image unscaled", "grid differs from image", "mixed scale factors"};
+    std::string line;
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s %llu%s", names[index], static_cast<unsigned long long>(counters.refused[index].load(std::memory_order_relaxed)), index + 1 < names.size() ? ", " : "");
+        line += item;
+    }
+    std::fprintf(stderr, "[render-scale] compute dispatches (cumulative): grid-scaled %llu; refused: %s\n", static_cast<unsigned long long>(counters.scaled.load(std::memory_order_relaxed)), line.c_str());
+}
+
+std::optional<GridScaleExtents> ShaderResources::GridScaleFor(const ShaderRecompiler::RecompileResult& program, std::uint32_t gridX, std::uint32_t gridY, GridScaleRefusal& refusal) const {
+    for (const auto& binding : program.bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap) {
+            refusal = GridScaleRefusal::ImageTable;
+            return std::nullopt;
+        }
+    }
+    std::optional<GridScaleExtents> extents;
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        const auto& image = storageTextures[index];
+        if (image == nullptr || index >= storageWritten.size() || !storageWritten[index]) continue;
+        const auto& descriptor = image->Descriptor();
+        if (descriptor.width != gridX || descriptor.height != gridY) {
+            refusal = GridScaleRefusal::GridMismatch;
+            return std::nullopt;
+        }
+        if (!image->Scaled()) {
+            refusal = GridScaleRefusal::WrittenUnscaled;
+            return std::nullopt;
+        }
+        const auto host = image->HostExtent();
+        if (extents.has_value() && (extents->hostX != host.width || extents->hostY != host.height)) {
+            refusal = GridScaleRefusal::MixedScale;
+            return std::nullopt;
+        }
+        extents = GridScaleExtents{gridX, gridY, host.width, host.height};
+    }
+    if (!extents.has_value()) {
+        refusal = GridScaleRefusal::NoWrittenImage;
+        return std::nullopt;
+    }
+    const auto consistent = [&](const StorageTexture& image) {
+        if (!image.Scaled()) return true;
+        const auto host = image.HostExtent();
+        const auto& descriptor = image.Descriptor();
+        const auto differs = [](std::uint64_t imageHost, std::uint64_t imageGuest, std::uint64_t gridHost, std::uint64_t gridGuest) {
+            const auto left = imageHost * gridGuest;
+            const auto right = gridHost * imageGuest;
+            return (left > right ? left - right : right - left) > gridGuest;
+        };
+        return !differs(host.width, descriptor.width, extents->hostX, extents->guestX) && !differs(host.height, descriptor.height, extents->hostY, extents->guestY);
+    };
+    for (const auto& image : storageTextures) {
+        if (image != nullptr && !consistent(*image)) {
+            refusal = GridScaleRefusal::MixedScale;
+            return std::nullopt;
+        }
+    }
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->StorageSource() != nullptr && !consistent(*texture->StorageSource())) {
+            refusal = GridScaleRefusal::MixedScale;
+            return std::nullopt;
+        }
+    }
+    return extents;
 }
 
 }

@@ -12,6 +12,8 @@ public:
     void Collect(IrProgram& program, const ShaderStageInputInfo& inputInfo) const;
 };
 
+[[nodiscard]] bool ProveGridPointwise(const IrProgram& program);
+
 }
 
 #endif

@@ -2298,9 +2298,34 @@ std::uint32_t EmitGuestFragCoord(SpirvEmitterState& state, std::uint32_t bits, s
 
 }
 
+namespace {
+
+std::uint32_t EmitGuestInvocation(SpirvEmitterState& state, StageInputKind builtin, std::uint32_t component) {
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto word = [&](std::uint32_t offset) { return state.module.SpecializationConstant(u32, PipelineSpecialization::GridScaleBase + offset, 0u); };
+    const auto guest = word(component);
+    const auto host = word(2u + component);
+    const auto active = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpINotEqual, boolean, guest, ConstantU32(state, 0u)), Binary(state, spv::OpINotEqual, boolean, host, ConstantU32(state, 0u)));
+    const auto hostGlobal = EmitBuiltinU32(state, StageInputKind::GlobalInvocationId, component);
+    const auto numerator = EmitBinaryU32(state, spv::OpIMul, EmitBinaryU32(state, spv::OpIAdd, EmitBinaryU32(state, spv::OpShiftLeftLogical, hostGlobal, ConstantU32(state, 1u)), ConstantU32(state, 1u)), guest);
+    const auto denominator = Select(state, u32, active, EmitBinaryU32(state, spv::OpShiftLeftLogical, host, ConstantU32(state, 1u)), ConstantU32(state, 1u));
+    const auto inside = EmitBinaryU32(state, spv::OpUDiv, numerator, denominator);
+    const auto beyond = EmitBinaryU32(state, spv::OpIAdd, guest, EmitBinaryU32(state, spv::OpISub, hostGlobal, host));
+    const auto mapped = Select(state, u32, Binary(state, spv::OpULessThan, boolean, hostGlobal, host), inside, beyond);
+    const auto global = Select(state, u32, active, mapped, hostGlobal);
+    if (builtin == StageInputKind::GlobalInvocationId) return Select(state, u32, active, global, EmitBuiltinU32(state, builtin, component));
+    const auto local = ConstantU32(state, std::max(WorkgroupLocalSize(state, *ShaderWorkgroupInput(state))[component], 1u));
+    const auto remapped = builtin == StageInputKind::WorkgroupId ? EmitBinaryU32(state, spv::OpUDiv, global, local) : EmitBinaryU32(state, spv::OpUMod, global, local);
+    return Select(state, u32, active, remapped, EmitBuiltinU32(state, builtin, component));
+}
+
+}
+
 std::uint32_t EmitGetBuiltin(SpirvValueEmitContext& ctx, const IrValue* kind, const IrValue* index) {
     const auto builtin = static_cast<StageInputKind>(kind->ImmediateU32());
     const auto component = index->ImmediateU32();
+    if (ctx.state.renderScale && ctx.state.program.Info().gridScalable && StageOf(ctx.state) == IrShaderStage::Compute && component < 2u && (builtin == StageInputKind::WorkgroupId || builtin == StageInputKind::LocalInvocationId || builtin == StageInputKind::GlobalInvocationId)) return EmitGuestInvocation(ctx.state, builtin, component);
     const auto value = EmitBuiltinU32(ctx.state, builtin, component);
     if (!ctx.state.renderScale || builtin != StageInputKind::FragCoord || component > 1u || StageOf(ctx.state) != IrShaderStage::Pixel) return value;
     return EmitGuestFragCoord(ctx.state, value, component);

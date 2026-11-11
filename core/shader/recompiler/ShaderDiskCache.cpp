@@ -141,7 +141,7 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 24, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 25, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 50, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
@@ -578,6 +578,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.stencilReplaySafe);
     writer.Value(result.bdaWrites);
     writer.Value(result.layerReplaySafe);
+    writer.Value(result.gridScalable);
     writer.Value(result.stencilReferenceDword);
 }
 
@@ -649,6 +650,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.stencilReplaySafe);
     reader.Value(result.bdaWrites);
     reader.Value(result.layerReplaySafe);
+    reader.Value(result.gridScalable);
     reader.Value(result.stencilReferenceDword);
     result.variantId = 0;
 }
@@ -876,6 +878,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.rasterPrimitive);
     writer.Value(info.layerExported);
     writer.Value(info.smoothOffsetBarycentrics);
+    writer.Value(info.gridScalable);
 }
 
 void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
@@ -994,6 +997,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.rasterPrimitive);
     reader.Value(info.layerExported);
     reader.Value(info.smoothOffsetBarycentrics);
+    reader.Value(info.gridScalable);
 }
 
 void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {

@@ -930,6 +930,7 @@ struct CompiledShaderArtifact {
     bool stencilReplaySafe = false;
     bool bdaWrites = false;
     bool layerReplaySafe = false;
+    bool gridScalable = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
     std::uint64_t variantId = 0;
 };
