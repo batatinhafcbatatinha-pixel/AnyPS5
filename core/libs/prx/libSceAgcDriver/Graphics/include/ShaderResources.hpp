@@ -363,7 +363,7 @@ public:
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
-    std::optional<GridScaleExtents> GridScaleFor(const ShaderRecompiler::RecompileResult& program, std::uint32_t gridX, std::uint32_t gridY, GridScaleRefusal& refusal) const;
+    std::optional<GridScaleExtents> GridScaleFor(const ShaderRecompiler::RecompileResult& program, std::uint32_t gridX, std::uint32_t gridY, std::uint32_t localX, std::uint32_t localY, GridScaleRefusal& refusal) const;
     static std::size_t LookupLogCapacity();
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults() const;

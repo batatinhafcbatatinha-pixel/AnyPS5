@@ -5813,7 +5813,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         std::optional<Graphics::GridScaleExtents> extents;
         if (!record.shader->program->gridScalable) refusal = Graphics::GridScaleRefusal::NotScalable;
         else if (!Graphics::GridScaleScope::Eligible() || record.z != 1u || localThreads[0] == 0u || localThreads[1] == 0u || localThreads[2] != 1u) refusal = Graphics::GridScaleRefusal::NotEligible;
-        else extents = resources.GridScaleFor(*record.shader->program, record.x * localThreads[0], record.y * localThreads[1], refusal);
+        else extents = resources.GridScaleFor(*record.shader->program, record.x * localThreads[0], record.y * localThreads[1], localThreads[0], localThreads[1], refusal);
         if (extents.has_value()) {
             record.grid = {extents->guestX, extents->guestY, extents->hostX, extents->hostY};
             record.x = (extents->hostX + localThreads[0] - 1u) / localThreads[0];

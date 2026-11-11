@@ -1432,7 +1432,8 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             evicted.push_back(detached);
             it = cache.entries.end();
         }
-        const auto request = ScaleRequestScope::Current() == ScaleRequest::Keep && written ? ScaleRequest::Allow : ScaleRequestScope::Current();
+        static const bool noStorage = [] { const char* text = std::getenv("ANYPS5_RENDER_SCALE_NO_STORAGE"); return text != nullptr && *text != 0 && *text != '0'; }();
+        const auto request = ScaleRequestScope::Current() == ScaleRequest::Keep && written && !noStorage ? ScaleRequest::Allow : ScaleRequestScope::Current();
         if (request == ScaleRequest::Refuse) RefuseScale(resource.baseAddress, ScaleRequestScope::Reason());
         if (it != cache.entries.end() && it->texture->Scaled() && (request == ScaleRequest::Refuse || !ScaleCandidate(resource, mip))) {
             LogScaleSurface(resource.baseAddress, {resource.width, resource.height}, it->texture->HostExtent(), static_cast<int>(it->texture->ImageFormat()), written ? "storage" : "colour", "demoted", request == ScaleRequest::Refuse ? ScaleRequestScope::Reason() : "policy");
@@ -7182,19 +7183,52 @@ void NoteGridScale(bool scaled, GridScaleRefusal reason) {
     std::fprintf(stderr, "[render-scale] compute dispatches (cumulative): grid-scaled %llu; refused: %s\n", static_cast<unsigned long long>(counters.scaled.load(std::memory_order_relaxed)), line.c_str());
 }
 
-std::optional<GridScaleExtents> ShaderResources::GridScaleFor(const ShaderRecompiler::RecompileResult& program, std::uint32_t gridX, std::uint32_t gridY, GridScaleRefusal& refusal) const {
+std::optional<GridScaleExtents> ShaderResources::GridScaleFor(const ShaderRecompiler::RecompileResult& program, std::uint32_t gridX, std::uint32_t gridY, std::uint32_t localX, std::uint32_t localY, GridScaleRefusal& refusal) const {
     for (const auto& binding : program.bindings) {
         if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap) {
             refusal = GridScaleRefusal::ImageTable;
             return std::nullopt;
         }
     }
+    static const bool trace = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto axisExtents = [](std::uint32_t grid, std::uint32_t local, std::uint32_t guest, std::uint32_t host, std::uint32_t& guestThreads, std::uint32_t& hostThreads) {
+        if (grid == guest) {
+            guestThreads = grid;
+            hostThreads = host;
+            return true;
+        }
+        if (grid > guest && grid - guest < local) {
+            guestThreads = grid;
+            hostThreads = static_cast<std::uint32_t>((static_cast<std::uint64_t>(grid) * host + guest / 2u) / guest);
+            return hostThreads != 0u;
+        }
+        if (grid != 0u && guest % grid == 0u) {
+            const auto factor = guest / grid;
+            if (factor <= 4u && host != 0u && guest % host == 0u && host % factor == 0u) {
+                guestThreads = grid;
+                hostThreads = host / factor;
+                return true;
+            }
+        }
+        return false;
+    };
     std::optional<GridScaleExtents> extents;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         const auto& image = storageTextures[index];
         if (image == nullptr || index >= storageWritten.size() || !storageWritten[index]) continue;
         const auto& descriptor = image->Descriptor();
-        if (descriptor.width != gridX || descriptor.height != gridY) {
+        const auto host = image->HostExtent();
+        GridScaleExtents mine;
+        const bool fits = axisExtents(gridX, localX, descriptor.width, host.width, mine.guestX, mine.hostX) && axisExtents(gridY, localY, descriptor.height, host.height, mine.guestY, mine.hostY);
+        if (trace) {
+            static std::mutex traceMutex;
+            static std::set<std::string> seen;
+            char key[160];
+            std::snprintf(key, sizeof(key), "grid %ux%u local %ux%u image %ux%u host %ux%u scaled %d %s", gridX, gridY, localX, localY, descriptor.width, descriptor.height, host.width, host.height, image->Scaled() ? 1 : 0, fits ? "fits" : "differs");
+            std::lock_guard lock(traceMutex);
+            if (seen.size() < 256 && seen.insert(key).second) std::fprintf(stderr, "[render-scale] compute written %s\n", key);
+        }
+        if (!fits) {
             refusal = GridScaleRefusal::GridMismatch;
             return std::nullopt;
         }
@@ -7202,12 +7236,11 @@ std::optional<GridScaleExtents> ShaderResources::GridScaleFor(const ShaderRecomp
             refusal = GridScaleRefusal::WrittenUnscaled;
             return std::nullopt;
         }
-        const auto host = image->HostExtent();
-        if (extents.has_value() && (extents->hostX != host.width || extents->hostY != host.height)) {
+        if (extents.has_value() && (extents->guestX != mine.guestX || extents->guestY != mine.guestY || extents->hostX != mine.hostX || extents->hostY != mine.hostY)) {
             refusal = GridScaleRefusal::MixedScale;
             return std::nullopt;
         }
-        extents = GridScaleExtents{gridX, gridY, host.width, host.height};
+        extents = mine;
     }
     if (!extents.has_value()) {
         refusal = GridScaleRefusal::NoWrittenImage;

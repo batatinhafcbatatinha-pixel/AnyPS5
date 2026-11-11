@@ -218,6 +218,7 @@ void DefineInputs(SpirvEmitterState& state) {
             }
         }
     }
+    if (StageOf(state) == IrShaderStage::Compute && state.renderScale && state.program.Info().gridScalable) addBuiltin(StageInputKind::GlobalInvocationId, 3u, "gl_GlobalInvocationID");
     if (state.laneCount == 2u || state.spannedWave) {
         addBuiltin(StageInputKind::LocalInvocationIndex, 1u, "gl_LocalInvocationIndex");
         if (std::any_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) {

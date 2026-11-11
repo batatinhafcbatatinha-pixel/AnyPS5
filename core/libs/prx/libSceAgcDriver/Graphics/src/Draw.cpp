@@ -688,9 +688,9 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     const auto commands = recorder.Commands();
     if (resident != nullptr && !resident->Cached()) recorder.KeepBytes(resident.get(), static_cast<std::size_t>(resident->BudgetBytes()));
     recorder.Keep(resident);
-    if (resident != nullptr) resident->BeginTwinWrite();
-    context.detiler->DispatchCmaskClear(commands, import.buffer, HostImportOffset(import, address), bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
-    if (resident != nullptr) resident->EndTwinWrite();
+    const bool scaled = resident != nullptr && resident->Scaled();
+    context.detiler->DispatchCmaskClear(commands, import.buffer, HostImportOffset(import, address), bytes, scaled ? resident->HostElementView() : view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0, scaled ? resident->HostExtent() : VkExtent2D{});
+    if (scaled) resident->NoteHostWritten();
     recorder.NotePendingWrite(address, bytes);
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }
@@ -3368,7 +3368,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& targetViews = prepared.targetViews;
     if (RenderScaleEnabled() && state.depth && state.depth->samples == 1u && state.hasColorTarget && state.color.extent.width == state.depth->extent.width && state.color.extent.height == state.depth->extent.height) NoteSceneExtent(state.depth->extent);
     RenderScaleTick();
-    const ScaleRequestScope scaleScope(!RenderScaleEnabled() ? ScaleRequest::Keep : std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.samples > 1u; }) || (state.depth && state.depth->samples != 1u) ? ScaleRequest::Refuse : ScaleRequest::Allow, "multisampled");
+    const bool multisampledDraw = std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.samples > 1u; }) || (state.depth && state.depth->samples != 1u);
+    const bool wholeDrawScales = RenderScaleEnabled() && !multisampledDraw && std::ranges::all_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice == 0 && ScaleCandidate(SurfaceForTarget(color), 0); }) && (!state.depth || DepthSurfaceHostExtent(context, *state.depth).has_value() || ScaleCandidateExtent(state.depth->address, DepthSliceBytes(state.depth->extent, 4u), state.depth->extent, true));
+    const ScaleRequestScope scaleScope(!RenderScaleEnabled() ? ScaleRequest::Keep : wholeDrawScales ? ScaleRequest::Allow : ScaleRequest::Refuse, multisampledDraw ? "multisampled" : "mixed targets");
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
