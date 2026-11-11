@@ -1674,9 +1674,11 @@ namespace {
 
 struct ScalePolicy {
     std::mutex mutex;
-    VkExtent2D scene{};
+    std::vector<VkExtent2D> families;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> displays;
+    std::vector<VkExtent2D> displayExtents;
     std::set<std::uint64_t> refused;
+    std::map<std::string, std::uint64_t> reasons;
 };
 
 ScalePolicy& Policy() {
@@ -1685,10 +1687,31 @@ ScalePolicy& Policy() {
 }
 
 thread_local ScaleRequest currentScaleRequest = ScaleRequest::Keep;
+thread_local const char* currentScaleReason = "refused";
 
-bool NearHalf(std::uint32_t value, std::uint32_t full) {
-    const auto difference = static_cast<std::int64_t>(value) - static_cast<std::int64_t>((full + 1u) / 2u);
+struct ScaleCounters {
+    std::atomic<std::int64_t> surfaces{0};
+    std::atomic<std::int64_t> guestBytes{0};
+    std::atomic<std::int64_t> hostBytes{0};
+    std::atomic<std::uint64_t> toHost{0};
+    std::atomic<std::uint64_t> toHostBytes{0};
+    std::atomic<std::uint64_t> toTwin{0};
+    std::atomic<std::uint64_t> toTwinBytes{0};
+    std::atomic<std::uint64_t> demotions{0};
+};
+
+ScaleCounters& ScaleCounts() {
+    static ScaleCounters counters;
+    return counters;
+}
+
+bool NearFraction(std::uint32_t value, std::uint32_t full, std::uint32_t parts) {
+    const auto difference = static_cast<std::int64_t>(value) - static_cast<std::int64_t>((full + parts - 1u) / parts);
     return difference >= -1 && difference <= 1;
+}
+
+bool SameExtent(VkExtent2D a, VkExtent2D b) {
+    return a.width == b.width && a.height == b.height;
 }
 
 }
@@ -1714,12 +1737,18 @@ bool RenderScaleEnabled() {
     return RenderScale() < 1.0f;
 }
 
-ScaleRequestScope::ScaleRequestScope(ScaleRequest request) : previous(currentScaleRequest) {
+ScaleRequestScope::ScaleRequestScope(ScaleRequest request, const char* reason) : previous(currentScaleRequest), previousReason(currentScaleReason) {
     currentScaleRequest = request;
+    currentScaleReason = reason;
 }
 
 ScaleRequestScope::~ScaleRequestScope() {
     currentScaleRequest = previous;
+    currentScaleReason = previousReason;
+}
+
+const char* ScaleRequestScope::Reason() {
+    return currentScaleReason;
 }
 
 ScaleRequest ScaleRequestScope::Current() {
@@ -1727,18 +1756,19 @@ ScaleRequest ScaleRequestScope::Current() {
 }
 
 void NoteSceneExtent(VkExtent2D extent) {
-    if (!RenderScaleEnabled()) return;
+    if (!RenderScaleEnabled() || extent.width == 0 || extent.height == 0) return;
     auto& policy = Policy();
     std::lock_guard lock(policy.mutex);
-    if (static_cast<std::uint64_t>(extent.width) * extent.height <= static_cast<std::uint64_t>(policy.scene.width) * policy.scene.height) return;
-    policy.scene = extent;
-    std::fprintf(stderr, "[render-scale] scene extent %ux%u\n", extent.width, extent.height);
+    if (std::ranges::any_of(policy.families, [&](VkExtent2D family) { return SameExtent(family, extent); })) return;
+    policy.families.push_back(extent);
+    std::fprintf(stderr, "[render-scale] render-target family %ux%u\n", extent.width, extent.height);
 }
 
-void NoteDisplaySurface(std::uint64_t address, std::uint64_t bytes) {
+void NoteDisplaySurface(std::uint64_t address, std::uint64_t bytes, VkExtent2D extent) {
     if (!RenderScaleEnabled() || bytes == 0) return;
     auto& policy = Policy();
     std::lock_guard lock(policy.mutex);
+    if (!std::ranges::any_of(policy.displayExtents, [&](VkExtent2D known) { return SameExtent(known, extent); })) policy.displayExtents.push_back(extent);
     for (const auto& range : policy.displays) {
         if (range.first == address && range.second == bytes) return;
     }
@@ -1751,11 +1781,11 @@ bool DisplaySurfaceOverlaps(std::uint64_t address, std::uint64_t bytes) {
     return std::ranges::any_of(policy.displays, [&](const auto& range) { return address < range.first + range.second && range.first < address + bytes; });
 }
 
-void RefuseScale(std::uint64_t address) {
+void RefuseScale(std::uint64_t address, const char* reason) {
     if (!RenderScaleEnabled()) return;
     auto& policy = Policy();
     std::lock_guard lock(policy.mutex);
-    policy.refused.insert(address);
+    if (policy.refused.insert(address).second) ++policy.reasons[reason];
 }
 
 bool ScaleRefused(std::uint64_t address) {
@@ -1771,17 +1801,67 @@ VkExtent2D ScaledExtent(VkExtent2D extent) {
     return {axis(extent.width), axis(extent.height)};
 }
 
-bool ScaleCandidate(const GuestTextureResource& descriptor, std::uint32_t mip) {
-    if (!RenderScaleEnabled() || mip != 0 || descriptor.dimension != TextureDimension::k2D || descriptor.mipCount != 1 || descriptor.baseLevel != 0 || descriptor.baseArray != 0 || descriptor.depthOrLastArray != 0) return false;
-    if (IsBlockCompressed(descriptor.format) || IsRepackedTextureFormat(descriptor.format) || descriptor.tileMode == TextureTileMode::kLinear || descriptor.fmaskCmaskAddress != 0) return false;
+bool ScaleCandidateExtent(std::uint64_t address, std::uint64_t bytes, VkExtent2D extent) {
+    if (!RenderScaleEnabled()) return false;
     {
         auto& policy = Policy();
         std::lock_guard lock(policy.mutex);
-        if (policy.refused.contains(descriptor.baseAddress) || policy.scene.width == 0) return false;
-        const bool full = descriptor.width == policy.scene.width && descriptor.height == policy.scene.height;
-        if (!full && !(NearHalf(descriptor.width, policy.scene.width) && NearHalf(descriptor.height, policy.scene.height))) return false;
+        if (policy.refused.contains(address)) return false;
+        const auto member = [&](VkExtent2D family) {
+            if (std::ranges::any_of(policy.displayExtents, [&](VkExtent2D display) { return SameExtent(display, family); })) return false;
+            if (SameExtent(family, extent)) return true;
+            for (std::uint32_t parts = 2; parts <= 4; ++parts) {
+                if (NearFraction(extent.width, family.width, parts) && NearFraction(extent.height, family.height, parts)) return true;
+            }
+            return false;
+        };
+        if (!std::ranges::any_of(policy.families, member)) return false;
     }
-    return !DisplaySurfaceOverlaps(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes);
+    return !DisplaySurfaceOverlaps(address, bytes);
+}
+
+bool ScaleCandidate(const GuestTextureResource& descriptor, std::uint32_t mip) {
+    if (!RenderScaleEnabled() || mip != 0 || descriptor.dimension != TextureDimension::k2D || descriptor.mipCount != 1 || descriptor.baseLevel != 0 || descriptor.baseArray != 0 || descriptor.depthOrLastArray != 0) return false;
+    if (IsBlockCompressed(descriptor.format) || IsRepackedTextureFormat(descriptor.format) || descriptor.tileMode == TextureTileMode::kLinear || descriptor.fmaskCmaskAddress != 0) return false;
+    return ScaleCandidateExtent(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes, {descriptor.width, descriptor.height});
+}
+
+void NoteScaleDemotion() {
+    ScaleCounts().demotions.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteScaledSurface(std::int64_t guestBytes, std::int64_t hostBytes, std::int64_t count) {
+    auto& counts = ScaleCounts();
+    counts.surfaces.fetch_add(count, std::memory_order_relaxed);
+    counts.guestBytes.fetch_add(guestBytes * count, std::memory_order_relaxed);
+    counts.hostBytes.fetch_add(hostBytes * count, std::memory_order_relaxed);
+}
+
+void NoteScaleResample(bool toHost, std::uint64_t bytes) {
+    auto& counts = ScaleCounts();
+    (toHost ? counts.toHost : counts.toTwin).fetch_add(1, std::memory_order_relaxed);
+    (toHost ? counts.toHostBytes : counts.toTwinBytes).fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void RenderScaleTick() {
+    if (!RenderScaleEnabled() || !LookupOutcomes::Profiled()) return;
+    static std::atomic<std::int64_t> last{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (previous == 0) {
+        last.compare_exchange_strong(previous, now);
+        return;
+    }
+    if (now - previous < 10 || !last.compare_exchange_strong(previous, now)) return;
+    auto& counts = ScaleCounts();
+    std::string refused;
+    {
+        auto& policy = Policy();
+        std::lock_guard lock(policy.mutex);
+        for (const auto& [reason, count] : policy.reasons) refused += " " + reason + "=" + std::to_string(count);
+    }
+    constexpr double mib = 1048576.0;
+    std::fprintf(stderr, "[render-scale] scaled %lld surfaces (%.0f MiB guest -> %.0f MiB host), refused:%s, twin->host %llu (%.0f MiB), host->twin %llu (%.0f MiB), demotions %llu (10 s)\n", static_cast<long long>(counts.surfaces.load()), static_cast<double>(counts.guestBytes.load()) / mib, static_cast<double>(counts.hostBytes.load()) / mib, refused.empty() ? " none" : refused.c_str(), static_cast<unsigned long long>(counts.toHost.exchange(0)), static_cast<double>(counts.toHostBytes.exchange(0)) / mib, static_cast<unsigned long long>(counts.toTwin.exchange(0)), static_cast<double>(counts.toTwinBytes.exchange(0)) / mib, static_cast<unsigned long long>(counts.demotions.exchange(0)));
 }
 
 std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, VkExtent2D hostExtent) {
@@ -1846,6 +1926,7 @@ void StorageTexture::createHostImage(const VkImageCreateInfo& twinInfo, VkExtent
     }
     hostExtent = extent;
     memoryBytes += hostAllocation.Size();
+    NoteScaledSurface(static_cast<std::int64_t>(guestBytes), static_cast<std::int64_t>(hostAllocation.Size()), 1);
     resampleFilter = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
 }
 
@@ -1878,7 +1959,7 @@ void StorageTexture::recordResample(VkCommandBuffer commands, bool toHost) {
 }
 
 void StorageTexture::resample(bool toHost) {
-    auto* recorder = Recorder::Active();
+    auto* recorder = recorderFor(context);
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     if (recorder != nullptr) {
@@ -1890,8 +1971,19 @@ void StorageTexture::resample(bool toHost) {
     }
     recordResample(commands, toHost);
     if (batch) batch->SubmitAndWait();
+    NoteScaleResample(toHost, toHost ? hostAllocation.Size() : guestBytes);
     if (toHost) hostStale = false;
     else twinStale = false;
+}
+
+void StorageTexture::BeginTwinWrite() {
+    syncTwin();
+}
+
+void StorageTexture::EndTwinWrite() {
+    if (hostImage == VK_NULL_HANDLE) return;
+    hostStale = true;
+    SyncHost();
 }
 
 void StorageTexture::SyncHost() {
@@ -2341,7 +2433,7 @@ bool ClearColorForTexel(VkFormat format, std::uint32_t elementBytes, std::span<c
     return FillClearColor(format, elementBytes, pattern, clear);
 }
 
-VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format) const {
+VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFormat format, bool twin) const {
     Require(mip < descriptor.mipCount, "storage texture mip level is outside the texture");
     Require(!firstLayer || descriptor.dimension == TextureDimension::k2DArray, "a first-layer storage view needs a 2D array surface");
     const auto viewLayerCount = firstLayer ? 1u : geometry.imageLayers - descriptor.baseArray;
@@ -2350,7 +2442,7 @@ VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFor
     usage.usage = packed && format == storageFormat ? VK_IMAGE_USAGE_SAMPLED_BIT | (attachable ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0u) : VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.pNext = format == storageFormat && !packed ? nullptr : &usage;
-    viewInfo.image = Image();
+    viewInfo.image = twin ? image : Image();
     // Storage views address one mip; cube faces are written as array layers.
     viewInfo.viewType = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : descriptor.dimension == TextureDimension::k2D ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : descriptor.dimension == TextureDimension::k1DArray ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     viewInfo.format = format;
@@ -2539,7 +2631,7 @@ VkImageView StorageTexture::ElementView() {
     const auto bytes = BytesPerElement(descriptor.format);
     const auto format = bytes == 1 ? VK_FORMAT_R8_UINT : bytes == 2 ? VK_FORMAT_R16_UINT : bytes == 4 ? VK_FORMAT_R32_UINT : bytes == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_UNDEFINED;
     if (format == VK_FORMAT_UNDEFINED || StorageFormatOrUndefined(context, format) != format) return VK_NULL_HANDLE;
-    elementView = createView(0, false, format);
+    elementView = createView(0, false, format, true);
     return elementView;
 }
 
@@ -7766,7 +7858,10 @@ void StorageTexture::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     imageAllocation.Reset();
-    if (hostImage) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, hostImage, nullptr);
+    if (hostImage) {
+        context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, hostImage, nullptr);
+        NoteScaledSurface(static_cast<std::int64_t>(guestBytes), static_cast<std::int64_t>(hostAllocation.Size()), -1);
+    }
     hostImage = VK_NULL_HANDLE;
     hostAllocation.Reset();
 }

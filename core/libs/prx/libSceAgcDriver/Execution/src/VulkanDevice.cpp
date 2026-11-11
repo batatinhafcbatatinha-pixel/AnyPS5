@@ -433,7 +433,7 @@ struct ComputePipelineObjects {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkDescriptorSetLayout resourcesLayout = VK_NULL_HANDLE;
     std::mutex splitMutex;
-    std::map<std::array<std::uint32_t, 3>, VkPipeline> splitPipelines;
+    std::map<std::array<std::uint32_t, 7>, VkPipeline> splitPipelines;
     ~ComputePipelineObjects() {
         for (const auto& [base, split] : splitPipelines) destroyPipeline(device, split, nullptr);
         if (pipeline != VK_NULL_HANDLE) destroyPipeline(device, pipeline, nullptr);
@@ -3874,7 +3874,7 @@ void WriteFrameBmp(int index, std::uint32_t width, std::uint32_t height, std::sp
 ResidentPresent ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter, std::uint32_t& layer) {
     const auto& descriptor = image.Descriptor();
     if (image.Scaled()) {
-        Graphics::RefuseScale(descriptor.baseAddress);
+        Graphics::RefuseScale(descriptor.baseAddress, "present");
         return ResidentPresent::None;
     }
     const bool gcn = buffer.tilingMode == DisplayTilingGcn;
@@ -4027,8 +4027,8 @@ FrameDumps& Dumps() {
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const DisplayBuffer* plane) {
-    Graphics::NoteDisplaySurface(buffer.address, DisplayBufferSize(buffer));
-    if (plane != nullptr) Graphics::NoteDisplaySurface(plane->address, DisplayBufferSize(*plane));
+    Graphics::NoteDisplaySurface(buffer.address, DisplayBufferSize(buffer), {buffer.width, buffer.height});
+    if (plane != nullptr) Graphics::NoteDisplaySurface(plane->address, DisplayBufferSize(*plane), {plane->width, plane->height});
     state->presentingGuestFrame = true;
     struct ClearGuestFrame {
         bool& flag;
@@ -5447,6 +5447,7 @@ struct RecordedDispatch {
     int cpuReason = 0;
     std::array<std::uint32_t, 3> threadGroup{};
     std::array<std::uint32_t, 3> threadLimit{};
+    std::array<std::uint32_t, 4> grid{};
 };
 
 struct DispatchCompletion {
@@ -5806,6 +5807,20 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const auto arguments = record.arguments;
     const auto* argumentImport = record.argumentImport;
     const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
+    if (Graphics::RenderScaleEnabled() && arguments == 0 && argumentImport == nullptr && record.threadGroup == std::array<std::uint32_t, 3>{}) {
+        Graphics::GridScaleRefusal refusal = Graphics::GridScaleRefusal::NotScalable;
+        const auto localThreads = Graphics::GridScaleScope::LocalThreads();
+        std::optional<Graphics::GridScaleExtents> extents;
+        if (!record.shader->program->gridScalable) refusal = Graphics::GridScaleRefusal::NotScalable;
+        else if (!Graphics::GridScaleScope::Eligible() || record.z != 1u || localThreads[0] == 0u || localThreads[1] == 0u || localThreads[2] != 1u) refusal = Graphics::GridScaleRefusal::NotEligible;
+        else extents = resources.GridScaleFor(*record.shader->program, record.x * localThreads[0], record.y * localThreads[1], refusal);
+        if (extents.has_value()) {
+            record.grid = {extents->guestX, extents->guestY, extents->hostX, extents->hostY};
+            record.x = (extents->hostX + localThreads[0] - 1u) / localThreads[0];
+            record.y = (extents->hostY + localThreads[1] - 1u) / localThreads[1];
+        }
+        Graphics::NoteGridScale(extents.has_value(), refusal);
+    }
     if (argumentImport == nullptr && record.shader->program->workgroupMemoryDwords != 0 && (record.x > limit[0] || record.y > limit[1] || record.z > limit[2])) {
         char counted[128] = "";
         if (record.cpuArguments != 0) std::snprintf(counted, sizeof(counted), " (read on the CPU from the indirect arguments at 0x%llx, cpuReason %d)", static_cast<unsigned long long>(record.cpuArguments), record.cpuReason);
@@ -5955,7 +5970,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             recorder.Keep(std::move(checked));
         }
     }
-    context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
+    context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.grid != std::array<std::uint32_t, 4>{} ? splitComputePipeline(context, *record.shader->program, *record.objects, {0u, 0u, 0u}, record.grid) : record.objects->pipeline);
     if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
     if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
     else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
@@ -6043,7 +6058,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
                     for (std::uint32_t xBase = 0; xBase < record.x; xBase += limit[0]) {
                         if (!firstChunk) {
                             Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-                            bindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, splitComputePipeline(context, *record.shader->program, *record.objects, {xBase, yBase, zBase}));
+                            bindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, splitComputePipeline(context, *record.shader->program, *record.objects, {xBase, yBase, zBase}, record.grid));
                         }
                         firstChunk = false;
                         dispatchChunk(commands, std::min(limit[0], record.x - xBase), std::min(limit[1], record.y - yBase), std::min(limit[2], record.z - zBase));
@@ -6166,12 +6181,16 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     return objects;
 }
 
-VkPipeline VulkanDevice::splitComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects, const std::array<std::uint32_t, 3>& base) {
+VkPipeline VulkanDevice::splitComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects, const std::array<std::uint32_t, 3>& base, const std::array<std::uint32_t, 4>& grid) {
     std::lock_guard lock(objects.splitMutex);
-    if (const auto found = objects.splitPipelines.find(base); found != objects.splitPipelines.end()) return found->second;
-    std::array<ShaderRecompiler::PipelineSpecializationConstant, ShaderRecompiler::PipelineSpecialization::WorkgroupOffsetWords> offsets{};
-    for (std::uint32_t component = 0; component < offsets.size(); ++component) offsets[component] = {ShaderRecompiler::PipelineSpecialization::WorkgroupOffsetBase + component, base[component]};
-    const Graphics::PipelineSpecialization specialization(shader, offsets);
+    const std::array<std::uint32_t, 7> splitKey{base[0], base[1], base[2], grid[0], grid[1], grid[2], grid[3]};
+    if (const auto found = objects.splitPipelines.find(splitKey); found != objects.splitPipelines.end()) return found->second;
+    std::vector<ShaderRecompiler::PipelineSpecializationConstant> replaced;
+    for (const auto& constant : shader.specialization) {
+        if (ShaderRecompiler::PipelineSpecialization::IsWorkgroupOffset(constant.id)) replaced.push_back({constant.id, base[constant.id - ShaderRecompiler::PipelineSpecialization::WorkgroupOffsetBase]});
+        else if (ShaderRecompiler::PipelineSpecialization::IsGridScale(constant.id)) replaced.push_back({constant.id, grid[constant.id - ShaderRecompiler::PipelineSpecialization::GridScaleBase]});
+    }
+    const Graphics::PipelineSpecialization specialization(shader, replaced);
     VkShaderModule module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     VkPipeline pipeline = VK_NULL_HANDLE;
     try {
@@ -6184,7 +6203,7 @@ VkPipeline VulkanDevice::splitComputePipeline(const Graphics::Context& context, 
     computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
     state->computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
     if (GuestMemory::GpuMutex().HeldByThisThread()) computePipelinesCreatedLocked.fetch_add(1, std::memory_order_relaxed);
-    objects.splitPipelines.emplace(base, pipeline);
+    objects.splitPipelines.emplace(splitKey, pipeline);
     return pipeline;
 }
 

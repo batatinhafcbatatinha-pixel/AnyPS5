@@ -31,6 +31,31 @@ namespace AgcDriver::Graphics {
 
 class Recorder;
 
+enum class GridScaleRefusal : std::uint8_t { NotScalable, NotEligible, ImageTable, NoWrittenImage, WrittenUnscaled, GridMismatch, MixedScale, Count };
+
+struct GridScaleExtents {
+    std::uint32_t guestX = 0;
+    std::uint32_t guestY = 0;
+    std::uint32_t hostX = 0;
+    std::uint32_t hostY = 0;
+};
+
+class GridScaleScope {
+public:
+    explicit GridScaleScope(bool eligible, std::array<std::uint32_t, 3> localThreads);
+    ~GridScaleScope();
+    GridScaleScope(const GridScaleScope&) = delete;
+    GridScaleScope& operator=(const GridScaleScope&) = delete;
+    static bool Eligible();
+    static std::array<std::uint32_t, 3> LocalThreads();
+
+private:
+    bool previousEligible;
+    std::array<std::uint32_t, 3> previousLocal;
+};
+
+void NoteGridScale(bool scaled, GridScaleRefusal reason);
+
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
 struct WriteIndexOutcomes {
@@ -338,6 +363,7 @@ public:
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
+    std::optional<GridScaleExtents> GridScaleFor(const ShaderRecompiler::RecompileResult& program, std::uint32_t gridX, std::uint32_t gridY, GridScaleRefusal& refusal) const;
     static std::size_t LookupLogCapacity();
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults() const;

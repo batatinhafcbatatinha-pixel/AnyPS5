@@ -422,6 +422,18 @@ TargetScale targetScaleFor(std::span<const std::shared_ptr<StorageTexture>> resi
     return {};
 }
 
+TargetScale drawScale(const Context& context, std::span<const std::shared_ptr<StorageTexture>> residents, const State& state) {
+    auto scale = targetScaleFor(residents, state.renderExtent);
+    if (scale.Active() || !state.depth) return scale;
+    const auto host = DepthSurfaceHostExtent(context, *state.depth);
+    if (!host) return scale;
+    scale.guest = state.renderExtent;
+    scale.x = static_cast<float>(host->width) / static_cast<float>(state.depth->extent.width);
+    scale.y = static_cast<float>(host->height) / static_cast<float>(state.depth->extent.height);
+    scale.host = {std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::ceil(state.renderExtent.width * static_cast<double>(scale.x))), 1u, host->width), std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::ceil(state.renderExtent.height * static_cast<double>(scale.y))), 1u, host->height)};
+    return scale;
+}
+
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews) {
     std::uint64_t key = 14695981039346656037ull;
     const auto mix = [&](std::uint64_t value) {
@@ -666,7 +678,9 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     const auto commands = recorder.Commands();
     if (resident != nullptr && !resident->Cached()) recorder.KeepBytes(resident.get(), static_cast<std::size_t>(resident->BudgetBytes()));
     recorder.Keep(resident);
+    if (resident != nullptr) resident->BeginTwinWrite();
     context.detiler->DispatchCmaskClear(commands, import.buffer, HostImportOffset(import, address), bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
+    if (resident != nullptr) resident->EndTwinWrite();
     recorder.NotePendingWrite(address, bytes);
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }
@@ -2897,7 +2911,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
-    const auto targetScale = targetScaleFor(record.targets, state.renderExtent);
+    const auto targetScale = drawScale(context, record.targets, state);
     if (continued) {
         record.pipeline->Continue(commands, state, record.masked, &targetScale);
     } else {
@@ -3343,7 +3357,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     targets.resize(state.colors.size());
     auto& targetViews = prepared.targetViews;
     if (RenderScaleEnabled() && state.depth && state.depth->samples == 1u && state.hasColorTarget && state.color.extent.width == state.depth->extent.width && state.color.extent.height == state.depth->extent.height) NoteSceneExtent(state.depth->extent);
-    const ScaleRequestScope scaleScope(!RenderScaleEnabled() ? ScaleRequest::Keep : state.depth || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.samples > 1u; }) ? ScaleRequest::Refuse : ScaleRequest::Allow);
+    RenderScaleTick();
+    const ScaleRequestScope scaleScope(!RenderScaleEnabled() ? ScaleRequest::Keep : std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.samples > 1u; }) || (state.depth && state.depth->samples != 1u) ? ScaleRequest::Refuse : ScaleRequest::Allow, "multisampled");
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -3474,8 +3489,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     if (state.depth) {
         targetViews.push_back(DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)));
     }
-    if (RenderScaleEnabled() && std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident != nullptr && binding.resident->Scaled(); }) && (state.depth || std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident == nullptr || !binding.resident->Scaled(); }))) {
-        const ScaleRequestScope refuse(ScaleRequest::Refuse);
+    const bool depthScaled = RenderScaleEnabled() && state.depth && DepthSurfaceHostExtent(context, *state.depth).has_value();
+    if (RenderScaleEnabled() && (depthScaled || std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident != nullptr && binding.resident->Scaled(); })) && ((state.depth && !depthScaled) || std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident == nullptr || !binding.resident->Scaled(); }))) {
+        const ScaleRequestScope refuse(ScaleRequest::Refuse, "mixed targets");
+        if (depthScaled) targetViews.back() = DemoteDepthSurface(context, *state.depth);
         for (std::size_t index = 0; index < targets.size(); ++index) {
             auto& binding = targets[index];
             if (binding.resident == nullptr || !binding.resident->Scaled()) continue;
@@ -3490,6 +3507,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
+    const ScaleRequestScope resourceScope(ScaleRequest::Keep);
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, plan, outcome, timer);
     if (stopAfterResolve.load(std::memory_order_relaxed) != 0) {
         const auto stop = stopAfterResolve.exchange(0, std::memory_order_relaxed);
@@ -3674,7 +3692,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     {
         std::vector<std::shared_ptr<StorageTexture>> residents;
         for (const auto& binding : targets) residents.push_back(binding.resident);
-        const auto scale = targetScaleFor(residents, state.renderExtent);
+        const auto scale = drawScale(context, residents, state);
         if (scale.Active()) {
             if (!masked.has_value()) masked = state;
             masked->fragmentGuestExtent = scale.guest.width | (scale.guest.height << 16u);
@@ -3727,7 +3745,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     Require(!pipeline->ReordersSamples() || std::ranges::none_of(state.colors, [](const ColorTarget& color) { return color.staged; }), "a partial write of a multisampled packed color target on a device that puts the guest's samples in order is not implemented");
     auto& framebuffer = prepared.framebuffer;
-    const auto framebufferScale = targetScaleFor(owners, state.renderExtent);
+    const auto framebufferScale = drawScale(context, owners, state);
     framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, framebufferScale.Active() ? framebufferScale.host : state.renderExtent, state.renderLayers);
     auto& reordered = prepared.reordered;
     auto& reorderPass = prepared.reorderPass;
@@ -3965,7 +3983,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     std::vector<std::shared_ptr<void>> reorderKept;
     RecordSampleOrder(context, commands, reorderPass, reordered, true, reorderKept);
     APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-    const auto directScale = targetScaleFor(prepared.owners, state.renderExtent);
+    const auto directScale = drawScale(context, prepared.owners, state);
     pipeline->Begin(commands, *framebuffer, state.renderExtent, state, masked.has_value() ? &*masked : nullptr, &directScale);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     const auto drawUse = recorded ? resources->BeginDrawUse(*recorder) : nullptr;
@@ -4350,7 +4368,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto framebuffer = recipe.framebuffer.lock();
     if (framebuffer == nullptr) {
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
-        const auto framebufferScale = targetScaleFor(targets, state.renderExtent);
+        const auto framebufferScale = drawScale(context, targets, state);
         framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, framebufferScale.Active() ? framebufferScale.host : state.renderExtent, state.renderLayers);
     }
     timer.phase(PhasePipeline);

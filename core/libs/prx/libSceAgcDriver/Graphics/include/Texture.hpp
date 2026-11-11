@@ -47,19 +47,26 @@ bool RenderScaleEnabled();
 enum class ScaleRequest : std::uint8_t { Keep, Allow, Refuse };
 class ScaleRequestScope {
 public:
-    explicit ScaleRequestScope(ScaleRequest request);
+    explicit ScaleRequestScope(ScaleRequest request, const char* reason = "refused");
     ~ScaleRequestScope();
     ScaleRequestScope(const ScaleRequestScope&) = delete;
     ScaleRequestScope& operator=(const ScaleRequestScope&) = delete;
     static ScaleRequest Current();
+    static const char* Reason();
 
 private:
     ScaleRequest previous;
+    const char* previousReason;
 };
 void NoteSceneExtent(VkExtent2D extent);
-void NoteDisplaySurface(std::uint64_t address, std::uint64_t bytes);
+void NoteDisplaySurface(std::uint64_t address, std::uint64_t bytes, VkExtent2D extent);
+bool ScaleCandidateExtent(std::uint64_t address, std::uint64_t bytes, VkExtent2D extent);
+void NoteScaleDemotion();
+void NoteScaledSurface(std::int64_t guestBytes, std::int64_t hostBytes, std::int64_t count);
+void NoteScaleResample(bool toHost, std::uint64_t bytes);
+void RenderScaleTick();
 bool DisplaySurfaceOverlaps(std::uint64_t address, std::uint64_t bytes);
-void RefuseScale(std::uint64_t address);
+void RefuseScale(std::uint64_t address, const char* reason);
 bool ScaleRefused(std::uint64_t address);
 VkExtent2D ScaledExtent(VkExtent2D extent);
 bool ScaleCandidate(const GuestTextureResource& descriptor, std::uint32_t mip);
@@ -511,6 +518,8 @@ public:
     bool Scaled() const { return hostImage != VK_NULL_HANDLE; }
     VkExtent2D HostExtent() const { return Scaled() ? hostExtent : VkExtent2D{descriptor.width, descriptor.height}; }
     void SyncHost();
+    void BeginTwinWrite();
+    void EndTwinWrite();
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
     std::uint32_t ImageDepth() const { return geometry.imageDepth; }
@@ -780,7 +789,7 @@ private:
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
     bool storesWhole() const;
     void appendStoredLayers(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
-    VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format) const;
+    VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format, bool twin = false) const;
     bool singlePass();
     VkImageView elementLayerView(std::uint32_t level, std::uint32_t layer);
     void recordDirectUploadBarrier(VkCommandBuffer commands, bool discard);
