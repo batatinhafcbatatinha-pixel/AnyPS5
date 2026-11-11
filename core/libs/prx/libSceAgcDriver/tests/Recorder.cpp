@@ -4486,7 +4486,8 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
     };
     Require(!boundInPlace(address + 4096, 1u << 20u, false), "a written 1 MiB element was not staged");
     Require(boundInPlace(address + 4096, 4u << 20u, false) != context.discreteGpu, context.discreteGpu ? "a written-only 4 MiB element was bound in place on a discrete GPU" : "a written-only 4 MiB element was staged past the written window");
-    Require(boundInPlace(address + 4096, 12u << 20u, false), "a written-only 12 MiB element was staged past the discrete written window");
+    const bool residentWindow = context.discreteGpu && std::getenv("APS5_NO_RESIDENT_STAGING") == nullptr && (std::getenv("APS5_RESIDENT_STAGING_MIB") == nullptr || std::strtoull(std::getenv("APS5_RESIDENT_STAGING_MIB"), nullptr, 10) != 0);
+    Require(boundInPlace(address + 4096, 12u << 20u, false) != residentWindow, residentWindow ? "a written-only 12 MiB element was bound in place within the resident written window" : "a written-only 12 MiB element was staged past the discrete written window");
     Require(!boundInPlace(address + 4096, 4u << 20u, true), "a read and written 4 MiB element was bound in place");
     const auto buildInPlace = [&](std::uint64_t dispatchThreads, bool read, std::uint32_t stride, std::uint32_t extent, std::uint32_t elementBytes = 12u << 20u) {
         const auto element = address + 4096;

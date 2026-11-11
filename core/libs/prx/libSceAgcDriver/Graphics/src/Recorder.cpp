@@ -1054,10 +1054,11 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             record();
         }
     }
-    if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes)) {
+    if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes) || ResidentStagingOverlaps(address, bytes)) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
+        static_cast<void>(FlushResidentStaging(address, bytes, ResidentFlush::Access));
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
             const HookSyncScope attribution(*recorder, address, bytes);
             Recorder::CountSync(1);
@@ -1902,6 +1903,7 @@ void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize l
     ensureOpen();
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
+    static_cast<void>(FlushResidentStaging(begin, static_cast<std::size_t>(end - begin), ResidentFlush::GpuCommand, "key-store"));
     keyStoreCount.fetch_add(1, std::memory_order_relaxed);
     if (seed != nullptr) open->kept.push_back(seed);
     // The same range queued twice lands once: nothing wrote over it in between, or the writer
@@ -2011,8 +2013,14 @@ void Recorder::ensureOpen() {
     }
 }
 
+void Recorder::FlushStoresOverlapping(std::uint64_t address, std::size_t bytes) {
+    static_cast<void>(FlushResidentStaging(address, bytes, ResidentFlush::Pending, "gpu-command"));
+    if (HasQueuedStores() && QueuedStoreOverlaps(address, bytes)) FlushStores();
+}
+
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
+    static_cast<void>(FlushResidentStaging(address, bytes.size(), ResidentFlush::GpuCommand, "store"));
     ensureOpen();
     flushDeferredDispatch();
     auto& run = open->run;

@@ -324,7 +324,7 @@ public:
     // Whether `overlaps(begin, end)` holds for a queued store's guest range.
     bool AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const;
     void FlushStores();
-    void FlushStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedStores() && QueuedStoreOverlaps(address, bytes)) FlushStores(); }
+    void FlushStoresOverlapping(std::uint64_t address, std::size_t bytes);
 
     // Pending-label table. A GPU label (RELEASE_MEM/WRITE_DATA recorded as a store into the batch)
     // is noted per 4-byte dword with the value it will store and a record-order stamp (the driver's
