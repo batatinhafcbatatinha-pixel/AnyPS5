@@ -128,8 +128,23 @@ struct ImageResource {
     bool operator==(const ImageResource& other) const = default;
 };
 
-inline bool RenderScaleMapsImage(const ImageResource& image) {
-    return image.table == NoTable && !image.targetMerge && !image.cube && !image.remappedDepth1D && !image.layerRows && !image.volumeGather && !image.packed && image.byElements == 0u && !image.atomic && image.mipMode == ImageMipMode::None && (image.dimension == RdnaImageDimension::Dim2D || image.dimension == RdnaImageDimension::Dim2DArray);
+inline const char* RenderScaleImageRefusal(const ImageResource& image, IrShaderStage stage) {
+    if (image.table != NoTable) return "table";
+    if (image.targetMerge) return "target-merge";
+    if (image.cube) return "cube";
+    if (image.dimension != RdnaImageDimension::Dim2D && image.dimension != RdnaImageDimension::Dim2DArray) return "dimension";
+    if (image.remappedDepth1D) return "depth-1d";
+    if (image.layerRows) return "layer-rows";
+    if (image.volumeGather) return "volume-gather";
+    if (image.packed) return "packed";
+    if (image.byElements != 0u) return "by-elements";
+    if (image.atomic && stage != IrShaderStage::Pixel) return "atomic";
+    if (image.mipMode != ImageMipMode::None) return "dynamic-mip";
+    return nullptr;
+}
+
+inline bool RenderScaleMapsImage(const ImageResource& image, IrShaderStage stage) {
+    return RenderScaleImageRefusal(image, stage) == nullptr;
 }
 
 enum SamplerUse : std::uint16_t {

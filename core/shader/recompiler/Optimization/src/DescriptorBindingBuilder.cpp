@@ -458,22 +458,22 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (registrationModules && modes.size() > 1u) plan.specialization.push_back({PipelineSpecialization::ImageBase + static_cast<std::uint32_t>(index) * PipelineSpecialization::ImageWords, imageModes[index]});
     }
     std::vector<bool> scalable(info.images.size(), false);
-    if (renderScale && !registrationModules) {
+    if (renderScale) {
         for (std::uint32_t index = 0; index < info.images.size(); ++index) {
             const auto& image = info.images[index];
-            if (!RenderScaleMapsImage(image)) {
+            if (!RenderScaleMapsImage(image, stage)) {
                 scalable[index] = image.targetMerge;
                 continue;
             }
-            plan.specialization.push_back({PipelineSpecialization::GuestExtentBase + index, GuestImageExtent(snapshot.images.at(index))});
-            bool mapped = RenderScaleMapsImage(info.runtimeImageModes.at(index).at(imageModes[index]));
+            if (!registrationModules) plan.specialization.push_back({PipelineSpecialization::GuestExtentBase + index, GuestImageExtent(snapshot.images.at(index))});
+            bool mapped = RenderScaleMapsImage(info.runtimeImageModes.at(index).at(imageModes[index]), stage);
             for (const auto& pair : info.sampledPairs) {
-                if (pair.image == index && info.samplers.at(pair.sampler).table != NoTable) mapped = false;
+                if (pair.image == index && (info.samplers.at(pair.sampler).table != NoTable || (registrationModules && unnormalized.samplers.at(pair.sampler)))) mapped = false;
             }
             scalable[index] = mapped;
         }
         for (std::uint32_t index = 0; index < info.samplers.size(); ++index) {
-            if (info.samplers[index].table == NoTable) plan.specialization.push_back({PipelineSpecialization::RenderScaleUnnormalizedBase + index, unnormalized.samplers[index] ? 1u : 0u});
+            if (!registrationModules && info.samplers[index].table == NoTable) plan.specialization.push_back({PipelineSpecialization::RenderScaleUnnormalizedBase + index, unnormalized.samplers[index] ? 1u : 0u});
         }
     }
     for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {

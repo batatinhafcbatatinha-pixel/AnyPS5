@@ -424,7 +424,17 @@ TargetScale targetScaleFor(std::span<const std::shared_ptr<StorageTexture>> resi
 
 TargetScale drawScale(const Context& context, std::span<const std::shared_ptr<StorageTexture>> residents, const State& state) {
     auto scale = targetScaleFor(residents, state.renderExtent);
-    if (scale.Active() || !state.depth) return scale;
+    if (scale.Active()) {
+        for (const auto& resident : residents) {
+            if (resident == nullptr || !resident->Scaled()) continue;
+            scale.host = {std::min(scale.host.width, resident->HostExtent().width), std::min(scale.host.height, resident->HostExtent().height)};
+        }
+        if (state.depth) {
+            if (const auto depthHost = DepthSurfaceHostExtent(context, *state.depth)) scale.host = {std::min(scale.host.width, depthHost->width), std::min(scale.host.height, depthHost->height)};
+        }
+        return scale;
+    }
+    if (!state.depth) return scale;
     const auto host = DepthSurfaceHostExtent(context, *state.depth);
     if (!host) return scale;
     scale.guest = state.renderExtent;

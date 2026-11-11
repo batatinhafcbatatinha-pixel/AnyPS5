@@ -1435,11 +1435,14 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         const auto request = ScaleRequestScope::Current() == ScaleRequest::Keep && written ? ScaleRequest::Allow : ScaleRequestScope::Current();
         if (request == ScaleRequest::Refuse) RefuseScale(resource.baseAddress, ScaleRequestScope::Reason());
         if (it != cache.entries.end() && it->texture->Scaled() && (request == ScaleRequest::Refuse || !ScaleCandidate(resource, mip))) {
+            LogScaleSurface(resource.baseAddress, {resource.width, resource.height}, it->texture->HostExtent(), static_cast<int>(it->texture->ImageFormat()), written ? "storage" : "colour", "demoted", request == ScaleRequest::Refuse ? ScaleRequestScope::Reason() : "policy");
             evicted.push_back(evictStorage(cache, it, true, "render scale refused"));
+            if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Keep(evicted.back());
             NoteScaleDemotion();
             it = cache.entries.end();
         } else if (it != cache.entries.end() && !it->texture->Scaled() && request == ScaleRequest::Allow && !it->texture->Dirty() && ScaleCandidate(resource, mip) && !DepthSurfaceOverlaps(context.device, resource.baseAddress, it->texture->GuestBytes())) {
             evicted.push_back(evictStorage(cache, it, true, "render scale promotion"));
+            if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Keep(evicted.back());
             it = cache.entries.end();
         }
         if (it != cache.entries.end()) {

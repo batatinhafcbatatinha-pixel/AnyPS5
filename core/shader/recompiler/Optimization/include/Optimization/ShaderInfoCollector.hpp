@@ -3,6 +3,9 @@
 
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include <cstdint>
+#include <map>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -13,6 +16,7 @@ public:
 };
 
 [[nodiscard]] bool ProveGridPointwise(const IrProgram& program);
+[[nodiscard]] std::map<std::string, std::uint32_t> GridPointwiseFailures(const IrProgram& program);
 
 }
 
