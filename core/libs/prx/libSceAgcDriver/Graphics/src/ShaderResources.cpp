@@ -858,6 +858,17 @@ PendingLookup pendingLookupSource(const Context& context, const GuestTextureReso
     return lookup;
 }
 
+std::shared_ptr<Texture> unscaledTexture(const Context& context, std::shared_ptr<Texture> texture, const std::function<std::shared_ptr<Texture>()>& lookup) {
+    if (texture == nullptr || texture->StorageSource() == nullptr || !texture->StorageSource()->Scaled()) return texture;
+    const auto descriptor = texture->StorageSource()->Descriptor();
+    texture.reset();
+    {
+        const ScaleRequestScope refuse(ScaleRequest::Refuse);
+        static_cast<void>(cachedStorageTexture(context, {}, descriptor, 0));
+    }
+    return lookup();
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D, bool layerRows = false) {
     Require(!layerRows || (requested.dimension == TextureDimension::k1DArray && !depthCompare), "only a sampled 1D array is laid out as rows of a 2D image");
@@ -1416,6 +1427,12 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             evicted.push_back(detached);
             it = cache.entries.end();
         }
+        const auto request = ScaleRequestScope::Current() == ScaleRequest::Keep && written ? ScaleRequest::Allow : ScaleRequestScope::Current();
+        if (request == ScaleRequest::Refuse) RefuseScale(resource.baseAddress);
+        if (it != cache.entries.end() && it->texture->Scaled() && (request == ScaleRequest::Refuse || ScaleRefused(resource.baseAddress))) {
+            evicted.push_back(evictStorage(cache, it, true, "render scale refused"));
+            it = cache.entries.end();
+        }
         if (it != cache.entries.end()) {
             if (layers) it->texture->RefreshLayers(layers->first, layers->second);
             else it->texture->Refresh();
@@ -1431,7 +1448,9 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             std::shared_ptr<StorageTexture> created;
             {
                 const CacheHold reclaimable(storageCacheReclaimable);
-                created = StorageTexture::Create(context, *context.detiler, resource, mip);
+                VkExtent2D hostExtent{};
+                if (request == ScaleRequest::Allow && ScaleCandidate(resource, mip) && !DepthSurfaceOverlaps(context.device, resource.baseAddress, guestBytes)) hostExtent = ScaledExtent({resource.width, resource.height});
+                created = StorageTexture::Create(context, *context.detiler, resource, mip, hostExtent);
             }
             created->AdoptHandOver(std::move(handOver));
             CachedStorageTexture entry{key, mip, std::move(created)};
@@ -1745,6 +1764,7 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled || stored == nullptr) return nullptr;
+    if (stored->Scaled() && (ScaleRequestScope::Current() == ScaleRequest::Refuse || ScaleRefused(stored->Descriptor().baseAddress))) return nullptr;
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
     const auto viewedBytes = DescribeSurface(viewed).guestBytes;
@@ -4087,6 +4107,7 @@ bool ShaderResources::reresolveElements(const std::vector<std::size_t>& elements
         const auto resource = DecodeTextureResource(words);
         const VkImageViewType multisampleViewType = element.shape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
         auto texture = cachedTexture(context, words, resource, ViewComponents(resource), 0, element.depthCompare, multisampleViewType);
+        texture = unscaledTexture(context, std::move(texture), [&] { return cachedTexture(context, words, resource, ViewComponents(resource), 0, element.depthCompare, multisampleViewType); });
         if (texture == nullptr) return false;
         if (texture != textures[i]) replaced.emplace_back(i, std::move(texture));
     }
@@ -5757,6 +5778,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 texture = DepthSurfaceAt(resource.baseAddress) ? DepthSurfaceFirstSample(context, words, resource, components) : MultisampleTargetFirstSample(context, resource, components);
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType, layerRows);
+            if (element >= binding.imageScalable.size() || !binding.imageScalable[element]) texture = unscaledTexture(context, std::move(texture), [&] { return cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType, layerRows); });
             if (resource.dimension == TextureDimension::k2DMsaa) multisampleSources.push_back(resource.baseAddress);
             bool baseLevel = false;
             if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
@@ -5842,7 +5864,10 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
-        else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, written));
+        else {
+            const ScaleRequestScope scaleScope(element < binding.imageScalable.size() && binding.imageScalable[element] ? ScaleRequest::Keep : ScaleRequest::Refuse);
+            storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, written));
+        }
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);
@@ -6297,6 +6322,7 @@ void ShaderResources::resolveImageTables() {
                     continue;
                 }
                 try {
+                    const ScaleRequestScope scaleScope(ScaleRequest::Refuse);
                     storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, true));
                 } catch (const std::runtime_error& error) {
                     table.map[faults + element] = rejectTableElement(table, words, error.what());

@@ -153,6 +153,8 @@ struct State {
     VkExtent2D renderExtent;
     std::uint32_t renderLayers = 1;
     std::uint32_t meshLayerBase = 0;
+    std::uint32_t fragmentGuestExtent = 0;
+    std::uint32_t fragmentHostExtent = 0;
     std::uint32_t meshLayerCount = 0xffffffffu;
     std::uint32_t layerExports = 0;
     VkPrimitiveTopology topology;

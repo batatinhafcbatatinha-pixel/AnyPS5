@@ -379,6 +379,7 @@ struct SpirvTarget {
     bool meshWindowBuffer = false;
     bool hostInterpolationFirst = false;
     bool shaderImageMinLod = false;
+    bool renderScale = false;
     bool float16WidenNans = false;
     bool float16NarrowNans = false;
 };
@@ -711,6 +712,7 @@ struct DescriptorBinding {
     ElementFlags samplerCoordinatesIgnored;
     ElementFlags imageUnnormalized;
     ElementFlags imageUnnormalizedBaseLevel;
+    ElementFlags imageScalable;
     std::vector<std::uint64_t> imageSamplers;
     ElementFlags bufferRead;
     std::vector<std::uint32_t> bufferExtent;

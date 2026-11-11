@@ -3873,6 +3873,10 @@ void WriteFrameBmp(int index, std::uint32_t width, std::uint32_t height, std::sp
 
 ResidentPresent ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter, std::uint32_t& layer) {
     const auto& descriptor = image.Descriptor();
+    if (image.Scaled()) {
+        Graphics::RefuseScale(descriptor.baseAddress);
+        return ResidentPresent::None;
+    }
     const bool gcn = buffer.tilingMode == DisplayTilingGcn;
     if (gcn && (descriptor.tileMode != Graphics::TextureTileMode::kGcnDisplay2D || descriptor.width != buffer.pitchInPixel || descriptor.height < buffer.height || descriptor.mipCount != 1 || image.ImageDepth() != 1)) return ResidentPresent::None;
     if (!gcn && (descriptor.width != buffer.width || descriptor.height != buffer.height || descriptor.mipCount != 1 || image.ImageDepth() != 1)) return ResidentPresent::None;
@@ -4023,6 +4027,8 @@ FrameDumps& Dumps() {
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const DisplayBuffer* plane) {
+    Graphics::NoteDisplaySurface(buffer.address, DisplayBufferSize(buffer));
+    if (plane != nullptr) Graphics::NoteDisplaySurface(plane->address, DisplayBufferSize(*plane));
     state->presentingGuestFrame = true;
     struct ClearGuestFrame {
         bool& flag;
@@ -4680,6 +4686,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.fragmentBarycentricBuiltins = state->fragmentBarycentricBuiltins;
     target.nonConstantImageOffsets = state->maintenance8;
     target.shaderImageMinLod = state->shaderImageMinLod;
+    target.renderScale = Graphics::RenderScaleEnabled();
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
     target.float16DenormPreserve = state->float16DenormPreserve;

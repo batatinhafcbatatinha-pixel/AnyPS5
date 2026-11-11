@@ -26,6 +26,10 @@ static_assert(PipelineSpecialization::CompareBase + ShaderInfo::MaxImages * Pipe
 static_assert(PipelineSpecialization::FoldOffsetBase + ShaderInfo::MaxSamplers <= PipelineSpecialization::UnnormalizedBaseLevelBase);
 static_assert(PipelineSpecialization::UnnormalizedBaseLevelBase + ShaderInfo::MaxSamplers <= PipelineSpecialization::MirrorUnnormalizedBase);
 static_assert(PipelineSpecialization::MirrorUnnormalizedBase + ShaderInfo::MaxSamplers <= PipelineSpecialization::MinLodBase);
+static_assert(PipelineSpecialization::VolumeGatherBase + ShaderInfo::MaxImages <= PipelineSpecialization::GuestExtentBase);
+static_assert(PipelineSpecialization::GuestExtentBase + ShaderInfo::MaxImages <= PipelineSpecialization::RenderScaleUnnormalizedBase);
+static_assert(PipelineSpecialization::RenderScaleUnnormalizedBase + ShaderInfo::MaxSamplers <= PipelineSpecialization::FragmentScaleBase);
+static_assert(PipelineSpecialization::FragmentScaleBase + PipelineSpecialization::FragmentScaleWords <= PipelineSpecialization::ImageComponentBase);
 static_assert(PipelineSpecialization::MinLodBase + ShaderInfo::MaxImages <= PipelineSpecialization::SamplerLodBiasBase);
 static_assert(PipelineSpecialization::SamplerLodBiasBase + ShaderInfo::MaxSamplers <= PipelineSpecialization::FmaskFormatBase);
 static_assert(PipelineSpecialization::FmaskFormatBase + ShaderInfo::MaxImages <= PipelineSpecialization::VolumeGatherBase);
@@ -343,6 +347,15 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
     return proof;
 }
 
+std::uint32_t GuestImageExtent(const DescriptorValue& descriptor) {
+    if (descriptor.dwordCount < 4u) return 0u;
+    const auto& words = descriptor.dwords;
+    const auto baseLevel = (words[3] >> 12u) & 0xfu;
+    const auto width = std::max(((((words[1] >> 30u) & 0x3u) | ((words[2] & 0xfffu) << 2u)) + 1u) >> baseLevel, 1u);
+    const auto height = std::max((((words[2] >> 14u) & 0x3fffu) + 1u) >> baseLevel, 1u);
+    return width | (height << 16u);
+}
+
 std::vector<std::uint32_t> ShaderDataDwordsFor(const IrBindingLayout& layout, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, const std::vector<PreparedImageMetadata>& imageMetadata, std::span<const std::uint32_t> runtimeState) {
     std::vector<std::uint32_t> result(layout.ShaderDataDwords(), 0u);
     for (std::size_t i = 0; i < layout.userDataRegisters.size(); ++i) {
@@ -403,7 +416,7 @@ BufferSubstitute BufferSpecializationFields(const DescriptorValue& descriptor, s
     return {descriptor.dwords[1] & 0xffff0000u, descriptor.dwords[3], present ? descriptor.dwords[0] & 3u : 0u, present ? tail : 0u, present};
 }
 
-DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes, bool shaderImageMinLod) const {
+DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes, bool shaderImageMinLod, bool renderScale) const {
     if (stage == IrShaderStage::Pixel && exportMappings.size() != 8u) fail("fragment runtime export mappings are missing");
     if (info.images.size() > ShaderInfo::MaxImages) fail("runtime image count exceeds the static capacity (" + std::to_string(info.images.size()) + " of " + std::to_string(ShaderInfo::MaxImages) + ")");
     DescriptorBindingPlan plan;
@@ -442,6 +455,25 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         const auto& modes = info.runtimeImageModes.at(index);
         imageModes[index] = ResourceMaterializer::RuntimeImageMode(info.images[index], snapshot.images.at(index), modes);
         if (registrationModules && modes.size() > 1u) plan.specialization.push_back({PipelineSpecialization::ImageBase + static_cast<std::uint32_t>(index) * PipelineSpecialization::ImageWords, imageModes[index]});
+    }
+    std::vector<bool> scalable(info.images.size(), false);
+    if (renderScale && !registrationModules) {
+        for (std::uint32_t index = 0; index < info.images.size(); ++index) {
+            const auto& image = info.images[index];
+            if (!RenderScaleMapsImage(image)) {
+                scalable[index] = image.targetMerge;
+                continue;
+            }
+            plan.specialization.push_back({PipelineSpecialization::GuestExtentBase + index, GuestImageExtent(snapshot.images.at(index))});
+            bool mapped = RenderScaleMapsImage(info.runtimeImageModes.at(index).at(imageModes[index]));
+            for (const auto& pair : info.sampledPairs) {
+                if (pair.image == index && info.samplers.at(pair.sampler).table != NoTable) mapped = false;
+            }
+            scalable[index] = mapped;
+        }
+        for (std::uint32_t index = 0; index < info.samplers.size(); ++index) {
+            if (info.samplers[index].table == NoTable) plan.specialization.push_back({PipelineSpecialization::RenderScaleUnnormalizedBase + index, unnormalized.samplers[index] ? 1u : 0u});
+        }
     }
     for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
@@ -605,6 +637,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 physical.imageUnnormalizedBaseLevel.push_back(unnormalized.imagesAtBaseLevel.at(resource));
                 physical.imageSamplers.push_back(0u);
                 physical.imageAtomic64.push_back(image.atomic64);
+                physical.imageScalable.push_back(scalable.at(resource));
             }
         } else if (physical.role == DescriptorRole::GuestSamplers) {
             for (std::uint32_t element = 0; element < compact.resources.size(); ++element) {
@@ -744,6 +777,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 physical.imageWritten.push_back(ImageBindingResourceClass(element.kind) == ImageResourceClass::Storage);
                 physical.imageAtomic.push_back(element.atomic);
                 physical.imageAtomic64.push_back(element.atomic64);
+                physical.imageScalable.push_back(false);
                 std::uint64_t samplers = 0;
                 for (std::uint32_t sampler = 0; sampler < entry.tableSamplerMasks.size(); ++sampler) {
                     if (((element.samplers >> sampler) & 1u) != 0u) samplers |= entry.tableSamplerMasks[sampler];

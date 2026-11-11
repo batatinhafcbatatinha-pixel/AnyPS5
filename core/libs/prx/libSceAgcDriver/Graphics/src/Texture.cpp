@@ -44,6 +44,7 @@
 #include <atomic>
 #include <mutex>
 #include <map>
+#include <set>
 #include <limits>
 #include <exception>
 #include <optional>
@@ -872,6 +873,7 @@ VkFormat Texture::DepthCopyFormat(VkFormat colorFormat) {
 }
 
 bool Texture::CanDepthCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor) {
+    if (source.Scaled()) return false;
     if (!CanCopyFrom(source, descriptor) || descriptor.dimension == TextureDimension::k3D) return false;
     if (DepthCopyFormat(ResolveTextureFormat(descriptor.format)) == VK_FORMAT_UNDEFINED) return false;
     if (ResolveTextureFormat(source.Descriptor().format) != ResolveTextureFormat(descriptor.format)) return false;
@@ -880,6 +882,7 @@ bool Texture::CanDepthCopyFrom(const StorageTexture& source, const GuestTextureR
 }
 
 bool Texture::CanBlockCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor) {
+    if (source.Scaled()) return false;
     const auto& from = source.Descriptor();
     if (descriptor.gcnPitch != 0 && from.gcnPitch == descriptor.gcnPitch && (descriptor.width != from.width || descriptor.height != from.height)) {
         return !IsBlockCompressed(descriptor.format) && !IsBlockCompressed(from.format) && !IsSrgbTextureFormat(descriptor.format) && BytesPerElement(from.format) == BytesPerElement(descriptor.format)
@@ -900,6 +903,7 @@ bool Texture::CanBlockCopyFrom(const StorageTexture& source, const GuestTextureR
 }
 
 bool Texture::CanRepackCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor) {
+    if (source.Scaled()) return false;
     const auto& from = source.Descriptor();
     if (!IsRepackedTextureFormat(descriptor.format) || descriptor.dimension == TextureDimension::k3D || ResolveTextureFormat(from.format) != ResolveTextureFormat(descriptor.format)) return false;
     if (descriptor.baseAddress != from.baseAddress || descriptor.pipeBankXor != from.pipeBankXor || descriptor.width != from.width || descriptor.height != from.height || !ArrayLayersServeView(from, descriptor) || descriptor.tileMode != from.tileMode || descriptor.mipCount > from.mipCount) return false;
@@ -1081,6 +1085,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
 }
 
 bool Texture::CanSrgbExpandFrom(const Context& context, const StorageTexture& source, const GuestTextureResource& descriptor) {
+    if (source.Scaled()) return false;
     if (!SrgbExpandsToRgba8(context, descriptor.format) || !CanCopyFrom(source, descriptor) || descriptor.dimension == TextureDimension::k3D) return false;
     if (!StorageFormatAvailable(context, source.Descriptor().format) || StorageFormatForGuest(context, source.Descriptor().format) != SampledTextureFormat(context, descriptor.format)) return false;
     const auto geometry = DescribeSurface(descriptor);
@@ -1665,7 +1670,121 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format) {
     return proxy;
 }
 
-std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) {
+namespace {
+
+struct ScalePolicy {
+    std::mutex mutex;
+    VkExtent2D scene{};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> displays;
+    std::set<std::uint64_t> refused;
+};
+
+ScalePolicy& Policy() {
+    static ScalePolicy policy;
+    return policy;
+}
+
+thread_local ScaleRequest currentScaleRequest = ScaleRequest::Keep;
+
+bool NearHalf(std::uint32_t value, std::uint32_t full) {
+    const auto difference = static_cast<std::int64_t>(value) - static_cast<std::int64_t>((full + 1u) / 2u);
+    return difference >= -1 && difference <= 1;
+}
+
+}
+
+float RenderScale() {
+    static const float scale = [] {
+        const char* text = std::getenv("ANYPS5_RENDER_SCALE");
+        if (text == nullptr || *text == 0) return 1.0f;
+        char* end = nullptr;
+        const float value = std::strtof(text, &end);
+        if (end == text || !std::isfinite(value)) {
+            std::fprintf(stderr, "[render-scale] ANYPS5_RENDER_SCALE=%s is not a number; rendering at the guest size\n", text);
+            return 1.0f;
+        }
+        const float clamped = std::clamp(value, 0.25f, 1.0f);
+        std::fprintf(stderr, "[render-scale] internal resolution scale %.3f\n", static_cast<double>(clamped));
+        return clamped;
+    }();
+    return scale;
+}
+
+bool RenderScaleEnabled() {
+    return RenderScale() < 1.0f;
+}
+
+ScaleRequestScope::ScaleRequestScope(ScaleRequest request) : previous(currentScaleRequest) {
+    currentScaleRequest = request;
+}
+
+ScaleRequestScope::~ScaleRequestScope() {
+    currentScaleRequest = previous;
+}
+
+ScaleRequest ScaleRequestScope::Current() {
+    return currentScaleRequest;
+}
+
+void NoteSceneExtent(VkExtent2D extent) {
+    if (!RenderScaleEnabled()) return;
+    auto& policy = Policy();
+    std::lock_guard lock(policy.mutex);
+    if (static_cast<std::uint64_t>(extent.width) * extent.height <= static_cast<std::uint64_t>(policy.scene.width) * policy.scene.height) return;
+    policy.scene = extent;
+    std::fprintf(stderr, "[render-scale] scene extent %ux%u\n", extent.width, extent.height);
+}
+
+void NoteDisplaySurface(std::uint64_t address, std::uint64_t bytes) {
+    if (!RenderScaleEnabled() || bytes == 0) return;
+    auto& policy = Policy();
+    std::lock_guard lock(policy.mutex);
+    for (const auto& range : policy.displays) {
+        if (range.first == address && range.second == bytes) return;
+    }
+    policy.displays.emplace_back(address, bytes);
+}
+
+bool DisplaySurfaceOverlaps(std::uint64_t address, std::uint64_t bytes) {
+    auto& policy = Policy();
+    std::lock_guard lock(policy.mutex);
+    return std::ranges::any_of(policy.displays, [&](const auto& range) { return address < range.first + range.second && range.first < address + bytes; });
+}
+
+void RefuseScale(std::uint64_t address) {
+    if (!RenderScaleEnabled()) return;
+    auto& policy = Policy();
+    std::lock_guard lock(policy.mutex);
+    policy.refused.insert(address);
+}
+
+bool ScaleRefused(std::uint64_t address) {
+    if (!RenderScaleEnabled()) return true;
+    auto& policy = Policy();
+    std::lock_guard lock(policy.mutex);
+    return policy.refused.contains(address);
+}
+
+VkExtent2D ScaledExtent(VkExtent2D extent) {
+    const auto scale = static_cast<double>(RenderScale());
+    const auto axis = [&](std::uint32_t value) { return std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(std::lround(static_cast<double>(value) * scale))); };
+    return {axis(extent.width), axis(extent.height)};
+}
+
+bool ScaleCandidate(const GuestTextureResource& descriptor, std::uint32_t mip) {
+    if (!RenderScaleEnabled() || mip != 0 || descriptor.dimension != TextureDimension::k2D || descriptor.mipCount != 1 || descriptor.baseLevel != 0 || descriptor.baseArray != 0 || descriptor.depthOrLastArray != 0) return false;
+    if (IsBlockCompressed(descriptor.format) || IsRepackedTextureFormat(descriptor.format) || descriptor.tileMode == TextureTileMode::kLinear || descriptor.fmaskCmaskAddress != 0) return false;
+    {
+        auto& policy = Policy();
+        std::lock_guard lock(policy.mutex);
+        if (policy.refused.contains(descriptor.baseAddress) || policy.scene.width == 0) return false;
+        const bool full = descriptor.width == policy.scene.width && descriptor.height == policy.scene.height;
+        if (!full && !(NearHalf(descriptor.width, policy.scene.width) && NearHalf(descriptor.height, policy.scene.height))) return false;
+    }
+    return !DisplaySurfaceOverlaps(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes);
+}
+
+std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, VkExtent2D hostExtent) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     static const bool unwatchHooked = [] {
@@ -1674,9 +1793,10 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     }();
     static_cast<void>(unwatchHooked);
     const MapImportGate::PublishHold publication(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes);
-    auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel));
+    auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel, hostExtent));
     uploadReason = "first";
     texture->upload();
+    texture->SyncHost();
     texture->defaultMip = mipLevel;
     texture->view = texture->createView(mipLevel, false, texture->storageFormat);
     if (const auto hook = publishHookForTest.load(std::memory_order_acquire)) hook();
@@ -1700,9 +1820,89 @@ void StorageTexture::clearImage(VkCommandBuffer commands, VkClearColorValue valu
         for (std::uint32_t component = 0; component < 4; ++component) value.uint32[component] = (bits >> (8 * component)) & 0xffu;
     }
     context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+    if (hostImage == VK_NULL_HANDLE) return;
+    layHost(commands);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, hostImage, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 }
 
-StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
+void StorageTexture::createHostImage(const VkImageCreateInfo& twinInfo, VkExtent2D extent) {
+    VkFormatProperties properties{};
+    context.formatProperties(context.physical, imageFormat, &properties);
+    constexpr VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if ((properties.optimalTilingFeatures & blit) != blit) return;
+    auto info = twinInfo;
+    info.extent = {extent.width, extent.height, 1u};
+    Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &hostImage), "vkCreateImage scaled storage");
+    try {
+        hostAllocation = AllocateImageMemory(context, hostImage, info, "vkAllocateMemory scaled storage texture", true, true);
+        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, hostImage, hostAllocation.Memory(), hostAllocation.Offset()), "vkBindImageMemory scaled storage");
+    } catch (...) {
+        context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, hostImage, nullptr);
+        hostImage = VK_NULL_HANDLE;
+        hostAllocation.Reset();
+        throw;
+    }
+    hostExtent = extent;
+    memoryBytes += hostAllocation.Size();
+    resampleFilter = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+}
+
+void StorageTexture::layHost(VkCommandBuffer commands) {
+    if (hostLaid || hostImage == VK_NULL_HANDLE) return;
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = hostImage;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    hostLaid = true;
+}
+
+void StorageTexture::recordResample(VkCommandBuffer commands, bool toHost) {
+    layHost(commands);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    const VkOffset3D guest{static_cast<std::int32_t>(descriptor.width), static_cast<std::int32_t>(descriptor.height), 1};
+    const VkOffset3D host{static_cast<std::int32_t>(hostExtent.width), static_cast<std::int32_t>(hostExtent.height), 1};
+    VkImageBlit region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = region.srcSubresource;
+    region.srcOffsets[1] = toHost ? guest : host;
+    region.dstOffsets[1] = toHost ? host : guest;
+    context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, toHost ? image : hostImage, VK_IMAGE_LAYOUT_GENERAL, toHost ? hostImage : image, VK_IMAGE_LAYOUT_GENERAL, 1, &region, resampleFilter);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+}
+
+void StorageTexture::resample(bool toHost) {
+    auto* recorder = Recorder::Active();
+    std::unique_ptr<CommandBatch> batch;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (recorder != nullptr) {
+        commands = recorder->Commands();
+        if (auto self = weak_from_this().lock()) keepStorageTexture(*recorder, std::move(self));
+    } else {
+        batch = std::make_unique<CommandBatch>(context);
+        commands = batch->Handle();
+    }
+    recordResample(commands, toHost);
+    if (batch) batch->SubmitAndWait();
+    if (toHost) hostStale = false;
+    else twinStale = false;
+}
+
+void StorageTexture::SyncHost() {
+    if (hostImage != VK_NULL_HANDLE && hostStale) resample(true);
+}
+
+void StorageTexture::syncTwin() {
+    if (hostImage != VK_NULL_HANDLE && twinStale && hostLaid) resample(false);
+}
+
+StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, VkExtent2D requestedHost) : context(context), detiler(detiler), descriptor(descriptor) {
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");
@@ -1763,6 +1963,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         memoryBytes = imageAllocation.Size();
         this->context.bufferPool = context.bufferPool;
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, imageAllocation.Memory(), imageAllocation.Offset()), "vkBindImageMemory storage");
+        if (requestedHost.width != 0 && requestedHost.height != 0 && (requestedHost.width != descriptor.width || requestedHost.height != descriptor.height) && AttachmentProxyFormat(context, vkFormat) == VK_FORMAT_UNDEFINED) createHostImage(imageInfo, requestedHost);
     } catch (...) {
         release();
         throw;
@@ -2149,7 +2350,7 @@ VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFor
     usage.usage = packed && format == storageFormat ? VK_IMAGE_USAGE_SAMPLED_BIT | (attachable ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0u) : VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.pNext = format == storageFormat && !packed ? nullptr : &usage;
-    viewInfo.image = image;
+    viewInfo.image = Image();
     // Storage views address one mip; cube faces are written as array layers.
     viewInfo.viewType = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : descriptor.dimension == TextureDimension::k2D ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : descriptor.dimension == TextureDimension::k1DArray ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     viewInfo.format = format;
@@ -2207,7 +2408,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.pNext = &usage;
-    viewInfo.image = image;
+    viewInfo.image = Image();
     viewInfo.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
@@ -2220,6 +2421,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
 
 VkImageView StorageTexture::AttachmentProxyView() {
     if (proxyView != VK_NULL_HANDLE) return proxyView;
+    Require(hostImage == VK_NULL_HANDLE, "a scaled storage image has no attachment proxy");
     Require(storageFormat == VK_FORMAT_R8_UNORM && descriptor.dimension == TextureDimension::k2D && descriptor.mipCount == 1 && geometry.imageLayers == 1, "an RGBA8_SRGB attachment proxy is only modeled for a single-mip 2D R8 surface");
     try {
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -2420,6 +2622,12 @@ std::atomic<int> flushFailureFiredForTest{0};
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
+    const bool current = refreshTwin(firstLayer, lastLayer);
+    SyncHost();
+    return current;
+}
+
+bool StorageTexture::refreshTwin(std::uint32_t firstLayer, std::uint32_t lastLayer) {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
@@ -3152,6 +3360,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
+    if (layers != nullptr) syncTwin();
+    hostStale = hostImage != VK_NULL_HANDLE;
     GuestMemory::MaterializeKnownZero(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto stampLayers = [&](bool selectedOnly) {
@@ -4399,6 +4609,7 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    if (hostImage != VK_NULL_HANDLE) twinStale = true;
     if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)));
     {
         auto& records = LayoutWrites();
@@ -6397,6 +6608,7 @@ const char* StorageTexture::CopyRefusal(const Context& context, const StorageTex
     if (destination != nullptr && (destination == &source || !destination->SameSurfaceShape(source))) return "shape";
     if (source.descriptor.dccAddress != 0 || (destination != nullptr && destination->descriptor.dccAddress != 0)) return "keys";
     if (source.released || !source.Cached() || (destination != nullptr && (destination->released || !destination->Cached()))) return "released";
+    if (source.Scaled() || (destination != nullptr && destination->Scaled())) return "scaled";
     if (HostImportFor(context, address, static_cast<std::size_t>(source.guestBytes)) == nullptr) return "not imported";
     if (Recorder::Active() == nullptr) return "no recorder";
     return nullptr;
@@ -6785,13 +6997,13 @@ void StorageTexture::AdoptHandOver(CreationHandOver handOver) {
 
 std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
     static const bool disabled = std::getenv("APS5_NO_ALIAS_BORROW") != nullptr;
-    if (disabled || !blockUnits) return nullptr;
+    if (disabled || !blockUnits || Scaled()) return nullptr;
     std::vector<std::shared_ptr<StorageTexture>> candidates;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         for (auto* texture : pending.textures) {
-            if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits) continue;
+            if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits || texture->Scaled()) continue;
             if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
         }
     }
@@ -6995,6 +7207,7 @@ bool StorageTexture::cpuLeftUnchanged(std::uint32_t layer, std::uint64_t from, s
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    syncTwin();
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -7553,6 +7766,9 @@ void StorageTexture::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     imageAllocation.Reset();
+    if (hostImage) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, hostImage, nullptr);
+    hostImage = VK_NULL_HANDLE;
+    hostAllocation.Reset();
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

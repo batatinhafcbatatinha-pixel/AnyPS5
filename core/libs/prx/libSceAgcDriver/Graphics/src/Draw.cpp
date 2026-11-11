@@ -407,6 +407,21 @@ void ReleasePixelFunctionLds(VkDevice device) {
     PixelLdsPools().erase(found);
 }
 
+TargetScale targetScaleFor(std::span<const std::shared_ptr<StorageTexture>> residents, VkExtent2D guest) {
+    for (const auto& resident : residents) {
+        if (resident == nullptr || !resident->Scaled()) continue;
+        const auto& descriptor = resident->Descriptor();
+        const auto host = resident->HostExtent();
+        TargetScale scale;
+        scale.guest = guest;
+        scale.x = static_cast<float>(host.width) / static_cast<float>(descriptor.width);
+        scale.y = static_cast<float>(host.height) / static_cast<float>(descriptor.height);
+        scale.host = {std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::ceil(guest.width * static_cast<double>(scale.x))), 1u, host.width), std::clamp<std::uint32_t>(static_cast<std::uint32_t>(std::ceil(guest.height * static_cast<double>(scale.y))), 1u, host.height)};
+        return scale;
+    }
+    return {};
+}
+
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews) {
     std::uint64_t key = 14695981039346656037ull;
     const auto mix = [&](std::uint64_t value) {
@@ -2882,8 +2897,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    const auto targetScale = targetScaleFor(record.targets, state.renderExtent);
     if (continued) {
-        record.pipeline->Continue(commands, state, record.masked);
+        record.pipeline->Continue(commands, state, record.masked, &targetScale);
     } else {
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
@@ -2921,7 +2937,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         for (const auto& write : record.staged) RecordStagedClear(context, commands, *write.temporary);
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, record.masked);
+        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, record.masked, &targetScale);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
@@ -2953,7 +2969,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
     }
     if (record.pipeline->SplitsFaces()) {
-        record.pipeline->ContinueBackFaces(commands, state, record.masked);
+        record.pipeline->ContinueBackFaces(commands, state, record.masked, &targetScale);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     }
     if (record.pipeline->SplitsSecondChannel()) {
@@ -3326,6 +3342,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& targets = prepared.targets;
     targets.resize(state.colors.size());
     auto& targetViews = prepared.targetViews;
+    if (RenderScaleEnabled() && state.depth && state.depth->samples == 1u && state.hasColorTarget && state.color.extent.width == state.depth->extent.width && state.color.extent.height == state.depth->extent.height) NoteSceneExtent(state.depth->extent);
+    const ScaleRequestScope scaleScope(!RenderScaleEnabled() ? ScaleRequest::Keep : state.depth || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.samples > 1u; }) ? ScaleRequest::Refuse : ScaleRequest::Allow);
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -3455,6 +3473,17 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     if (state.depth) {
         targetViews.push_back(DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)));
+    }
+    if (RenderScaleEnabled() && std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident != nullptr && binding.resident->Scaled(); }) && (state.depth || std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident == nullptr || !binding.resident->Scaled(); }))) {
+        const ScaleRequestScope refuse(ScaleRequest::Refuse);
+        for (std::size_t index = 0; index < targets.size(); ++index) {
+            auto& binding = targets[index];
+            if (binding.resident == nullptr || !binding.resident->Scaled()) continue;
+            const auto& color = binding.color;
+            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] { return color.arrayLastSlice != 0 ? CachedStorageLayers(context, ArraySurfaceForTarget(color), color.arraySlice, color.layers) : CachedStorageSurface(context, SurfaceForTarget(color)); });
+            Require(binding.resident != nullptr && !binding.resident->Scaled(), "a render target could not leave its scaled image");
+            targetViews[index] = binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice);
+        }
     }
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
@@ -3642,6 +3671,16 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         masked->colors[index].format = AttachmentProxyFormat(context, state.colors[index].format);
         masked->blends.at(state.colors[index].exportIndex).colorWriteMask &= VK_COLOR_COMPONENT_R_BIT;
     }
+    {
+        std::vector<std::shared_ptr<StorageTexture>> residents;
+        for (const auto& binding : targets) residents.push_back(binding.resident);
+        const auto scale = targetScaleFor(residents, state.renderExtent);
+        if (scale.Active()) {
+            if (!masked.has_value()) masked = state;
+            masked->fragmentGuestExtent = scale.guest.width | (scale.guest.height << 16u);
+            masked->fragmentHostExtent = scale.host.width | (scale.host.height << 16u);
+        }
+    }
     const State& pipelineState = masked.has_value() ? *masked : state;
     static const bool verifySetLayouts = std::getenv("APS5_VERIFY_SET_LAYOUTS") != nullptr;
     if (verifySetLayouts && context.descriptorCache != nullptr) {
@@ -3688,7 +3727,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     Require(!pipeline->ReordersSamples() || std::ranges::none_of(state.colors, [](const ColorTarget& color) { return color.staged; }), "a partial write of a multisampled packed color target on a device that puts the guest's samples in order is not implemented");
     auto& framebuffer = prepared.framebuffer;
-    framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+    const auto framebufferScale = targetScaleFor(owners, state.renderExtent);
+    framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, framebufferScale.Active() ? framebufferScale.host : state.renderExtent, state.renderLayers);
     auto& reordered = prepared.reordered;
     auto& reorderPass = prepared.reorderPass;
     if (pipeline->ReordersSamples()) {
@@ -3925,7 +3965,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     std::vector<std::shared_ptr<void>> reorderKept;
     RecordSampleOrder(context, commands, reorderPass, reordered, true, reorderKept);
     APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-    pipeline->Begin(commands, *framebuffer, state.renderExtent, state, masked.has_value() ? &*masked : nullptr);
+    const auto directScale = targetScaleFor(prepared.owners, state.renderExtent);
+    pipeline->Begin(commands, *framebuffer, state.renderExtent, state, masked.has_value() ? &*masked : nullptr, &directScale);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     const auto drawUse = recorded ? resources->BeginDrawUse(*recorder) : nullptr;
     resources->BindDrawUse(commands, pipeline->Layout(), drawUse.get());
@@ -3942,7 +3983,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         if (recorded) for (const auto& [reference, selectedPipeline] : stencilReplay) recorder->Keep(selectedPipeline);
     }
     if (pipeline->SplitsFaces()) {
-        pipeline->ContinueBackFaces(commands, state, masked.has_value() ? &*masked : nullptr);
+        pipeline->ContinueBackFaces(commands, state, masked.has_value() ? &*masked : nullptr, &directScale);
         recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, prepared.trace, subdraw);
     }
     if (pipeline->SplitsSecondChannel()) {
@@ -4309,7 +4350,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto framebuffer = recipe.framebuffer.lock();
     if (framebuffer == nullptr) {
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
-        framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+        const auto framebufferScale = targetScaleFor(targets, state.renderExtent);
+        framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, framebufferScale.Active() ? framebufferScale.host : state.renderExtent, state.renderLayers);
     }
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4379,6 +4421,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         Require(pass.source.has_value() && pass.targets.size() == 1, "CB resolve without its source and destination");
         const auto& destination = pass.targets.front();
         Require(!ColorTileModeIsLinear(destination.tileMode) && context.detiler != nullptr, "CB resolve into a target without a resident image is not implemented");
+        const ScaleRequestScope refuse(ScaleRequest::Refuse);
         const auto resident = CachedStorageSurface(context, SurfaceForTarget(destination));
         Require(resident->Attachable(), "storage format cannot be a color attachment");
         ResolveMultisampleTarget(context, *pass.source, *resident, resident->AttachmentView(destination.format, destination.mip));

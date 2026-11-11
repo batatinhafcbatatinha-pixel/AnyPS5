@@ -21,6 +21,7 @@ struct SpirvTargetOptions {
     std::span<const std::string_view> supportedExtensions;
     bool nonConstantImageOffsets = false;
     bool shaderImageMinLod = false;
+    bool renderScale = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
     bool depthRangeRemap = false;

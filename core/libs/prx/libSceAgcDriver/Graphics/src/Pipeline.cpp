@@ -390,6 +390,10 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         appendKey(key, shader.pushConstantOffset);
         appendKey(key, state.meshLayerBase);
         appendKey(key, state.meshLayerCount);
+        if (state.fragmentHostExtent != 0) {
+            appendKey(key, state.fragmentGuestExtent);
+            appendKey(key, state.fragmentHostExtent);
+        }
         if (resources.split) {
             auto& sets = shader.stage == Stage::Fragment ? keys.fragmentSets : keys.preRasterizationSets;
             for (const auto& binding : shader.program->bindings) {
@@ -560,7 +564,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             stages[i].module = _modules[i];
             stages[i].pName = "main";
             if (shaders[i].stage == ShaderRecompiler::ShaderStage::Mesh && context.meshWave32 && shader.hostSubgroupSize == 32u) stages[i].pNext = &meshSubgroup;
-            specializations.emplace_back(shader, state.meshLayerBase, state.meshLayerCount);
+            specializations.emplace_back(shader, state.meshLayerBase, state.meshLayerCount, state.fragmentGuestExtent, state.fragmentHostExtent);
             stages[i].pSpecializationInfo = specializations.back().Info();
         }
         if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); })) {
@@ -926,7 +930,27 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     return framebuffer;
 }
 
-void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, const State* masked) const {
+VkViewport TargetScale::Viewport(const VkViewport& viewport) const {
+    if (!Active()) return viewport;
+    return {viewport.x * x, viewport.y * y, viewport.width * x, viewport.height * y, viewport.minDepth, viewport.maxDepth};
+}
+
+VkRect2D TargetScale::Scissor(const VkRect2D& scissor) const {
+    if (!Active()) return scissor;
+    const auto edge = [](std::int64_t value, float factor, std::uint32_t limit, bool up) {
+        const auto scaled = static_cast<double>(value) * factor;
+        const auto rounded = static_cast<std::int64_t>(up ? std::ceil(scaled) : std::floor(scaled));
+        return static_cast<std::int32_t>(std::clamp<std::int64_t>(rounded, 0, limit));
+    };
+    const auto left = edge(scissor.offset.x, x, host.width, false);
+    const auto top = edge(scissor.offset.y, y, host.height, false);
+    const auto right = edge(std::int64_t{scissor.offset.x} + scissor.extent.width, x, host.width, true);
+    const auto bottom = edge(std::int64_t{scissor.offset.y} + scissor.extent.height, y, host.height, true);
+    return {{left, top}, {static_cast<std::uint32_t>(std::max(right - left, 0)), static_cast<std::uint32_t>(std::max(bottom - top, 0))}};
+}
+
+void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, const State* masked, const TargetScale* scale) const {
+    if (scale != nullptr && scale->Active()) extent = scale->host;
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -954,7 +978,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
         if (outputs && depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
         if (outputs && depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat)) rendering.pStencilAttachment = &depth;
         context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
-        Continue(commands, state, masked);
+        Continue(commands, state, masked, scale);
         return;
     }
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -973,15 +997,17 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     sampleLocations.pPostSubpassSampleLocations = &post;
     if (sampleLocationsEnabled) begin.pNext = &sampleLocations;
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    Continue(commands, state, masked);
+    Continue(commands, state, masked, scale);
 }
 
-void Pipeline::Continue(VkCommandBuffer commands, const State& state, const State* masked) const {
+void Pipeline::Continue(VkCommandBuffer commands, const State& state, const State* masked, const TargetScale* scale) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
-    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
-    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
+    const auto scaledViewport = scale != nullptr ? scale->Viewport(state.viewport) : VkViewport{};
+    const auto scaledScissor = scale != nullptr ? scale->Scissor(state.scissor) : VkRect2D{};
+    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, scale != nullptr ? &scaledViewport : &state.viewport);
+    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, scale != nullptr ? &scaledScissor : &state.scissor);
     setColorWriteMasks(commands, state, masked, false);
     if (state.stencilReplayReference) context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
     if (libraries) {
@@ -1026,12 +1052,14 @@ void Pipeline::setColorWriteMasks(VkCommandBuffer commands, const State& state, 
     context.Resolved(&DeviceFunctions::cmdSetColorWriteMask, "vkCmdSetColorWriteMaskEXT")(commands, 0, static_cast<std::uint32_t>(state.blends.size()), masks.data());
 }
 
-void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state, const State* masked) const {
+void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state, const State* masked, const TargetScale* scale) const {
     Require(backFaces != VK_NULL_HANDLE, "the pipeline draws both faces in one pass");
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, backFaces);
+    const auto scaledViewport = scale != nullptr ? scale->Viewport(state.viewport) : VkViewport{};
+    const auto scaledScissor = scale != nullptr ? scale->Scissor(state.scissor) : VkRect2D{};
     setColorWriteMasks(commands, state, masked, false);
-    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
-    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
+    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, scale != nullptr ? &scaledViewport : &state.viewport);
+    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, scale != nullptr ? &scaledScissor : &state.scissor);
     context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
     if (depthBounds) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
 }
@@ -1081,6 +1109,10 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
     }
     append(key, state.meshLayerBase);
     append(key, state.meshLayerCount);
+    if (state.fragmentHostExtent != 0) {
+        append(key, state.fragmentGuestExtent);
+        append(key, state.fragmentHostExtent);
+    }
     append(key, PushConstantStages(shaders));
     append(key, input.bindings.size());
     for (const auto& binding : input.bindings) {

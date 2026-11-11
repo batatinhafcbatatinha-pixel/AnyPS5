@@ -53,6 +53,10 @@ inline constexpr std::uint32_t SamplerLodBiasBase = 57728u;
 inline constexpr float SamplerLodBiasShaderThreshold = 15.0f;
 inline constexpr std::uint32_t FmaskFormatBase = 58048u;
 inline constexpr std::uint32_t VolumeGatherBase = 58176u;
+inline constexpr std::uint32_t GuestExtentBase = 58304u;
+inline constexpr std::uint32_t RenderScaleUnnormalizedBase = 58432u;
+inline constexpr std::uint32_t FragmentScaleBase = 58496u;
+inline constexpr std::uint32_t FragmentScaleWords = 2u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;
@@ -60,6 +64,10 @@ inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint3
 
 inline constexpr bool IsWorkgroupOffset(std::uint32_t id) {
     return id >= WorkgroupOffsetBase && id < WorkgroupOffsetBase + WorkgroupOffsetWords;
+}
+
+inline constexpr bool IsFragmentScale(std::uint32_t id) {
+    return id >= FragmentScaleBase && id < FragmentScaleBase + FragmentScaleWords;
 }
 
 }

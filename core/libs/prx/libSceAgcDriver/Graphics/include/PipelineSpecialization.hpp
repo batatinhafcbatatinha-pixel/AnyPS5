@@ -52,11 +52,13 @@ public:
         }
     }
 
-    explicit PipelineSpecialization(const ShaderRecompiler::RecompileResult& shader, std::uint32_t layerBase = 0u, std::uint32_t layerCount = 0xffffffffu) {
+    explicit PipelineSpecialization(const ShaderRecompiler::RecompileResult& shader, std::uint32_t layerBase = 0u, std::uint32_t layerCount = 0xffffffffu, std::uint32_t fragmentGuest = 0u, std::uint32_t fragmentHost = 0u) {
         values = shader.specialization;
         for (auto& constant : values) {
             if (constant.id == ShaderRecompiler::PipelineSpecialization::MeshLayerBase) constant.value = layerBase;
             if (constant.id == ShaderRecompiler::PipelineSpecialization::MeshLayerCount) constant.value = layerCount;
+            if (constant.id == ShaderRecompiler::PipelineSpecialization::FragmentScaleBase) constant.value = fragmentGuest;
+            if (constant.id == ShaderRecompiler::PipelineSpecialization::FragmentScaleBase + 1u) constant.value = fragmentHost;
         }
         Validate(shader);
         describe(values);
