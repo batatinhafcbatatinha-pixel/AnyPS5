@@ -1766,15 +1766,18 @@ public:
             scaled = true;
             recordNow([&](VkCommandBuffer commands) { recordDepthResample(commands, true); });
             view = hostView;
+            LogScaleSurface(target.address, target.extent, hostExtent, static_cast<int>(hostFormat), "depth", "scaled", nullptr);
         } else {
             recordNow([&](VkCommandBuffer commands) { recordDepthResample(commands, false); });
             scaled = false;
             view = twinView;
+            LogScaleSurface(target.address, target.extent, hostExtent, static_cast<int>(hostFormat), "depth", "demoted", ScaleRequestScope::Reason());
             RefuseScale(target.address, "depth demoted");
             NoteScaleDemotion();
         }
         hostStale = false;
         twinStale = false;
+        for (auto& entry : textures) retiredTextures.push_back(std::move(entry.second));
         textures.clear();
     }
 
@@ -1796,6 +1799,7 @@ public:
     bool scaled = false;
     mutable bool hostStale = false;
     mutable bool twinStale = false;
+    std::vector<std::shared_ptr<Texture>> retiredTextures;
     std::shared_ptr<std::atomic<bool>> active = std::make_shared<std::atomic<bool>>(true);
     bool sampleable = true;
     bool samplingActive = false;
@@ -3611,7 +3615,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     }
     if (stencilWritten || created || stencilRebound) surface->MarkStencilStale();
     drawnDepth = surface;
-    if (const auto request = ScaleRequestScope::Current(); request != ScaleRequest::Keep && target.samples == 1u && RenderScaleEnabled()) surface->SetScaled(request == ScaleRequest::Allow && ScaleCandidateExtent(target.address, DepthSliceBytes(target.extent, 4u), target.extent));
+    if (const auto request = ScaleRequestScope::Current(); request != ScaleRequest::Keep && target.samples == 1u && RenderScaleEnabled()) surface->SetScaled(request == ScaleRequest::Allow && ScaleCandidateExtent(target.address, DepthSliceBytes(target.extent, 4u), target.extent, true));
     surface->HostUse();
     surface->NoteAttached();
     return surface->view;

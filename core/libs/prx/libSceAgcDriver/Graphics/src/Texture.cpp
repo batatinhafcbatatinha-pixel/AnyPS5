@@ -1785,7 +1785,9 @@ void RefuseScale(std::uint64_t address, const char* reason) {
     if (!RenderScaleEnabled()) return;
     auto& policy = Policy();
     std::lock_guard lock(policy.mutex);
-    if (policy.refused.insert(address).second) ++policy.reasons[reason];
+    if (!policy.refused.insert(address).second) return;
+    ++policy.reasons[reason];
+    LogScaleSurface(address, {}, {}, 0, std::strncmp(reason, "depth", 5) == 0 ? "depth" : "colour", "refused", reason);
 }
 
 bool ScaleRefused(std::uint64_t address) {
@@ -1801,7 +1803,44 @@ VkExtent2D ScaledExtent(VkExtent2D extent) {
     return {axis(extent.width), axis(extent.height)};
 }
 
-bool ScaleCandidateExtent(std::uint64_t address, std::uint64_t bytes, VkExtent2D extent) {
+void LogScaleSurface(std::uint64_t address, VkExtent2D guest, VkExtent2D host, int format, const char* role, const char* state, const char* reason) {
+    std::fprintf(stderr, "[render-scale] surface 0x%llx %ux%u -> %ux%u format %d role %s %s%s%s\n", static_cast<unsigned long long>(address), guest.width, guest.height, host.width, host.height, format, role, state, reason != nullptr ? ":" : "", reason != nullptr ? reason : "");
+}
+
+namespace {
+
+bool EnvSet(const char* name) {
+    const char* text = std::getenv(name);
+    return text != nullptr && *text != 0 && std::strcmp(text, "0") != 0;
+}
+
+bool ScaleGranted(std::uint64_t address, bool depth) {
+    static const bool noDepth = EnvSet("ANYPS5_RENDER_SCALE_NO_DEPTH");
+    static const bool noColor = EnvSet("ANYPS5_RENDER_SCALE_NO_COLOR");
+    static const std::optional<std::uint64_t> only = []() -> std::optional<std::uint64_t> {
+        const char* text = std::getenv("ANYPS5_RENDER_SCALE_O\nY");
+        if (text == nullptr || *text == 0) return std::nullopt;
+        return std::strtoull(text, nullptr, 16);
+    }();
+    static const std::optional<std::uint64_t> limit = []() -> std::optional<std::uint64_t> {
+        const char* text = std::getenv("ANYPS5_RENDER_SCALE_MAX_SURFACES");
+        if (text == nullptr || *text == 0) return std::nullopt;
+        return std::strtoull(text, nullptr, 10);
+    }();
+    if ((depth && noDepth) || (!depth && noColor) || (only && *only != address)) return false;
+    if (!limit) return true;
+    static std::mutex mutex;
+    static std::set<std::uint64_t> granted;
+    std::lock_guard lock(mutex);
+    if (granted.contains(address)) return true;
+    if (granted.size() >= *limit) return false;
+    granted.insert(address);
+    return true;
+}
+
+}
+
+bool ScaleCandidateExtent(std::uint64_t address, std::uint64_t bytes, VkExtent2D extent, bool depth) {
     if (!RenderScaleEnabled()) return false;
     {
         auto& policy = Policy();
@@ -1817,7 +1856,7 @@ bool ScaleCandidateExtent(std::uint64_t address, std::uint64_t bytes, VkExtent2D
         };
         if (!std::ranges::any_of(policy.families, member)) return false;
     }
-    return !DisplaySurfaceOverlaps(address, bytes);
+    return !DisplaySurfaceOverlaps(address, bytes) && ScaleGranted(address, depth);
 }
 
 bool ScaleCandidate(const GuestTextureResource& descriptor, std::uint32_t mip) {
@@ -1927,6 +1966,7 @@ void StorageTexture::createHostImage(const VkImageCreateInfo& twinInfo, VkExtent
     hostExtent = extent;
     memoryBytes += hostAllocation.Size();
     NoteScaledSurface(static_cast<std::int64_t>(guestBytes), static_cast<std::int64_t>(hostAllocation.Size()), 1);
+    LogScaleSurface(descriptor.baseAddress, {descriptor.width, descriptor.height}, extent, static_cast<int>(imageFormat), ScaleRequestScope::Current() == ScaleRequest::Allow ? "colour" : "storage", "scaled", nullptr);
     resampleFilter = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
 }
 

@@ -618,6 +618,45 @@ auto recordEmissionFailure(std::exception_ptr* emissionFailure, TStep&& step) ->
     }
 }
 
+void traceRenderScale(const RecompileRequest& request, const IrProgram& program) {
+    static const bool enabled = std::getenv("APS5_TRACE_RENDER_SCALE") != nullptr;
+    if (!enabled || !request.target.renderScale) return;
+    static std::mutex mutex;
+    static std::set<std::pair<std::uint64_t, std::uint32_t>> seen;
+    {
+        std::lock_guard lock(mutex);
+        if (!seen.insert({request.shader.codeAddress, static_cast<std::uint32_t>(request.shader.stage)}).second) return;
+    }
+    constexpr std::array<const char*, 8> stages{"compute", "vertex", "hull", "domain", "geometry", "pixel", "local", "mesh"};
+    const auto join = [](const std::map<std::string, std::uint32_t>& reasons) {
+        std::string text;
+        for (const auto& [reason, count] : reasons) text += (text.empty() ? "" : ",") + reason + " x" + std::to_string(count);
+        return text;
+    };
+    std::string grid = "n/a";
+    if (request.shader.stage == ShaderStage::Compute) {
+        const auto failures = GridPointwiseFailures(program);
+        grid = failures.empty() ? "pass" : "fail:" + join(failures);
+    }
+    const auto& info = program.Info();
+    const auto stage = program.Resources().stage;
+    std::map<std::string, std::uint32_t> reasons;
+    std::uint32_t scalable = 0;
+    for (std::uint32_t index = 0; index < info.images.size(); ++index) {
+        const auto& image = info.images[index];
+        const char* refusal = image.targetMerge ? nullptr : RenderScaleImageRefusal(image, stage);
+        for (const auto& pair : info.sampledPairs) {
+            if (refusal == nullptr && pair.image == index && info.samplers.at(pair.sampler).table != NoTable) refusal = "table-sampler";
+        }
+        if (refusal == nullptr) {
+            ++scalable;
+        } else {
+            ++reasons[refusal];
+        }
+    }
+    std::fprintf(stderr, "[render-scale] shader 0x%llx %s grid=%s images=%u/%zu unscalable:%s\n", static_cast<unsigned long long>(request.shader.codeAddress), stages.at(static_cast<std::size_t>(request.shader.stage)), grid.c_str(), scalable, info.images.size(), join(reasons).c_str());
+}
+
 void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
@@ -639,6 +678,7 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
     if (request.target.renderScale && request.shader.stage == ShaderStage::Compute) program.Info().gridScalable = ProveGridPointwise(program);
+    traceRenderScale(request, program);
 }
 
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program) {

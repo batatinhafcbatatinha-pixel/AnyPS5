@@ -60,7 +60,8 @@ private:
 };
 void NoteSceneExtent(VkExtent2D extent);
 void NoteDisplaySurface(std::uint64_t address, std::uint64_t bytes, VkExtent2D extent);
-bool ScaleCandidateExtent(std::uint64_t address, std::uint64_t bytes, VkExtent2D extent);
+bool ScaleCandidateExtent(std::uint64_t address, std::uint64_t bytes, VkExtent2D extent, bool depth = false);
+void LogScaleSurface(std::uint64_t address, VkExtent2D guest, VkExtent2D host, int format, const char* role, const char* state, const char* reason);
 void NoteScaleDemotion();
 void NoteScaledSurface(std::int64_t guestBytes, std::int64_t hostBytes, std::int64_t count);
 void NoteScaleResample(bool toHost, std::uint64_t bytes);

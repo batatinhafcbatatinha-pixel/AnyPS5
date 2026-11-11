@@ -252,11 +252,22 @@ std::uint32_t CoordU32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access
 }
 
 bool RenderScaled(SpirvEmitterState& state, const ImageEmitAccess& access) {
-    return state.renderScale && !state.registrationModules && RenderScaleMapsImage(state.program.Info().images.at(access.mem.resource)) && RenderScaleMapsImage(access.image);
+    return state.renderScale && RenderScaleMapsImage(state.program.Info().images.at(access.mem.resource), state.program.Resources().stage) && RenderScaleMapsImage(access.image, state.program.Resources().stage);
 }
 
 std::uint32_t GuestAxisExtent(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t axis, std::uint32_t lod) {
     const auto u32 = TypeU32(state);
+    if (state.registrationModules) {
+        const auto descriptor = [&](std::uint32_t word) { return RuntimeImageDword(state, resource, offsetof(RuntimeAbi::ResourceMetadata, descriptor) / sizeof(std::uint32_t) + word); };
+        const auto field = [&](std::uint32_t value, std::uint32_t shift, std::uint32_t mask) { return Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, value, ConstantU32(state, shift)), ConstantU32(state, mask)); };
+        const auto word2 = descriptor(2u);
+        const auto extent = axis == 0u
+            ? Binary(state, spv::OpBitwiseOr, u32, field(descriptor(1u), 30u, 0x3u), Binary(state, spv::OpShiftLeftLogical, u32, field(word2, 0u, 0xfffu), ConstantU32(state, 2u)))
+            : field(word2, 14u, 0x3fffu);
+        const auto shift = Binary(state, spv::OpIAdd, u32, field(descriptor(3u), 12u, 0xfu), lod);
+        const auto shifted = Binary(state, spv::OpShiftRightLogical, u32, Binary(state, spv::OpIAdd, u32, extent, ConstantU32(state, 1u)), shift);
+        return Select(state, u32, Binary(state, spv::OpUGreaterThan, TypeBool(state), shifted, ConstantU32(state, 1u)), shifted, ConstantU32(state, 1u));
+    }
     const auto word = state.module.SpecializationConstant(u32, PipelineSpecialization::GuestExtentBase + resource, 0u);
     const auto base = axis == 0u ? Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, 0xffffu)) : Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, 16u));
     const auto shifted = Binary(state, spv::OpShiftRightLogical, u32, base, lod);
@@ -311,7 +322,7 @@ std::uint32_t RenderScaledCoordU32(SpirvValueEmitContext& ctx, const ImageEmitAc
 
 std::uint32_t RenderScaledUnnormalizedCoord(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t coord) {
     auto& state = ctx.state;
-    if (!RenderScaled(state, access) || state.program.Info().samplers.at(access.mem.sampler).table != NoTable) return coord;
+    if (!RenderScaled(state, access) || state.registrationModules || state.program.Info().samplers.at(access.mem.sampler).table != NoTable) return coord;
     const auto f32 = TypeF32(state);
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
@@ -1498,7 +1509,7 @@ void EmitAtomicOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
         ctx.Define(access.inst, EmitValueOrDefaultIfCondition(state, condition, TypeU64(state), ConstantU64(state, 0u), [&]() {
             const auto scalar = TypeScalarU64(state);
             const auto pointer = state.module.AllocateId();
-            state.module.AddFunction(spv::OpImageTexelPointer, TypePointer(state, spv::StorageClassImage, scalar), pointer, StorageImageDescriptorPointer(state, access.mem.resource), CoordU32(ctx, access), ConstantU32(state, 0));
+            state.module.AddFunction(spv::OpImageTexelPointer, TypePointer(state, spv::StorageClassImage, scalar), pointer, StorageImageDescriptorPointer(state, access.mem.resource), RenderScaled(state, access) ? RenderScaledCoordU32(ctx, access, CoordU32(ctx, access), true, ConstantU32(state, 0u)) : CoordU32(ctx, access), ConstantU32(state, 0));
             const auto value = Unary(state, spv::OpBitcast, scalar, ctx.Arg(access.inst, 2));
             const auto old = state.module.AllocateId();
             if (opcode == IrOpcode::ImageAtomicCmpSwap64) {
@@ -1516,7 +1527,7 @@ void EmitAtomicOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     ctx.Define(access.inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
         const auto pointer = state.module.AllocateId();
         const auto pointerType = TypePointer(state, spv::StorageClassImage, TypeU32(state));
-        state.module.AddFunction(spv::OpImageTexelPointer, pointerType, pointer, StorageImageDescriptorPointer(state, access.mem.resource), CoordU32(ctx, access), ImageSampleIndex(ctx, access));
+        state.module.AddFunction(spv::OpImageTexelPointer, pointerType, pointer, StorageImageDescriptorPointer(state, access.mem.resource), RenderScaled(state, access) ? RenderScaledCoordU32(ctx, access, CoordU32(ctx, access), true, ConstantU32(state, 0u)) : CoordU32(ctx, access), ImageSampleIndex(ctx, access));
         if (opcode == IrOpcode::ImageAtomicInc32 || opcode == IrOpcode::ImageAtomicDec32) {
             return AtomicUpdate(state, pointer, ResourceKind::Image, [&](std::uint32_t current) {
                 return opcode == IrOpcode::ImageAtomicInc32 ? AtomicIncrement(state, current, value) : AtomicDecrement(state, current, value);

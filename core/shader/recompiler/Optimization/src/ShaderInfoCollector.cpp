@@ -6,6 +6,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <map>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -16,10 +18,8 @@ namespace {
 bool CrossLaneOpcode(IrOpcode opcode) {
     switch (opcode) {
     case IrOpcode::Barrier:
-    case IrOpcode::ReadFirstLane:
     case IrOpcode::ReadLane:
     case IrOpcode::WriteLane:
-    case IrOpcode::LaneId:
     case IrOpcode::DppMoveU32:
     case IrOpcode::DppUpdateU32:
     case IrOpcode::WqmU64:
@@ -711,30 +711,190 @@ void ShaderInfoCollector::Collect(IrProgram& program, const ShaderStageInputInfo
     program.Metadata().shaderInfoComplete = true;
 }
 
-bool ProveGridPointwise(const IrProgram& program) {
-    if (program.Resources().stage != IrShaderStage::Compute || program.Info().sharedMemoryBytes != 0u) return false;
+namespace {
+
+const IrValue* ArgumentOf(const IrValue& value, std::size_t index) {
+    const auto* argument = value.Argument(index);
+    return argument == nullptr ? nullptr : argument->Resolve();
+}
+
+bool OpcodeNamed(const IrValue& value, std::string_view text) {
+    return IrOpcodeName(value.Opcode()).find(text) != std::string_view::npos;
+}
+
+bool MemoryOpcode(IrOpcode opcode) {
+    return ImageOpcodeInfoOf(opcode).access != ImageAccess::None || BufferAccessOf(opcode) != BufferAccess::None || AddressOpcodeInfoOf(opcode).access != AddressAccess::None;
+}
+
+bool WaveUniform(const IrValue* root) {
+    std::vector<const IrValue*> pending{root};
+    std::unordered_set<const IrValue*> visited;
+    while (!pending.empty()) {
+        const auto* value = pending.back();
+        pending.pop_back();
+        if (value == nullptr) return false;
+        value = value->Resolve();
+        if (value == nullptr) return false;
+        if (!visited.insert(value).second || value->HasImmediate()) continue;
+        const auto opcode = value->Opcode();
+        if (opcode == IrOpcode::ReadFirstLane || opcode == IrOpcode::GetUserData || opcode == IrOpcode::GetShaderBase) continue;
+        if (opcode == IrOpcode::GetBuiltin) {
+            const auto* kind = ArgumentOf(*value, 0u);
+            if (kind != nullptr && kind->HasImmediate() && static_cast<StageInputKind>(kind->ImmediateU32()) == StageInputKind::DispatchThreadLimit) continue;
+            return false;
+        }
+        if (opcode == IrOpcode::Phi) {
+            const auto* first = value->ArgumentCount() == 0u ? nullptr : ArgumentOf(*value, 0u);
+            for (std::size_t index = 1; index < value->ArgumentCount(); ++index) {
+                if (ArgumentOf(*value, index) != first) return false;
+            }
+            if (first != nullptr) pending.push_back(first);
+            continue;
+        }
+        if (CrossLaneOpcode(opcode) || opcode == IrOpcode::LaneId || opcode == IrOpcode::Ballot || opcode == IrOpcode::GetExec || opcode == IrOpcode::GetExecLo || opcode == IrOpcode::GetExecHi || opcode == IrOpcode::GetVectorRegister || opcode == IrOpcode::GetScalarRegister || opcode == IrOpcode::GetThreadBitScalarRegister || opcode == IrOpcode::GetAttribute || opcode == IrOpcode::LoadVectorWindow || SharedAccessOf(opcode) != SharedAccess::None) return false;
+        const auto count = value->ArgumentCount();
+        const auto used = MemoryOpcode(opcode) && count != 0u ? count - 1u : count;
+        for (std::size_t index = 0; index < used; ++index) pending.push_back(value->Argument(index));
+    }
+    return true;
+}
+
+bool LaneIndex(const IrValue* value) {
+    if (value == nullptr) return false;
+    if (value->Opcode() == IrOpcode::LaneId) return true;
+    if (value->Opcode() != IrOpcode::IAdd32 && value->Opcode() != IrOpcode::ISub32 && value->Opcode() != IrOpcode::BitwiseAnd32) return false;
+    const auto* left = ArgumentOf(*value, 0u);
+    const auto* right = ArgumentOf(*value, 1u);
+    return (LaneIndex(left) && right != nullptr && right->HasImmediate()) || (LaneIndex(right) && left != nullptr && left->HasImmediate());
+}
+
+bool HalfTest(const IrValue* value) {
+    if (value == nullptr) return false;
+    const auto opcode = value->Opcode();
+    if (opcode != IrOpcode::ULessThan32 && opcode != IrOpcode::UGreaterThanEqual32 && opcode != IrOpcode::IEqual32 && opcode != IrOpcode::INotEqual32) return false;
+    const auto* left = ArgumentOf(*value, 0u);
+    const auto* right = ArgumentOf(*value, 1u);
+    return (LaneIndex(left) && right != nullptr && right->HasImmediate()) || (LaneIndex(right) && left != nullptr && left->HasImmediate());
+}
+
+bool MaskValue(const IrValue* root) {
+    std::vector<const IrValue*> pending{root};
+    std::unordered_set<const IrValue*> visited;
+    while (!pending.empty()) {
+        const auto* value = pending.back();
+        pending.pop_back();
+        if (value == nullptr) return false;
+        value = value->Resolve();
+        if (value == nullptr) return false;
+        if (!visited.insert(value).second || value->HasImmediate()) continue;
+        const auto opcode = value->Opcode();
+        if (opcode == IrOpcode::Ballot || opcode == IrOpcode::GetExec || opcode == IrOpcode::GetExecLo || opcode == IrOpcode::GetExecHi) continue;
+        if (opcode == IrOpcode::Select || opcode == IrOpcode::SelectU32) {
+            if (!HalfTest(ArgumentOf(*value, 0u)) && !WaveUniform(value->Argument(0))) return false;
+            pending.push_back(value->Argument(1));
+            pending.push_back(value->Argument(2));
+            continue;
+        }
+        if (opcode == IrOpcode::Phi || opcode == IrOpcode::BitwiseAnd32 || opcode == IrOpcode::BitwiseOr32 || opcode == IrOpcode::BitwiseNot32 || opcode == IrOpcode::BitwiseXor32 || OpcodeNamed(*value, "CompositeExtract")) {
+            for (std::size_t index = 0; index < value->ArgumentCount(); ++index) pending.push_back(value->Argument(index));
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool OwnBitUse(const IrValue* lane, const IrValue& user, std::string& reason) {
+    const auto opcode = user.Opcode();
+    if (opcode == IrOpcode::Reference || opcode == IrOpcode::ReferenceU32 || (LaneIndex(&user) && &user != lane)) {
+        for (const IrValue* next : user.Uses()) {
+            if (!OwnBitUse(&user, *next, reason)) return false;
+        }
+        return true;
+    }
+    if ((opcode == IrOpcode::ShiftRightLogical32 || opcode == IrOpcode::BitFieldUExtract) && ArgumentOf(user, 1u) == lane && ArgumentOf(user, 0u) != lane && MaskValue(user.Argument(0))) return true;
+    if (opcode == IrOpcode::ShiftLeftLogical32 && ArgumentOf(user, 1u) == lane) {
+        const auto* one = ArgumentOf(user, 0u);
+        if (one == nullptr || !one->HasImmediate() || one->ImmediateU32() != 1u) {
+            reason = "lane-id:shift";
+            return false;
+        }
+        for (const IrValue* next : user.Uses()) {
+            if (next->Opcode() != IrOpcode::BitwiseAnd32 || !MaskValue(ArgumentOf(*next, 0u) == &user ? next->Argument(1) : next->Argument(0))) {
+                reason = std::string("lane-id:bit-") + std::string(IrOpcodeName(next->Opcode()));
+                return false;
+            }
+        }
+        return true;
+    }
+    if (HalfTest(&user)) {
+        for (const IrValue* next : user.Uses()) {
+            if ((next->Opcode() != IrOpcode::Select && next->Opcode() != IrOpcode::SelectU32) || ArgumentOf(*next, 0u) != &user || !MaskValue(next->Argument(1)) || !MaskValue(next->Argument(2))) {
+                reason = std::string("lane-id:half-") + std::string(IrOpcodeName(next->Opcode()));
+                return false;
+            }
+        }
+        return true;
+    }
+    reason = std::string("lane-id:") + std::string(IrOpcodeName(opcode));
+    return false;
+}
+
+}
+
+std::map<std::string, std::uint32_t> GridPointwiseFailures(const IrProgram& program) {
+    std::map<std::string, std::uint32_t> failures;
+    const auto fail = [&](const std::string& reason) { ++failures[reason]; };
+    if (program.Resources().stage != IrShaderStage::Compute) {
+        fail("stage");
+        return failures;
+    }
+    if (program.Info().sharedMemoryBytes != 0u) fail("lds");
     for (const auto& image : program.Info().images) {
-        if ((image.written || image.atomic) && !RenderScaleMapsImage(image)) return false;
+        if (!image.written && !image.atomic) continue;
+        if (const auto* refusal = RenderScaleImageRefusal(image, IrShaderStage::Compute)) fail(std::string("written-image-") + refusal);
     }
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
             const auto opcode = inst->Opcode();
-            if (CrossLaneOpcode(opcode) || SharedAccessOf(opcode) != SharedAccess::None) return false;
-            const auto buffer = BufferAccessOf(opcode);
-            if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic) return false;
-            const auto address = AddressOpcodeInfoOf(opcode).access;
-            if (address == AddressAccess::Write || address == AddressAccess::Atomic) return false;
-            if (ImageOpcodeInfoOf(opcode).access == ImageAccess::Atomic) return false;
-            if (opcode == IrOpcode::GetBuiltin) {
-                const auto* kind = inst->Argument(0)->Resolve();
-                if (kind == nullptr || !kind->HasImmediate()) return false;
-                const auto builtin = static_cast<StageInputKind>(kind->ImmediateU32());
-                if (builtin != StageInputKind::WorkgroupId && builtin != StageInputKind::LocalInvocationId && builtin != StageInputKind::GlobalInvocationId && builtin != StageInputKind::DispatchThreadLimit) return false;
+            if (opcode == IrOpcode::ReadFirstLane) {
+                if (!WaveUniform(inst->Argument(0))) fail("read-first-lane-varying");
+                continue;
             }
-            if (opcode == IrOpcode::Ballot && BallotReachesMemory(inst)) return false;
+            if (opcode == IrOpcode::LaneId) {
+                std::string reason;
+                for (const IrValue* user : inst->Uses()) {
+                    if (!OwnBitUse(inst, *user, reason)) break;
+                }
+                if (!reason.empty()) fail(reason);
+                continue;
+            }
+            if (CrossLaneOpcode(opcode)) fail(std::string(IrOpcodeName(opcode)));
+            if (SharedAccessOf(opcode) != SharedAccess::None) fail("lds");
+            const auto buffer = BufferAccessOf(opcode);
+            if (buffer == BufferAccess::Write) fail("buffer-store");
+            if (buffer == BufferAccess::Atomic) fail("buffer-atomic");
+            const auto address = AddressOpcodeInfoOf(opcode).access;
+            if (address == AddressAccess::Write) fail("global-store");
+            if (address == AddressAccess::Atomic) fail("global-atomic");
+            if (ImageOpcodeInfoOf(opcode).access == ImageAccess::Atomic) fail("image-atomic");
+            if (opcode == IrOpcode::GetBuiltin) {
+                const auto* kind = ArgumentOf(*inst, 0u);
+                if (kind == nullptr || !kind->HasImmediate()) {
+                    fail("builtin-dynamic");
+                } else {
+                    const auto builtin = static_cast<StageInputKind>(kind->ImmediateU32());
+                    if (builtin != StageInputKind::WorkgroupId && builtin != StageInputKind::LocalInvocationId && builtin != StageInputKind::GlobalInvocationId && builtin != StageInputKind::DispatchThreadLimit) fail("builtin-" + std::to_string(kind->ImmediateU32()));
+                }
+            }
+            if (opcode == IrOpcode::Ballot && BallotReachesMemory(inst)) fail("ballot-data");
         }
     }
-    return true;
+    return failures;
+}
+
+bool ProveGridPointwise(const IrProgram& program) {
+    return GridPointwiseFailures(program).empty();
 }
 
 void ShaderInfoCollector::Collect(IrProgram& program) const {
