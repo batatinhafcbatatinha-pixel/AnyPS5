@@ -14,6 +14,8 @@ layout(push_constant) uniform Push {
     uint clear0;
     uint clear1;
     uint write;
+    uint hostWidth;
+    uint hostHeight;
 } push;
 
 const uint xMasks[13] = uint[](0x008u, 0x000u, 0x040u, 0x000u, 0x080u, 0x000u, 0x100u, 0x000u, 0x200u, 0x008u, 0x010u, 0x040u, 0x020u);
@@ -21,9 +23,10 @@ const uint yMasks[13] = uint[](0x000u, 0x010u, 0x000u, 0x040u, 0x000u, 0x080u, 0
 
 void main() {
     uvec2 pixel = gl_GlobalInvocationID.xy;
-    if (pixel.x >= push.width || pixel.y >= push.height) return;
-    uint x = pixel.x & ~7u;
-    uint y = pixel.y & ~7u;
+    if (pixel.x >= push.hostWidth || pixel.y >= push.hostHeight) return;
+    uvec2 guest = min(uvec2((pixel.x * push.width) / push.hostWidth, (pixel.y * push.height) / push.hostHeight), uvec2(push.width - 1u, push.height - 1u));
+    uint x = guest.x & ~7u;
+    uint y = guest.y & ~7u;
     uint offset = 0u;
     for (uint bit = 0u; bit < 13u; ++bit) offset |= (uint(bitCount((x & xMasks[bit]) ^ (y & yMasks[bit]))) & 1u) << bit;
     uint nibble = ((y / 512u) * push.blocksPerRow + x / 1024u) * 8192u + offset;
@@ -34,5 +37,5 @@ void main() {
         imageStore(target, ivec2(pixel), uvec4(push.clear0, push.clear1, 0u, 0u));
         return;
     }
-    if ((pixel.x & 7u) == 0u && (pixel.y & 7u) == 0u) atomicOr(errors.codes, 1u);
+    if ((guest.x & 7u) == 0u && (guest.y & 7u) == 0u) atomicOr(errors.codes, 1u);
 }

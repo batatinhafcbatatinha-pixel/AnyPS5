@@ -64,7 +64,7 @@ bool ScaleCandidateExtent(std::uint64_t address, std::uint64_t bytes, VkExtent2D
 void LogScaleSurface(std::uint64_t address, VkExtent2D guest, VkExtent2D host, int format, const char* role, const char* state, const char* reason);
 void NoteScaleDemotion();
 void NoteScaledSurface(std::int64_t guestBytes, std::int64_t hostBytes, std::int64_t count);
-void NoteScaleResample(bool toHost, std::uint64_t bytes);
+void NoteScaleResample(bool toHost, std::uint64_t bytes, const char* reason = nullptr);
 void RenderScaleTick();
 bool DisplaySurfaceOverlaps(std::uint64_t address, std::uint64_t bytes);
 void RefuseScale(std::uint64_t address, const char* reason);
@@ -520,6 +520,8 @@ public:
     VkExtent2D HostExtent() const { return Scaled() ? hostExtent : VkExtent2D{descriptor.width, descriptor.height}; }
     void SyncHost();
     void BeginTwinWrite();
+    VkImageView HostElementView();
+    void NoteHostWritten() { if (hostImage != VK_NULL_HANDLE) twinStale = true; }
     void EndTwinWrite();
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
@@ -877,6 +879,7 @@ private:
     bool hostLaid = false;
     bool hostStale = false;
     bool twinStale = false;
+    std::uint32_t bufferStores = 0;
     VkDeviceSize memoryBytes = 0;
     VkImageView view = VK_NULL_HANDLE;
     std::uint32_t defaultMip = 0;
@@ -885,6 +888,7 @@ private:
     std::map<std::pair<std::uint32_t, bool>, VkImageView> atomicViews;
     std::map<std::pair<std::uint32_t, bool>, VkImageView> uintViews;
     VkImageView elementView = VK_NULL_HANDLE;
+    VkImageView hostElementView = VK_NULL_HANDLE;
     std::map<std::uint32_t, VkImageView> elementLayerViews;
     std::int8_t singlePassState = -1;
     bool attachable = false;

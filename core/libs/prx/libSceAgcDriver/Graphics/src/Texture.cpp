@@ -345,6 +345,13 @@ struct ExpandImage {
     VkDeviceSize bytes = 0;
 };
 
+GuestTextureResource HostSized(GuestTextureResource descriptor, const StorageTexture& source) {
+    if (!source.Scaled()) return descriptor;
+    descriptor.width = source.HostExtent().width;
+    descriptor.height = source.HostExtent().height;
+    return descriptor;
+}
+
 ExpandImage CreateExpandImage(const Context& context, const GuestTextureResource& descriptor, std::uint32_t depth, std::uint32_t layers) {
     ExpandImage result;
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1085,7 +1092,6 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
 }
 
 bool Texture::CanSrgbExpandFrom(const Context& context, const StorageTexture& source, const GuestTextureResource& descriptor) {
-    if (source.Scaled()) return false;
     if (!SrgbExpandsToRgba8(context, descriptor.format) || !CanCopyFrom(source, descriptor) || descriptor.dimension == TextureDimension::k3D) return false;
     if (!StorageFormatAvailable(context, source.Descriptor().format) || StorageFormatForGuest(context, source.Descriptor().format) != SampledTextureFormat(context, descriptor.format)) return false;
     const auto geometry = DescribeSurface(descriptor);
@@ -1101,7 +1107,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         copyLevels = descriptor.mipCount;
         copyLayers = geometry.imageLayers;
         APS5_LOG_OUT("Texture address=0x%llx %ux%u mips=%u layers=%u sRGB copy of storage image (guest format %u)", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, copyLayers, descriptor.format);
-        auto expanded = CreateExpandImage(context, descriptor, 1u, copyLayers);
+        auto expanded = CreateExpandImage(context, HostSized(descriptor, *source), 1u, copyLayers);
         image = expanded.image;
         owned = std::move(expanded.owned);
         allocationBytes = expanded.bytes;
@@ -1157,7 +1163,7 @@ bool Texture::refreshSrgbExpand() {
     toTransferDst.image = image;
     toTransferDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, copyLevels, 0, copyLayers};
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &produced, 0, nullptr, 1, &toTransferDst);
-    RecordExpandBlit(context, commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, image, sourceDescriptor, 1u, copyLayers);
+    RecordExpandBlit(context, commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, image, HostSized(sourceDescriptor, *storageSource), 1u, copyLayers);
     VkImageMemoryBarrier toShaderRead = toTransferDst;
     toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1679,6 +1685,7 @@ struct ScalePolicy {
     std::vector<VkExtent2D> displayExtents;
     std::set<std::uint64_t> refused;
     std::map<std::string, std::uint64_t> reasons;
+    std::map<std::string, std::uint64_t> twinReasons;
 };
 
 ScalePolicy& Policy() {
@@ -1876,7 +1883,12 @@ void NoteScaledSurface(std::int64_t guestBytes, std::int64_t hostBytes, std::int
     counts.hostBytes.fetch_add(hostBytes * count, std::memory_order_relaxed);
 }
 
-void NoteScaleResample(bool toHost, std::uint64_t bytes) {
+void NoteScaleResample(bool toHost, std::uint64_t bytes, const char* reason) {
+    if (!toHost) {
+        auto& policy = Policy();
+        std::lock_guard lock(policy.mutex);
+        ++policy.twinReasons[reason != nullptr ? reason : "other"];
+    }
     auto& counts = ScaleCounts();
     (toHost ? counts.toHost : counts.toTwin).fetch_add(1, std::memory_order_relaxed);
     (toHost ? counts.toHostBytes : counts.toTwinBytes).fetch_add(bytes, std::memory_order_relaxed);
@@ -1898,6 +1910,9 @@ void RenderScaleTick() {
         auto& policy = Policy();
         std::lock_guard lock(policy.mutex);
         for (const auto& [reason, count] : policy.reasons) refused += " " + reason + "=" + std::to_string(count);
+        refused += ", host->twin by";
+        for (const auto& [reason, count] : policy.twinReasons) refused += " " + reason + "=" + std::to_string(count);
+        policy.twinReasons.clear();
     }
     constexpr double mib = 1048576.0;
     std::fprintf(stderr, "[render-scale] scaled %lld surfaces (%.0f MiB guest -> %.0f MiB host), refused:%s, twin->host %llu (%.0f MiB), host->twin %llu (%.0f MiB), demotions %llu (10 s)\n", static_cast<long long>(counts.surfaces.load()), static_cast<double>(counts.guestBytes.load()) / mib, static_cast<double>(counts.hostBytes.load()) / mib, refused.empty() ? " none" : refused.c_str(), static_cast<unsigned long long>(counts.toHost.exchange(0)), static_cast<double>(counts.toHostBytes.exchange(0)) / mib, static_cast<unsigned long long>(counts.toTwin.exchange(0)), static_cast<double>(counts.toTwinBytes.exchange(0)) / mib, static_cast<unsigned long long>(counts.demotions.exchange(0)));
@@ -2011,9 +2026,18 @@ void StorageTexture::resample(bool toHost) {
     }
     recordResample(commands, toHost);
     if (batch) batch->SubmitAndWait();
-    NoteScaleResample(toHost, toHost ? hostAllocation.Size() : guestBytes);
+    NoteScaleResample(toHost, toHost ? hostAllocation.Size() : guestBytes, toHost ? uploadReason : flushReason);
     if (toHost) hostStale = false;
     else twinStale = false;
+}
+
+VkImageView StorageTexture::HostElementView() {
+    if (hostImage == VK_NULL_HANDLE) return ElementView();
+    if (hostElementView != VK_NULL_HANDLE) return hostElementView;
+    const auto bytes = BytesPerElement(descriptor.format);
+    const auto format = bytes == 1 ? VK_FORMAT_R8_UINT : bytes == 2 ? VK_FORMAT_R16_UINT : bytes == 4 ? VK_FORMAT_R32_UINT : VK_FORMAT_R32G32_UINT;
+    hostElementView = createView(0, false, format, false);
+    return hostElementView;
 }
 
 void StorageTexture::BeginTwinWrite() {
@@ -2031,7 +2055,9 @@ void StorageTexture::SyncHost() {
 }
 
 void StorageTexture::syncTwin() {
-    if (hostImage != VK_NULL_HANDLE && twinStale && hostLaid) resample(false);
+    if (hostImage == VK_NULL_HANDLE || !twinStale || !hostLaid) return;
+    resample(false);
+    if (flushReason != nullptr && (std::strcmp(flushReason, "imported buffer region") == 0 || std::strcmp(flushReason, "copied buffer region") == 0) && ++bufferStores == 4) RefuseScale(descriptor.baseAddress, "buffer view");
 }
 
 StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, VkExtent2D requestedHost) : context(context), detiler(detiler), descriptor(descriptor) {
@@ -7887,6 +7913,8 @@ void StorageTexture::release() noexcept {
     for (const auto& [key, uint] : uintViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, uint, nullptr);
     uintViews.clear();
     if (elementView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, elementView, nullptr);
+    if (hostElementView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, hostElementView, nullptr);
+    hostElementView = VK_NULL_HANDLE;
     elementView = VK_NULL_HANDLE;
     for (const auto& [key, element] : elementLayerViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, element, nullptr);
     elementLayerViews.clear();
