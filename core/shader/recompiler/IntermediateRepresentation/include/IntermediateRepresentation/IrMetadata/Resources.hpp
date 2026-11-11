@@ -128,6 +128,10 @@ struct ImageResource {
     bool operator==(const ImageResource& other) const = default;
 };
 
+inline bool RenderScaleMapsImage(const ImageResource& image) {
+    return image.table == NoTable && !image.targetMerge && !image.cube && !image.remappedDepth1D && !image.layerRows && !image.volumeGather && !image.packed && image.byElements == 0u && !image.atomic && image.mipMode == ImageMipMode::None && (image.dimension == RdnaImageDimension::Dim2D || image.dimension == RdnaImageDimension::Dim2DArray);
+}
+
 enum SamplerUse : std::uint16_t {
     SamplerUseExplicitLod = 1u << 0u,
     SamplerUseImplicitLod = 1u << 1u,

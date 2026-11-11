@@ -251,6 +251,95 @@ std::uint32_t CoordU32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access
     return result;
 }
 
+bool RenderScaled(SpirvEmitterState& state, const ImageEmitAccess& access) {
+    return state.renderScale && !state.registrationModules && RenderScaleMapsImage(state.program.Info().images.at(access.mem.resource)) && RenderScaleMapsImage(access.image);
+}
+
+std::uint32_t GuestAxisExtent(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t axis, std::uint32_t lod) {
+    const auto u32 = TypeU32(state);
+    const auto word = state.module.SpecializationConstant(u32, PipelineSpecialization::GuestExtentBase + resource, 0u);
+    const auto base = axis == 0u ? Binary(state, spv::OpBitwiseAnd, u32, word, ConstantU32(state, 0xffffu)) : Binary(state, spv::OpShiftRightLogical, u32, word, ConstantU32(state, 16u));
+    const auto shifted = Binary(state, spv::OpShiftRightLogical, u32, base, lod);
+    const auto atLeastOne = Select(state, u32, Binary(state, spv::OpUGreaterThan, TypeBool(state), shifted, ConstantU32(state, 1u)), shifted, ConstantU32(state, 1u));
+    return Select(state, u32, Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU32(state, 0u)), ConstantU32(state, 0u), atLeastOne);
+}
+
+std::uint32_t HostViewSize(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, bool storage, std::uint32_t lod) {
+    auto& state = ctx.state;
+    state.module.EmitCapability(spv::CapabilityImageQuery);
+    const auto size = state.module.AllocateId();
+    if (storage) {
+        const auto image = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, ImageType(state, access.image), image, StorageImageDescriptorPointer(state, access.mem.resource));
+        state.module.AddFunction(spv::OpImageQuerySize, ImageViewSizeType(state, access.image.dimension), size, image);
+    } else {
+        state.module.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, access.image.dimension), size, LoadSampledImageDescriptor(state, access.mem.resource), lod);
+    }
+    return size;
+}
+
+std::uint32_t GuestToHostTexel(SpirvEmitterState& state, std::uint32_t guestCoord, std::uint32_t guest, std::uint32_t host) {
+    const auto u32 = TypeU32(state);
+    const auto doubled = Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpShiftLeftLogical, u32, guestCoord, ConstantU32(state, 1u)), ConstantU32(state, 1u));
+    const auto denominator = Binary(state, spv::OpShiftLeftLogical, u32, guest, ConstantU32(state, 1u));
+    const auto safe = Select(state, u32, Binary(state, spv::OpIEqual, TypeBool(state), denominator, ConstantU32(state, 0u)), ConstantU32(state, 1u), denominator);
+    const auto mapped = Binary(state, spv::OpUDiv, u32, Binary(state, spv::OpIMul, u32, doubled, host), safe);
+    return Select(state, u32, Binary(state, spv::OpULessThan, TypeBool(state), guestCoord, guest), mapped, guestCoord);
+}
+
+std::uint32_t RenderScaledCoordU32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t coord, bool storage, std::uint32_t lod) {
+    auto& state = ctx.state;
+    const auto u32 = TypeU32(state);
+    const auto components = RdnaImageDimensionInfoFor(access.image.dimension).coordinateComponents;
+    const auto size = HostViewSize(ctx, access, storage, lod);
+    const auto extract = [&](std::uint32_t composite, std::uint32_t index) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, u32, value, composite, index);
+        return value;
+    };
+    std::array<std::uint32_t, 3> values{};
+    for (std::uint32_t index = 0; index < components; ++index) values[index] = extract(coord, index);
+    for (std::uint32_t axis = 0; axis < 2u; ++axis) values[axis] = GuestToHostTexel(state, values[axis], GuestAxisExtent(state, access.mem.resource, axis, lod), extract(size, axis));
+    const auto result = state.module.AllocateId();
+    if (components == 3u) {
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), result, values[0], values[1], values[2]);
+    } else {
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), result, values[0], values[1]);
+    }
+    return result;
+}
+
+std::uint32_t RenderScaledUnnormalizedCoord(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t coord) {
+    auto& state = ctx.state;
+    if (!RenderScaled(state, access) || state.program.Info().samplers.at(access.mem.sampler).table != NoTable) return coord;
+    const auto f32 = TypeF32(state);
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto components = RdnaImageDimensionInfoFor(access.image.dimension).coordinateComponents;
+    const auto unnormalized = Binary(state, spv::OpINotEqual, boolean, state.module.SpecializationConstant(u32, PipelineSpecialization::RenderScaleUnnormalizedBase + access.mem.sampler, 0u), ConstantU32(state, 0u));
+    const auto size = HostViewSize(ctx, access, false, ConstantU32(state, 0u));
+    std::array<std::uint32_t, 3> values{};
+    for (std::uint32_t index = 0; index < components; ++index) {
+        values[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, f32, values[index], coord, index);
+    }
+    for (std::uint32_t axis = 0; axis < 2u; ++axis) {
+        const auto guest = GuestAxisExtent(state, access.mem.resource, axis, ConstantU32(state, 0u));
+        const auto host = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, u32, host, size, axis);
+        const auto active = Binary(state, spv::OpLogicalAnd, boolean, unnormalized, Binary(state, spv::OpINotEqual, boolean, guest, ConstantU32(state, 0u)));
+        const auto ratio = Binary(state, spv::OpFDiv, f32, Unary(state, spv::OpConvertUToF, f32, host), Unary(state, spv::OpConvertUToF, f32, Select(state, u32, active, guest, ConstantU32(state, 1u))));
+        values[axis] = Select(state, f32, active, Binary(state, spv::OpFMul, f32, values[axis], ratio), values[axis]);
+    }
+    const auto result = state.module.AllocateId();
+    if (components == 3u) {
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), result, values[0], values[1], values[2]);
+    } else {
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), result, values[0], values[1]);
+    }
+    return result;
+}
+
 std::uint32_t LodU32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     if (!access.mem.imageHasMip) {
         return ConstantU32(ctx.state, 0);
@@ -480,6 +569,13 @@ std::uint32_t QueryDimensions(SpirvValueEmitContext& ctx, const ImageEmitAccess&
         for (std::uint32_t index = 0; index < components; index++) {
             result[index] = state.module.AllocateId();
             state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), result[index], size, index);
+        }
+    }
+    if (RenderScaled(state, access) && info.multisampled == 0u && components >= 2u) {
+        const auto lod = AddressU32(ctx, access, 0);
+        for (std::uint32_t axis = 0; axis < 2u; ++axis) {
+            const auto guest = GuestAxisExtent(state, access.mem.resource, axis, lod);
+            result[axis] = Select(state, TypeU32(state), Binary(state, spv::OpINotEqual, TypeBool(state), guest, ConstantU32(state, 0u)), guest, result[axis]);
         }
     }
     if (access.mem.imageDimension == RdnaImageDimension::Dim3D && dimension == RdnaImageDimension::Dim2D) {
@@ -1287,7 +1383,7 @@ void EmitReadOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     ctx.Define(access.inst, EmitValueOrDefaultIfCondition(state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4), [&]() {
         const auto descriptor = LoadSampledImageDescriptor(state, access.mem.resource);
         const auto color = state.module.AllocateId();
-        const auto coord = CoordU32(ctx, access);
+        const auto coord = RenderScaled(state, access) ? RenderScaledCoordU32(ctx, access, CoordU32(ctx, access), false, LodU32(ctx, access)) : CoordU32(ctx, access);
         if (dimensionInfo.multisampled != 0u) {
             const auto& addressInfo = AddressDimension(access);
             if (addressInfo.multisampled == 0u || access.mem.imageAddressComponents <= addressInfo.coordinateComponents) {
@@ -1387,7 +1483,7 @@ void EmitWriteOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     }
     EmitIfCondition(state, condition, [&]() {
         const auto mipLod = access.image.mipMode == ImageMipMode::DynamicStorage ? LodU32(ctx, access) : 0u;
-        const auto coord = CoordU32(ctx, access);
+        const auto coord = RenderScaled(state, access) ? RenderScaledCoordU32(ctx, access, CoordU32(ctx, access), true, ConstantU32(state, 0u)) : CoordU32(ctx, access);
         auto texel = access.mem.imagePacked ? PackedStoreTexel(ctx, access, ctx.Arg(access.inst, 2)) : StoreTexel(ctx, access, ctx.Arg(access.inst, 2), uintImage);
         if (!uintImage && !access.mem.imagePacked && !access.image.atomic && access.image.table == NoTable && !state.registrationModules && access.image.conversionFormat == IrBufferFormat::Invalid) texel = QuantizeStoreTexel(state, access.mem.resource, texel);
         EmitStorageImageWrite(state, access.mem.resource, mipLod, coord, texel, ImageSampleIndex(ctx, access));
@@ -1463,6 +1559,7 @@ SampleSetup MakeSampleSetup(SpirvValueEmitContext& ctx, const ImageEmitAccess& a
         ctx.Fail(access.inst, "samples or gathers a converted float image, which needs filtering in the shader and is not implemented");
     }
     auto coord = CoordF32(ctx, access, layout.coord, dimensionInfo.coordinateComponents, AddressDimension(access).coordinateComponents);
+    coord = RenderScaledUnnormalizedCoord(ctx, access, coord);
     if (access.image.layerRows) {
         if (dref || access.inst.Opcode() != IrOpcode::ImageSampleRaw || (access.mem.imageSampleFlags != RdnaImageSampleFlagLevelZero && access.mem.imageSampleFlags != RdnaImageSampleFlagLod)) ctx.Fail(access.inst, "reads a 1D array laid out as rows of a 2D image other than by image_sample_lz or image_sample_l");
         coord = LayerRowsCoord(ctx, access, coord);

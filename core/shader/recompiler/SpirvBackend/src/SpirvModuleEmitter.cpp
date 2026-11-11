@@ -2264,8 +2264,46 @@ std::uint32_t EmitGetUserData(SpirvEmitterState& state, ScalarReg reg) {
     return EmitShaderDataDwordLoad(state, dwordIndex);
 }
 
+namespace {
+
+std::uint32_t EmitGuestFragCoord(SpirvEmitterState& state, std::uint32_t bits, std::uint32_t component) {
+    const auto f32 = TypeF32(state);
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto axis = [&](std::uint32_t word) {
+        const auto value = state.module.SpecializationConstant(u32, PipelineSpecialization::FragmentScaleBase + word, 0u);
+        return component == 0u ? EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, 0xffffu)) : EmitBinaryU32(state, spv::OpShiftRightLogical, value, ConstantU32(state, 16u));
+    };
+    const auto guest = axis(0u);
+    const auto host = axis(1u);
+    const auto active = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpINotEqual, boolean, guest, ConstantU32(state, 0u)), Binary(state, spv::OpINotEqual, boolean, host, ConstantU32(state, 0u)));
+    const auto position = Unary(state, spv::OpBitcast, f32, bits);
+    const auto floored = state.module.AllocateId();
+    state.module.AddFunction(spv::OpExtInst, f32, floored, GlslStd450(state), GLSLstd450Floor, position);
+    const auto offset = Binary(state, spv::OpFSub, f32, position, floored);
+    const auto texel = Unary(state, spv::OpConvertFToU, u32, floored);
+    const auto numerator = EmitBinaryU32(state, spv::OpIMul, EmitBinaryU32(state, spv::OpIAdd, EmitBinaryU32(state, spv::OpShiftLeftLogical, texel, ConstantU32(state, 1u)), ConstantU32(state, 1u)), guest);
+    const auto denominator = Select(state, u32, active, EmitBinaryU32(state, spv::OpShiftLeftLogical, host, ConstantU32(state, 1u)), ConstantU32(state, 1u));
+    const auto whole = EmitBinaryU32(state, spv::OpUDiv, numerator, denominator);
+    const auto remainder = EmitBinaryU32(state, spv::OpUMod, numerator, denominator);
+    const auto fraction = Binary(state, spv::OpFDiv, f32, Unary(state, spv::OpConvertUToF, f32, remainder), Unary(state, spv::OpConvertUToF, f32, denominator));
+    const auto ratio = Binary(state, spv::OpFDiv, f32, Unary(state, spv::OpConvertUToF, f32, guest), Unary(state, spv::OpConvertUToF, f32, Select(state, u32, active, host, ConstantU32(state, 1u))));
+    const auto centred = Binary(state, spv::OpFAdd, f32, Unary(state, spv::OpConvertUToF, f32, whole), fraction);
+    const auto shifted = Binary(state, spv::OpFAdd, f32, centred, Binary(state, spv::OpFMul, f32, Binary(state, spv::OpFSub, f32, offset, ConstantF32Value(state, 0.5f)), ratio));
+    const auto centre = Binary(state, spv::OpFOrdEqual, boolean, offset, ConstantF32Value(state, 0.5f));
+    const auto overflow = Binary(state, spv::OpLogicalAnd, boolean, centre, Binary(state, spv::OpINotEqual, boolean, Unary(state, spv::OpConvertFToU, u32, shifted), whole));
+    const auto guarded = Select(state, f32, overflow, Binary(state, spv::OpFAdd, f32, Unary(state, spv::OpConvertUToF, f32, whole), ConstantF32Value(state, 0.5f)), shifted);
+    return Unary(state, spv::OpBitcast, u32, Select(state, f32, active, guarded, position));
+}
+
+}
+
 std::uint32_t EmitGetBuiltin(SpirvValueEmitContext& ctx, const IrValue* kind, const IrValue* index) {
-    return EmitBuiltinU32(ctx.state, static_cast<StageInputKind>(kind->ImmediateU32()), index->ImmediateU32());
+    const auto builtin = static_cast<StageInputKind>(kind->ImmediateU32());
+    const auto component = index->ImmediateU32();
+    const auto value = EmitBuiltinU32(ctx.state, builtin, component);
+    if (!ctx.state.renderScale || builtin != StageInputKind::FragCoord || component > 1u || StageOf(ctx.state) != IrShaderStage::Pixel) return value;
+    return EmitGuestFragCoord(ctx.state, value, component);
 }
 
 std::uint32_t EmitGetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {

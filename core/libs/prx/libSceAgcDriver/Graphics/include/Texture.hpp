@@ -42,6 +42,28 @@ VkFormat HostStorageFormat(const Context& context, VkFormat format);
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
 std::uint64_t SampledTextureMemory();
 
+float RenderScale();
+bool RenderScaleEnabled();
+enum class ScaleRequest : std::uint8_t { Keep, Allow, Refuse };
+class ScaleRequestScope {
+public:
+    explicit ScaleRequestScope(ScaleRequest request);
+    ~ScaleRequestScope();
+    ScaleRequestScope(const ScaleRequestScope&) = delete;
+    ScaleRequestScope& operator=(const ScaleRequestScope&) = delete;
+    static ScaleRequest Current();
+
+private:
+    ScaleRequest previous;
+};
+void NoteSceneExtent(VkExtent2D extent);
+void NoteDisplaySurface(std::uint64_t address, std::uint64_t bytes);
+bool DisplaySurfaceOverlaps(std::uint64_t address, std::uint64_t bytes);
+void RefuseScale(std::uint64_t address);
+bool ScaleRefused(std::uint64_t address);
+VkExtent2D ScaledExtent(VkExtent2D extent);
+bool ScaleCandidate(const GuestTextureResource& descriptor, std::uint32_t mip);
+
 struct SparseLevelBinds {
     std::vector<VkSparseImageMemoryBind> levels;
     std::vector<VkSparseMemoryBind> tails;
@@ -277,7 +299,7 @@ public:
         CreationHandOver& operator=(CreationHandOver&&) = default;
         ~CreationHandOver();
     };
-    static std::shared_ptr<StorageTexture> Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    static std::shared_ptr<StorageTexture> Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, VkExtent2D hostExtent = {});
     static CreationHandOver PrepareCreation(const Context& context, const GuestTextureResource& descriptor, std::uint64_t guestBytes, std::shared_ptr<StorageTexture> detached, bool& flushed);
     void AdoptHandOver(CreationHandOver handOver);
     ~StorageTexture();
@@ -485,7 +507,10 @@ public:
     // False, naming why, when the copy must be a transfer.
     bool CopyFrom(StorageTexture& source, const char*& refusal);
     static const char* CopyRefusal(const Context& context, const StorageTexture* destination, const StorageTexture& source, std::uint64_t address);
-    VkImage Image() const { return image; }
+    VkImage Image() const { return hostImage != VK_NULL_HANDLE ? hostImage : image; }
+    bool Scaled() const { return hostImage != VK_NULL_HANDLE; }
+    VkExtent2D HostExtent() const { return Scaled() ? hostExtent : VkExtent2D{descriptor.width, descriptor.height}; }
+    void SyncHost();
     const GuestTextureResource& Descriptor() const { return descriptor; }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
     std::uint32_t ImageDepth() const { return geometry.imageDepth; }
@@ -533,7 +558,12 @@ private:
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
     std::atomic<std::uint64_t> provedPending{0};
-    StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, VkExtent2D hostExtent);
+    void createHostImage(const VkImageCreateInfo& twinInfo, VkExtent2D extent);
+    void resample(bool toHost);
+    void recordResample(VkCommandBuffer commands, bool toHost);
+    void layHost(VkCommandBuffer commands);
+    void syncTwin();
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
     void upload(const std::vector<bool>* layers = nullptr);
@@ -680,6 +710,7 @@ private:
     std::uint64_t layerBegin(std::uint32_t layer) const { return descriptor.baseAddress + static_cast<std::uint64_t>(layer) * trackedLayerBytes; }
     bool anyLayerPending() const;
     bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer);
+    bool refreshTwin(std::uint32_t firstLayer, std::uint32_t lastLayer);
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration();
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
@@ -829,6 +860,13 @@ private:
     bool lent = false;
     VkImage image = VK_NULL_HANDLE;
     ImageAllocation imageAllocation;
+    VkImage hostImage = VK_NULL_HANDLE;
+    ImageAllocation hostAllocation;
+    VkExtent2D hostExtent{};
+    VkFilter resampleFilter = VK_FILTER_NEAREST;
+    bool hostLaid = false;
+    bool hostStale = false;
+    bool twinStale = false;
     VkDeviceSize memoryBytes = 0;
     VkImageView view = VK_NULL_HANDLE;
     std::uint32_t defaultMip = 0;

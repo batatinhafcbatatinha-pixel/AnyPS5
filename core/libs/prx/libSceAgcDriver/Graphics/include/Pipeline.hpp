@@ -13,6 +13,16 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
 
 // The attachments of one render pass instance. Work recorded with it references the handle until
 // the batch completes, so a recorded draw keeps the object (Recorder::Keep) like its pipeline.
+struct TargetScale {
+    VkExtent2D guest{};
+    VkExtent2D host{};
+    float x = 1.0f;
+    float y = 1.0f;
+    bool Active() const { return host.width != 0 && host.height != 0 && (x != 1.0f || y != 1.0f); }
+    VkViewport Viewport(const VkViewport& viewport) const;
+    VkRect2D Scissor(const VkRect2D& scissor) const;
+};
+
 class Framebuffer {
 public:
     Framebuffer(const Context& context, VkRenderPass renderPass, std::span<const VkImageView> targets, VkExtent2D extent, std::uint32_t layers = 1);
@@ -49,13 +59,13 @@ public:
     VkPipelineLayout Layout() const;
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<void>> owners, VkExtent2D extent, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
-    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, const State* masked = nullptr) const;
+    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, const State* masked = nullptr, const TargetScale* scale = nullptr) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).
-    void Continue(VkCommandBuffer commands, const State& state, const State* masked = nullptr) const;
+    void Continue(VkCommandBuffer commands, const State& state, const State* masked = nullptr, const TargetScale* scale = nullptr) const;
     bool SplitsFaces() const { return backFaces != VK_NULL_HANDLE; }
     bool Optimized() const { return optimized != nullptr && optimized->handle.load() != VK_NULL_HANDLE; }
-    void ContinueBackFaces(VkCommandBuffer commands, const State& state, const State* masked = nullptr) const;
+    void ContinueBackFaces(VkCommandBuffer commands, const State& state, const State* masked = nullptr, const TargetScale* scale = nullptr) const;
     bool SplitsSecondChannel() const { return secondChannel != VK_NULL_HANDLE; }
     void ContinueSecondChannel(VkCommandBuffer commands, const State& state, const State* masked = nullptr) const;
     const SampleOrder& HostSampleOrder() const { return sampleOrder; }
