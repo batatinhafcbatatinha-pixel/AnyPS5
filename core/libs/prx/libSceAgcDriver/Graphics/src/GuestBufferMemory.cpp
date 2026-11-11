@@ -5959,6 +5959,10 @@ struct ResidentRegistry {
     std::atomic<std::uint64_t> deferred{0};
     std::atomic<std::uint64_t> deferredBytes{0};
     std::atomic<std::uint64_t> claimed{0};
+    std::atomic<std::uint64_t> sourced{0};
+    std::atomic<std::uint64_t> sourcedBytes{0};
+    std::atomic<std::uint64_t> sourceFallbacks{0};
+    std::atomic<std::uint64_t> sourceFallbackBytes{0};
     std::atomic<std::uint64_t> lost{0};
 };
 
@@ -6235,7 +6239,7 @@ void reportResident() {
         std::snprintf(part, sizeof(part), " %s %llu/%.1f/%llu", key.c_str(), static_cast<unsigned long long>(cause.count), cause.bytes / 1048576.0, static_cast<unsigned long long>(cause.dropped));
         text += part;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] resident staging: %llu hits (%.1f MiB of copy-ins avoided), %llu copy-backs deferred (%.1f MiB), %llu flushes skipped for a claiming build, %llu lost; %zu live, %.1f MiB of %.0f MiB; flushes by cause (count/MiB copied back/entries dropped):%s\n", static_cast<unsigned long long>(registry.hits.load(std::memory_order_relaxed)), registry.hitBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(registry.deferred.load(std::memory_order_relaxed)), registry.deferredBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(registry.claimed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(registry.lost.load(std::memory_order_relaxed)), live, liveBytes / 1048576.0, residentBudget() / 1048576.0, text.empty() ? " none" : text.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] resident staging: %llu hits (%.1f MiB of copy-ins avoided), %llu copy-backs deferred (%.1f MiB), %llu flushes skipped for a claiming build or image, image uploads from resident buffers %llu/%.1f MiB (fallbacks to the import %llu/%.1f MiB), %llu lost; %zu live, %.1f MiB of %.0f MiB; flushes by cause (count/MiB copied back/entries dropped):%s\n", static_cast<unsigned long long>(registry.hits.load(std::memory_order_relaxed)), registry.hitBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(registry.deferred.load(std::memory_order_relaxed)), registry.deferredBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(registry.claimed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(registry.sourced.load(std::memory_order_relaxed)), registry.sourcedBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(registry.sourceFallbacks.load(std::memory_order_relaxed)), registry.sourceFallbackBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(registry.lost.load(std::memory_order_relaxed)), live, liveBytes / 1048576.0, residentBudget() / 1048576.0, text.empty() ? " none" : text.c_str());
 }
 
 void reportStaging() {
@@ -6292,6 +6296,56 @@ void FlushAllResidentStaging(VkDevice device) {
         taken = takeResidents(registry, ResidentFlush::Teardown, {}, [&](const ResidentEntry& entry) { return entry.context.device == device; });
     }
     recordResidentFlushes(taken, ResidentFlush::Teardown);
+}
+
+std::optional<ResidentSource> ResidentSourceFor(VkDevice device, VkBuffer import, std::uint64_t address, std::size_t bytes) {
+    if (!ResidentStagingOverlaps(address, bytes)) return std::nullopt;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    auto& registry = Residents();
+    std::vector<ResidentEntry> stale;
+    {
+        std::lock_guard lock(registry.mutex);
+        const auto found = std::find_if(registry.entries.begin(), registry.entries.end(), [&](const ResidentEntry& entry) { return entry.context.device == device && entry.copySource == import && entry.begin <= address && end <= entry.end; });
+        if (found == registry.entries.end()) return std::nullopt;
+        if (GuestMemory::UnchangedSinceCollected(address, bytes, found->generation)) {
+            found->lastUse = ++registry.clock;
+            registry.sourced.fetch_add(1, std::memory_order_relaxed);
+            registry.sourcedBytes.fetch_add(bytes, std::memory_order_relaxed);
+            return ResidentSource{found->buffer->Handle(), address - found->bufferBase, found->buffer};
+        }
+        const auto id = found->id;
+        stale = takeResidents(registry, ResidentFlush::CpuWrite, "image-source", [&](const ResidentEntry& entry) { return entry.id == id; });
+    }
+    recordResidentFlushes(stale, ResidentFlush::CpuWrite);
+    return std::nullopt;
+}
+
+void CountResidentSourceFallback(std::uint64_t bytes) {
+    Residents().sourceFallbacks.fetch_add(1, std::memory_order_relaxed);
+    Residents().sourceFallbackBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+ResidentRangeClaim::ResidentRangeClaim(VkDevice device, std::uint64_t address, std::size_t bytes) {
+    if (!ResidentStagingOverlaps(address, bytes)) return;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    if (residentClaims != nullptr) buffers = *residentClaims;
+    {
+        auto& registry = Residents();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& entry : registry.entries) {
+            if (entry.context.device != device || entry.begin > address || end > entry.end) continue;
+            buffers.push_back(entry.buffer.get());
+            claimed = true;
+        }
+    }
+    if (!claimed) return;
+    previous = std::exchange(residentClaims, &buffers);
+}
+
+ResidentRangeClaim::~ResidentRangeClaim() {
+    if (claimed) residentClaims = previous;
 }
 
 void DropResidentStaging(VkDevice device) {

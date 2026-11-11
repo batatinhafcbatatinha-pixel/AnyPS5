@@ -132,6 +132,7 @@ thread_local const char* uploadReason = "first";
 // (DiscardPendingInside) and units an alias's own results superseded (markLayersPending); relaxed,
 // reported only.
 std::atomic<std::uint64_t> singlePassMoves{0}, slabRetiles{0}, paddingSeedCopies{0}, linearImportRetiles{0};
+std::atomic<std::uint64_t> changedCpuUnits{0}, changedDriverUnits{0}, changedUnscannedUnits{0}, cpuUploadsDriverOnly{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0}, clearHandOvers{0}, creationHandOvers{0}, handedOverSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
 // whose selected pending units were dropped because their memory is no longer registered (see
@@ -209,6 +210,9 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
+    char units[192];
+    std::snprintf(units, sizeof(units), "; changed units uploaded: cpu-stamped %llu, driver-stamped only %llu, unscanned %llu; 'cpu' uploads with no CPU-stamped changed unit %llu", take(changedCpuUnits), take(changedDriverUnits), take(changedUnscannedUnits), take(cpuUploadsDriverOnly));
+    line += units;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes and %llu image creations (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; refreshes proved %llu, %llu of them over pending driver key stores (cumulative); drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(creationHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), static_cast<unsigned long long>(refreshesProved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesProvedPendingKeys.load(std::memory_order_relaxed)), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -2483,6 +2487,9 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const bool orderedEligible = refreshOrdered && !scoped && alias == nullptr && !handOverKeys.has_value() && descriptor.dccAddress == 0 && !layerPending.Any() && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
     bool orderedSkipped = false;
     bool flushed = false;
+    static const bool residentSource = std::getenv("APS5_NO_RESIDENT_IMAGE_SOURCE") == nullptr;
+    std::optional<ResidentRangeClaim> residentClaim;
+    if (residentSource && !scoped && alias == nullptr && !handOverKeys.has_value() && descriptor.dccAddress == 0 && !layerPending.Any() && ResidentStagingOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) residentClaim.emplace(context.device, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     {
         struct OrderedRefreshScope {
             bool previousOrdered;
@@ -2768,6 +2775,25 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     }
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
+        if (profile) {
+            std::uint64_t cpuUnits = 0, driverUnits = 0, unscanned = 0;
+            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+                if (!changed[layer]) continue;
+                const auto first = static_cast<std::size_t>(layerBegin(layer) / 65536 - descriptor.baseAddress / 65536);
+                const auto last = static_cast<std::size_t>((layerBegin(layer) + layerBytes(layer) - 1) / 65536 - descriptor.baseAddress / 65536);
+                if (cpuBlocks.empty() || generations.size() != cpuBlocks.size() || last >= cpuBlocks.size()) {
+                    ++unscanned;
+                    continue;
+                }
+                bool cpu = false;
+                for (auto block = first; block <= last; ++block) cpu = cpu || (cpuBlocks[block] != 0 && (compared || generations[block] != 0));
+                ++(cpu ? cpuUnits : driverUnits);
+            }
+            changedCpuUnits.fetch_add(cpuUnits, std::memory_order_relaxed);
+            changedDriverUnits.fetch_add(driverUnits, std::memory_order_relaxed);
+            changedUnscannedUnits.fetch_add(unscanned, std::memory_order_relaxed);
+            if (cpuWrote && !keysChanged && cpuUnits == 0) cpuUploadsDriverOnly.fetch_add(1, std::memory_order_relaxed);
+        }
         upload(&changed);
     } else {
         uploadedKeys = keys;
@@ -3230,6 +3256,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 forgetBorrowed(0, trackedLayers);
                 runs.emplace_back(0, guestBytes);
             }
+            if (ResidentStagingOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && FlushResidentStaging(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), ResidentFlush::Pending, "storage upload windows", false)) CountResidentSourceFallback(guestBytes);
             const auto uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0);
             countStorageUpload(1, uploadedBytes);
             if (layers != nullptr) {
@@ -3277,7 +3304,15 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             batch = std::make_unique<CommandBatch>(context);
             commands = batch->Handle();
         }
-        const auto importOffset = HostImportOffset(*import, descriptor.baseAddress);
+        auto source = import->buffer;
+        auto importOffset = HostImportOffset(*import, descriptor.baseAddress);
+        if (auto resident = ResidentSourceFor(context.device, import->buffer, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            source = resident->buffer;
+            importOffset = resident->offset;
+            if (recorder != nullptr) recorder->Keep(resident->keep);
+        } else if (ResidentStagingOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && FlushResidentStaging(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), ResidentFlush::Pending, "storage upload", false)) {
+            CountResidentSourceFallback(guestBytes);
+        }
         if (direct) {
             recordDirectUploadBarrier(commands, layers == nullptr);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
@@ -3285,7 +3320,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 for (std::uint32_t level = 0; level < mips.size(); ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
-                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestOffset(layer, mip), elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
+                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, source, importOffset + geometry.GuestOffset(layer, mip), elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
                 }
             }
             recordDirectUploadDone(commands);
@@ -3304,7 +3339,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             for (std::uint32_t level = 0; level < mips.size(); ++level) {
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto& mip = mips[level];
-                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestOffset(layer, mip), linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, source, importOffset + geometry.GuestOffset(layer, mip), linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
             }
         }
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
