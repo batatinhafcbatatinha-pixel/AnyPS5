@@ -1,5 +1,7 @@
 # AnyPS5 (fork with the port launcher)
 
+**English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [Català](docs/user/README.ca.md) | [Italiano](docs/user/README.it.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md) | [Bahasa Indonesia](docs/user/README.id.md) | [Polski](docs/user/README.pl.md) | [日本語](docs/user/README.ja.md)
+
 Fork of [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), a relinker that converts PlayStation 5 executables
 into native Windows and Linux programs (no emulation: the PS5's Zen 2 code runs as it is, the system libraries are
 reimplemented). This fork adds the launcher the other recompilers use, so a game is converted and started from
