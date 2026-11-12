@@ -7,6 +7,8 @@ game_files/ (a junction to the player's dump: nothing of the game is copied). Co
                        Windows into <port>/build/out (app.exe, app0/ with the converted modules, libs/ = the AnyPS5
                        system libraries) and fill app0/ with links to the dump.
   play --port <dir>    start build/out/app.exe with the PC settings of <port>/pc-settings.ini as AnyPS5 variables.
+                       The patches chosen in the launcher (<port>/patches/*.json) are applied to the converted
+                       modules first; a patch whose file is gone is undone.
   env --port <dir>     print the variables play would set (a check of the PC settings without starting the game).
 
 Saves, trophies and screenshots stay in build/out (the game's working folder); a new build keeps them.
@@ -346,11 +348,56 @@ def settings_env(port, game):
     return env
 
 
+# ---------------------------------------------------------------- game patches (<port>/patches/*.json)
+
+def patch_bytes(write, key):
+    """The bytes of "<key>" (hex text) or "<key>_u32" (little-endian 32-bit numbers)."""
+    if key in write:
+        return bytes.fromhex(write[key])
+    return struct.pack(f'<{len(write[key + "_u32"])}I', *write[key + '_u32'])
+
+
+def apply_patches(port):
+    """Makes the converted modules match the patches the player chose (the JSON files of <port>/patches, format of
+    github.com/batatinhafcbatatinha-pixel/recomp-patches). Only *.guest.prx files are written, never the dump; each
+    changed module keeps a .orig copy, which is put back first, so removing a patch file undoes the patch."""
+    app0 = port / 'build' / 'out' / 'app0'
+    for original in app0.rglob('*.guest.prx.orig'):
+        shutil.copy2(original, str(original)[:-5])
+        original.unlink()
+    folder = port / 'patches'
+    for file in sorted(folder.glob('*.json')) if folder.is_dir() else []:
+        try:
+            patch = json.loads(file.read_text(encoding='utf-8'))
+            plan = []
+            for write in patch['writes']:
+                find, new = patch_bytes(write, 'find'), patch_bytes(write, 'write')
+                name = write['module'].lower() + '.guest.prx'
+                modules = [p for p in app0.rglob('*.guest.prx') if p.name.lower() == name and not is_link(p)]
+                if len(modules) != 1:
+                    raise ValueError(f'{write["module"]}: {len(modules)} converted modules with that name')
+                data = modules[0].read_bytes()
+                if data.count(find) != 1:
+                    raise ValueError(f'{write["module"]}: the pattern occurs {data.count(find)} times (another game version?)')
+                plan.append((modules[0], data.find(find) + int(write.get('at', 0)), new))
+            for module, offset, new in plan:
+                original = Path(str(module) + '.orig')
+                if not original.is_file():
+                    shutil.copy2(module, original)
+                data = bytearray(module.read_bytes())
+                data[offset:offset + len(new)] = new
+                module.write_bytes(data)
+            log(f'Patch applied: {patch.get("name", file.stem)}')
+        except (ValueError, KeyError, OSError) as error:
+            log(f'Patch NOT applied ({file.name}): {error}')
+
+
 def play(port):
     out = port / 'build' / 'out'
     exe = out / 'app.exe'
     if not exe.is_file():
         raise SystemExit('Not built yet: install the game in the launcher first.')
+    apply_patches(port)
     game = (port / 'game_files').resolve() if (port / 'game_files').exists() else None
     env = dict(os.environ)
     env.update(settings_env(port, game))
