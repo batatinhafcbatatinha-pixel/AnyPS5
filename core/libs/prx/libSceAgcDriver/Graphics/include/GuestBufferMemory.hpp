@@ -215,6 +215,7 @@ std::uint64_t StagingShadowsRefused();
 
 enum class ResidentFlush : std::uint8_t { Access, Pending, ImageStore, GpuCommand, OverlapRead, Overlap, Rebind, CpuWrite, Budget, Retire, Teardown, Count };
 bool ResidentStagingOverlaps(std::uint64_t address, std::size_t bytes);
+bool ResidentDirtyOverlaps(std::uint64_t address, std::size_t bytes);
 bool FlushResidentStaging(std::uint64_t address, std::size_t bytes, ResidentFlush reason, const char* cause = nullptr, bool honourClaims = true);
 void FlushAllResidentStaging(VkDevice device);
 struct ResidentSource {
@@ -405,6 +406,20 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    // Marks this thread's RecordStagingCopies calls as a draw's (resolveDrawResources): a draw whose
+    // resident hits nothing in its open render pass wrote needs no barrier of its own, the pass's
+    // leading barrier ordered every earlier write before it (Recorder::PassOpenWithoutWrites).
+    class DrawStagingScope {
+    public:
+        DrawStagingScope();
+        ~DrawStagingScope();
+        DrawStagingScope(const DrawStagingScope&) = delete;
+        DrawStagingScope& operator=(const DrawStagingScope&) = delete;
+        static bool Active();
+
+    private:
+        bool previous;
+    };
     bool StagingDecisionsCurrent() const;
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
@@ -486,6 +501,7 @@ public:
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    bool ShadowSourced(std::uint64_t begin, std::uint64_t end) const;
     struct CutRegion {
         std::uint64_t begin;
         std::uint64_t end;
@@ -560,6 +576,7 @@ private:
         // mapping, so nothing is ever stored from it by the CPU, and the region is taken even when
         // the import could bind it in place.
         bool deviceLocal = false;
+        bool shadowSourced = false;
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
@@ -618,6 +635,7 @@ private:
     // written element inside, and an atomic element or a size within the written-shadow window.
     // Independent of the import, so UploadPrepare and UploadFinish decide alike.
     bool stagingEligible(const Region& region, bool addressable) const;
+    bool shadowSourceEligible(const Region& region, bool addressable) const;
     bool stagingWanted(const Region& region, bool addressable) const;
     bool adaptiveInPlace(const Region& region, bool use) const;
     bool overlayCandidate(const Region& inside, bool readOnly) const;

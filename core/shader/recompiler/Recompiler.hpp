@@ -1037,6 +1037,12 @@ void SetDebugProbeActive(bool active);
 [[nodiscard]] bool RayTracingStrict();
 [[nodiscard]] bool RayTracingMiss();
 [[nodiscard]] bool ExactF32Arithmetic();
+// APS5_GPU_SRT: shaders whose resources the GPU resolves at run time (item 3 of the rewrite,
+// D:/ps5/perf/REWRITE-STATE.md). The SRT walk is not flattened on the CPU: raw scalar loads stay
+// address reads through the BDA page table and every buffer V# is read by the shader itself
+// (MemoryInfo::gpuDescriptor). Applies to programs without image or sampler operations.
+// 0: off (default); 1: compute programs; 2: every stage.
+[[nodiscard]] std::uint32_t GpuSrtStages();
 
 struct RectListShaders {
     RecompileResult control;

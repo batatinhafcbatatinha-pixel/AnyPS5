@@ -239,7 +239,7 @@ void DefineGetBdaPointer(SpirvEmitterState& state) {
     DefineBdaDwordReadFunctions(state);
     DefineBdaSpanReadFunctions(state);
     CollectBdaAnchors(state);
-    if (!state.bdaAnchors.empty()) DefineBdaAnchorFunction(state);
+    if (!state.bdaAnchors.empty() || state.program.Resources().gpuSrt) DefineBdaAnchorFunction(state);
     if (state.program.Info().bdaWrites) {
         state.bdaWritePointerFunction = DefineBdaLookup(state, "get_bda_write_pointer", true, BdaAbi::Write);
         if (!BdaByteReadsForced()) state.bdaWriteProbeFunction = DefineBdaLookup(state, "probe_bda_write_pointer", false, BdaAbi::Write);

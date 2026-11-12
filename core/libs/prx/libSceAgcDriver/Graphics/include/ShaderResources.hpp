@@ -905,6 +905,9 @@ private:
     mutable AgcDriver::Mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    // The sum of the entries' TableElements (fixed per object once built), kept as entries come and
+    // go so an insert does not walk the whole list.
+    std::uint64_t tableTotal = 0;
     std::size_t capacity = 0;
     bool fixedCapacity = false;
     std::list<std::size_t> evictedOrder;

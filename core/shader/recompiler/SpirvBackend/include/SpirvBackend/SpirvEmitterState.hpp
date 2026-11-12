@@ -205,6 +205,15 @@ struct SpirvEmitterState {
         std::uint32_t offset = 0;
     };
     std::vector<BdaAnchor> bdaAnchors;
+    // One BDA range per runtime V# handle (APS5_GPU_SRT programs): looked up once where the
+    // GetBufferResource is emitted, so its 32-bit loads translate with an add instead of a table
+    // search (EmitBufferAnchor / EmitAnchoredBufferRead in SpirvBdaRead.cpp).
+    struct BufferAnchor {
+        const IrValue* handle = nullptr;
+        std::uint32_t base = 0;
+        BdaAnchor range;
+    };
+    std::vector<BufferAnchor> bufferAnchors;
     std::uint32_t bdaAnchorFunction = 0;
     std::uint32_t bdaStopValue = 0;
     std::uint32_t bdaPcOverride = 0;

@@ -107,6 +107,15 @@ bool RayTracingMiss() {
     return miss;
 }
 
+std::uint32_t GpuSrtStages() {
+    static const std::uint32_t stages = [] {
+        const char* text = std::getenv("APS5_GPU_SRT");
+        if (text == nullptr || *text == '\0' || std::strcmp(text, "0") == 0) return 0u;
+        return std::strcmp(text, "2") == 0 ? 2u : 1u;
+    }();
+    return stages;
+}
+
 bool ExactF32Arithmetic() {
     static const bool exact = [] {
         const char* text = std::getenv("APS5_FAST_F32");

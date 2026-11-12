@@ -351,6 +351,19 @@ public:
     // with a pending unit inside the range are stored (APS5_NO_FLUSH_PRETEST=1 lists every
     // overlapping pending image, as before).
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr, bool waited = false, VkDevice device = VK_NULL_HANDLE);
+    // While alive on this thread, FlushPending stores whose consumers are only GPU work recorded after
+    // them (host-imported images that publish nothing) are recorded in queue order without the CPU
+    // waiting for the range's earlier writers, as the storage refresh and the label readback do.
+    class GpuOrderedScope {
+    public:
+        explicit GpuOrderedScope(bool on);
+        ~GpuOrderedScope();
+        GpuOrderedScope(const GpuOrderedScope&) = delete;
+        GpuOrderedScope& operator=(const GpuOrderedScope&) = delete;
+
+    private:
+        bool previous;
+    };
     static bool FlushPendingImages(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited, VkDevice device);
     static void FlushAllPending(const char* reason, VkDevice device = VK_NULL_HANDLE);
     static bool FlushAllPendingUntil(const char* reason, const std::function<bool()>& stop, VkDevice device = VK_NULL_HANDLE);

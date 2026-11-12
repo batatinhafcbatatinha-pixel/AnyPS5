@@ -1037,8 +1037,38 @@ private:
 // GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
+struct HookSegments {
+    std::mutex mutex;
+    std::array<std::uint64_t, 6> nanoseconds{};
+    std::array<std::uint64_t, 3> counts{};
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+
+void NoteHookSegments(bool capture, bool locked, bool kept, const std::array<std::chrono::steady_clock::time_point, 5>& marks) {
+    static HookSegments segments;
+    std::lock_guard lock(segments.mutex);
+    const auto base = capture ? 0u : 3u;
+    for (std::size_t i = 0; i < 3; ++i) segments.nanoseconds[base + i] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(marks[i == 2 ? 4 : i + 1] - marks[i]).count());
+    if (capture) {
+        ++segments.counts[0];
+        if (locked) ++segments.counts[1];
+        if (kept) ++segments.counts[2];
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - segments.last < std::chrono::seconds(10)) return;
+    segments.last = now;
+    const auto ms = [&](std::size_t i) { return static_cast<double>(segments.nanoseconds[i]) / 1e6; };
+    AgcDriver::ProfilePrint_nid_no_patch("[hookseg] capture-site hook calls %llu (locked %llu, kept %llu): checks+locked block %.1f ms, storage keep test %.1f ms, publish/flush+final %.1f ms; other sites: %.1f / %.1f / %.1f ms\n", static_cast<unsigned long long>(segments.counts[0]), static_cast<unsigned long long>(segments.counts[1]), static_cast<unsigned long long>(segments.counts[2]), ms(0), ms(1), ms(2), ms(3), ms(4), ms(5));
+    segments.nanoseconds = {};
+    segments.counts = {};
+}
+
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
+    static const bool segmented = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::array<std::chrono::steady_clock::time_point, 5> marks{};
+    bool lockedHere = false;
+    if (segmented) marks[0] = std::chrono::steady_clock::now();
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
     // write of the open batch, and the check below syncs on it like any recorded store). Not from
@@ -1054,8 +1084,9 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             record();
         }
     }
-    if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes) || ResidentStagingOverlaps(address, bytes)) {
+    if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes) || ResidentDirtyOverlaps(address, bytes)) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
+        lockedHere = true;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
         static_cast<void>(FlushResidentStaging(address, bytes, ResidentFlush::Access));
@@ -1067,6 +1098,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             recorder->SyncThrough(address, bytes, true);
         }
     }
+    if (segmented) marks[1] = std::chrono::steady_clock::now();
     const auto site = GuestMemory::CurrentReadSite();
     const auto scope = site != GuestMemory::ReadSite::Store ? PublishScope::Whole : PublishScope::PartialUnits;
     const bool waited = completionDepth() != 0;
@@ -1082,6 +1114,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     bool stored = false;
     std::size_t images = 0, evicted = 0;
     const bool kept = !HookFlushCpuBlocks() && StorageTexture::AccessKeptByCpu(address, bytes, &images, &evicted);
+    if (segmented) marks[2] = std::chrono::steady_clock::now();
     if (kept || (images == 0 && !HookFlushCpuBlocks())) {
         stored = StorageTexture::WaitForFlushing(address, bytes);
         published = StorageTexture::PublishShadowsOnly(address, bytes, scope, "memory access", waited);
@@ -1104,6 +1137,11 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             if (HookFullSync() || completionDepth() != 0) recorder->Sync();
             else recorder->SyncThrough(address, bytes, true);
         }
+    }
+    if (segmented) {
+        marks[3] = marks[2];
+        marks[4] = std::chrono::steady_clock::now();
+        NoteHookSegments(site == GuestMemory::ReadSite::Capture, lockedHere, kept, marks);
     }
 }
 
@@ -1761,6 +1799,10 @@ VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner,
 void Recorder::AfterRun(std::function<void(Recorder&)> work) {
     Require(RunOpen(), "work after a dispatch run without an open run");
     open->afterRun.push_back(std::move(work));
+}
+
+bool Recorder::PassOpenWithoutWrites(GuestRangeList ranges) const {
+    return open != nullptr && open->renderPass.open && !RunOpen() && !open->passHazards.WritesOverlap(ranges);
 }
 
 bool Recorder::CloseRunOwing(const void* owner) {

@@ -77,6 +77,11 @@ public:
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
+    // Debug aid (APS5_TRACE_SLOW_CAPTURE_HOOKS=1): the program whose capture the calling thread runs, for the
+    // [slow-capture-hooks] line's attribution of page fetches that waited in the flush hook.
+    static void SetTraceProgram(std::uint64_t program);
+    // Whether APS5_TRACE_SLOW_CAPTURE_HOOKS=1 is set (also used by the dispatch's [write-targets] line).
+    static bool TraceSlowHooks();
     struct SupplyCounts {
         std::uint64_t shared, copied, spilled;
     };

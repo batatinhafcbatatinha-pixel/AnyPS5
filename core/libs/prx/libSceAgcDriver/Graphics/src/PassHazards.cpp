@@ -78,6 +78,10 @@ void PassHazards::Add(const PassAccess& access) {
     anyWrites = anyWrites || access.anyWrites;
 }
 
+bool PassHazards::WritesOverlap(GuestRangeList ranges) const {
+    return anyWrites || overlapsAny(writes, ranges) || overlapsAny(writeOnly, ranges);
+}
+
 void PassHazards::SealWriteOnly() {
     for (const auto& [begin, end] : writeOnly.Ranges()) writes.Insert(begin, end);
     writeOnly.Clear();

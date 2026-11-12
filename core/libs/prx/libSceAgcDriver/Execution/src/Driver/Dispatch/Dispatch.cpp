@@ -24,6 +24,8 @@
 
 namespace AgcDriver::DriverDetail {
 
+void NoteWriteTarget(const char* kind, std::uint64_t address, std::uint64_t bytes);
+
 namespace {
 
 bool DispatchItemsEnabled() {
@@ -432,6 +434,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!resolving) insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
     }
     const auto* registeredViews = capture != nullptr ? &capture->snapshot.registeredImages : keepVariant != nullptr && keepVariant->registeredViews != nullptr ? keepVariant->registeredViews.get() : nullptr;
+    if (ShaderMemory::TraceSlowHooks() && !resolving && compiledResult != nullptr) {
+        for (const auto& binding : compiledResult->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            for (std::size_t element = 0; element * 4 + 3 < binding.guestDescriptor.size(); ++element) {
+                if (element < binding.bufferWritten.size() && !binding.bufferWritten[element]) continue;
+                const auto* words = binding.guestDescriptor.data() + element * 4;
+                const auto base = static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1] & 0xffffu) << 32u);
+                if (base != 0) NoteWriteTarget("dispatch", base, words[2]);
+            }
+        }
+    }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
         parked = ResolvedDispatch{};

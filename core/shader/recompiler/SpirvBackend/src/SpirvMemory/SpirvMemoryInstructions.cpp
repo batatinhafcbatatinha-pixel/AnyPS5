@@ -1683,8 +1683,9 @@ void EmitGetSrtResource(SpirvValueEmitContext& context) {
     EmitVoid(context);
 }
 
-void EmitGetBufferResource(SpirvValueEmitContext& context) {
+void EmitGetBufferResource(SpirvValueEmitContext& context, const IrValue& inst) {
     EmitVoid(context);
+    EmitBufferAnchor(context, inst);
 }
 
 void EmitGetAddressResource(SpirvValueEmitContext& context) {

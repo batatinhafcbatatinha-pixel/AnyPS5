@@ -5643,6 +5643,8 @@ bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes
     return true;
 }
 
+bool TraceImageAddress(std::uint64_t address);
+
 namespace {
 
 struct StorageDumpSelector {
@@ -5666,7 +5668,16 @@ const StorageDumpSelector& StorageDumpSelection() {
     return selector;
 }
 
+bool StorageDumpComposite() {
+    static const bool composite = [] {
+        const char* text = std::getenv("APS5_DUMP_STORAGE");
+        return text != nullptr && std::strcmp(text, "composite") == 0;
+    }();
+    return composite;
+}
+
 bool StorageDumpSelects(const GuestTextureResource& descriptor) {
+    if (StorageDumpComposite()) return descriptor.width == 1280u && descriptor.height == 720u && TraceImageAddress(descriptor.baseAddress);
     const auto& selector = StorageDumpSelection();
     if (selector.address != 0) return descriptor.baseAddress == selector.address;
     return selector.width != 0 && descriptor.width == selector.width && descriptor.height == selector.height && descriptor.depthOrLastArray + 1 == selector.layers && (selector.anyFormat || descriptor.format == selector.format);
@@ -5682,7 +5693,7 @@ bool StorageDumpReady() {
 
 void StorageTexture::FlushDumpSelected(const char* reason) {
     const auto& selector = StorageDumpSelection();
-    if (selector.address == 0 && selector.width == 0) return;
+    if (selector.address == 0 && selector.width == 0 && !StorageDumpComposite()) return;
     if (!StorageDumpReady()) return;
     if (std::getenv("APS5_DUMP_STORAGE_GATE") != nullptr) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -5692,7 +5703,7 @@ void StorageTexture::FlushDumpSelected(const char* reason) {
             auto& live = Live();
             std::lock_guard lock(live.mutex);
             for (auto* texture : live.textures) {
-                if (selected.size() + captured.size() >= 8) break;
+                if (selected.size() + captured.size() >= 16) break;
                 if (!StorageDumpSelects(texture->descriptor) || texture->sliceLinearBytes * texture->arrayLayers > (8u << 20u)) continue;
                 if (std::find(captured.begin(), captured.end(), texture->descriptor.baseAddress) != captured.end()) continue;
                 if (auto alive = texture->weak_from_this().lock()) selected.push_back(std::move(alive));
@@ -5800,6 +5811,14 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
         if (FlushPending(address, bytes, nullptr, reason)) ++stored;
     }
     return stored;
+}
+
+StorageTexture::GpuOrderedScope::GpuOrderedScope(bool on) : previous(GpuOrderedFlush()) {
+    GpuOrderedFlush() = previous || on;
+}
+
+StorageTexture::GpuOrderedScope::~GpuOrderedScope() {
+    GpuOrderedFlush() = previous;
 }
 
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice device) {
@@ -7944,6 +7963,82 @@ std::uint64_t StorageTexture::BudgetBytes() const {
 
 VkImageView StorageTexture::View() const {
     return view;
+}
+
+
+// Debug aid: APS5_TRACE_IMAGES=<hex>,<hex>,... names guest addresses whose storage images and
+// writers are traced (TraceLiveImagesOver from the flip trace, the draw and dispatch builds).
+std::mutex& tracedDynamicMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<std::uint64_t>& tracedDynamic() {
+    static std::vector<std::uint64_t> addresses;
+    return addresses;
+}
+
+void AddTracedImageAddress(std::uint64_t address) {
+    std::lock_guard lock(tracedDynamicMutex());
+    auto& addresses = tracedDynamic();
+    if (std::find(addresses.begin(), addresses.end(), address) == addresses.end()) addresses.push_back(address);
+}
+
+bool TraceImageAddress(std::uint64_t address) {
+    {
+        std::lock_guard lock(tracedDynamicMutex());
+        const auto& dynamic = tracedDynamic();
+        if (std::find(dynamic.begin(), dynamic.end(), address) != dynamic.end()) return true;
+    }
+    static const std::vector<std::uint64_t> addresses = [] {
+        std::vector<std::uint64_t> parsed;
+        const char* value = std::getenv("APS5_TRACE_IMAGES");
+        while (value != nullptr && *value != 0) {
+            char* end = nullptr;
+            const auto number = std::strtoull(value, &end, 16);
+            if (end == value) break;
+            parsed.push_back(number);
+            value = *end == ',' ? end + 1 : end;
+        }
+        return parsed;
+    }();
+    return std::find(addresses.begin(), addresses.end(), address) != addresses.end();
+}
+
+std::vector<std::uint64_t> TracedImageAddresses() {
+    std::vector<std::uint64_t> parsed;
+    {
+        std::lock_guard lock(tracedDynamicMutex());
+        parsed = tracedDynamic();
+    }
+    const char* value = std::getenv("APS5_TRACE_IMAGES");
+    while (value != nullptr && *value != 0) {
+        char* end = nullptr;
+        const auto number = std::strtoull(value, &end, 16);
+        if (end == value) break;
+        parsed.push_back(number);
+        value = *end == ',' ? end + 1 : end;
+    }
+    return parsed;
+}
+
+void TraceLiveImagesOver(std::uint64_t address, std::size_t bytes, const char* tag) {
+    std::vector<std::shared_ptr<StorageTexture>> found;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* texture : live.textures) {
+            const auto begin = texture->Descriptor().baseAddress;
+            if (begin < address + bytes && address < begin + texture->GuestBytes()) {
+                if (auto alive = texture->weak_from_this().lock()) found.push_back(std::move(alive));
+            }
+        }
+    }
+    for (const auto& texture : found) {
+        const auto& d = texture->Descriptor();
+        std::fprintf(stderr, "[image-trace] %s 0x%llx: image=%p base=0x%llx bytes=0x%llx %ux%u fmt=%u tile=%d mips=%u ver=%llu gen=%llu dirty=%d cached=%d scaled=%d\n", tag, static_cast<unsigned long long>(address), reinterpret_cast<void*>(texture->Image()), static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(texture->GuestBytes()), d.width, d.height, d.format, static_cast<int>(d.tileMode), d.mipCount, static_cast<unsigned long long>(texture->Version()), static_cast<unsigned long long>(texture->Generation()), texture->Dirty() ? 1 : 0, texture->Cached() ? 1 : 0, texture->Scaled() ? 1 : 0);
+    }
+    if (found.empty()) std::fprintf(stderr, "[image-trace] %s 0x%llx: no live image\n", tag, static_cast<unsigned long long>(address));
 }
 
 }

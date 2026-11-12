@@ -112,6 +112,12 @@ void ResetCheckpointSnapshots() noexcept;
 #include <vector>
 #include <utility>
 
+namespace AgcDriver::Graphics {
+// Texture.cpp, APS5_TRACE_IMAGES (debug aid).
+std::vector<std::uint64_t> TracedImageAddresses();
+void TraceLiveImagesOver(std::uint64_t address, std::size_t bytes, const char* tag);
+}
+
 namespace AgcDriver {
 
 std::string SoftwareFallbackWarning(VkPhysicalDeviceType selectedType, std::string_view selectedName, std::string_view hardwareName, PresentationRejection rejection, bool requested) {
@@ -4005,12 +4011,22 @@ PlaneSource OverlayPlaneSource(const Graphics::Context& context, const DisplayBu
 // Debug aid: APS5_DUMP_FRAMES=<n> saves the first n presented display buffers as frame_<index>.bmp,
 // read back by the blit's own submission and written after its fence (RetireSlot), or with
 // APS5_NO_GPU_DUMP=1 decoded from the tiled guest buffer on the CPU, as before.
+// APS5_DUMP_FRAMES_AFTER=<s> starts counting presents for the dumps only <s> seconds after the
+// first presented display buffer (skips menus and cutscenes).
 struct FrameDumps {
     int limit;
     bool cpu;
     int every = 1;
     int dumped = 0;
     std::uint64_t presents = 0;
+    double after = 0;
+    std::optional<std::chrono::steady_clock::time_point> first;
+    bool Due() {
+        const auto now = std::chrono::steady_clock::now();
+        if (!first) first = now;
+        if (std::chrono::duration<double>(now - *first).count() < after) return false;
+        return dumped < limit && ++presents % static_cast<std::uint64_t>(every) == 0;
+    }
 };
 
 FrameDumps& Dumps() {
@@ -4021,6 +4037,12 @@ FrameDumps& Dumps() {
         const char* value = std::getenv("APS5_DUMP_FRAMES_EVERY");
         return value ? std::max(std::atoi(value), 1) : 1;
     }()};
+    static const bool configured = [] {
+        const char* value = std::getenv("APS5_DUMP_FRAMES_AFTER");
+        dumps.after = value ? std::atof(value) : 0.0;
+        return true;
+    }();
+    static_cast<void>(configured);
     return dumps;
 }
 
@@ -4055,7 +4077,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
         const auto pixels = passthrough ? ReadDisplayBufferTexels(buffer) : ReadDisplayBuffer(buffer);
         bool dumpFrame = false;
         std::optional<int> cpuDump;
-        if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+        if (frameDumpOutput.Enabled_nid_no_patch() && dumps.limit > 0 && dumps.Due()) {
             if (passthrough || dumps.cpu) {
                 cpuDump = dumps.dumped++;
             } else {
@@ -4104,9 +4126,21 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
         }
     }
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
+    // Debug aid: APS5_TRACE_FLIP=1 logs each presented display buffer and the source it is shown from.
+    static const bool traceFlip = std::getenv("APS5_TRACE_FLIP") != nullptr;
+    if (traceFlip) {
+        static std::uint64_t traced = 0;
+        static const auto start = std::chrono::steady_clock::now();
+        const auto written = Graphics::StorageTexture::LastWrite(buffer.address);
+        const auto cover = Graphics::StorageTexture::ClassifyFill(buffer.address, bytes);
+        for (const auto traced : Graphics::TracedImageAddresses()) Graphics::TraceLiveImagesOver(traced, 1, "flip");
+        const auto live = Graphics::StorageTexture::FindLive(buffer.address, bytes);
+        std::fprintf(stderr, "[flip-trace] images over 0x%llx: cover=%d covered=%p fmt=%u ver=%llu others=%zu inside=%zu; newest live=%p fmt=%u ver=%llu\n", static_cast<unsigned long long>(buffer.address), static_cast<int>(cover.cover), cover.image ? reinterpret_cast<void*>(cover.image->Image()) : nullptr, cover.image ? cover.image->Descriptor().format : 0u, static_cast<unsigned long long>(cover.image ? cover.image->Version() : 0), cover.others, cover.inside, live ? reinterpret_cast<void*>(live->Image()) : nullptr, live ? live->Descriptor().format : 0u, static_cast<unsigned long long>(live ? live->Version() : 0));
+        std::fprintf(stderr, "[flip-trace] #%llu t=%.2f addr=0x%llx %ux%u fmt=0x%llx tile=%u dcc=0x%llx plane=0x%llx src=%s img=%p ver=%llu gen=%llu layer=%u scaled=%d desc=%ux%u/%u bytes=0x%llx lastwrite=%lld cleared=%d\n", static_cast<unsigned long long>(++traced), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, static_cast<unsigned long long>(buffer.pixelFormat), buffer.tilingMode, static_cast<unsigned long long>(buffer.dccAddress), static_cast<unsigned long long>(plane ? plane->address : 0), resident ? (convert ? "resident-convert" : "resident") : (cleared ? "clear" : "guest"), resident ? reinterpret_cast<void*>(resident->Image()) : nullptr, static_cast<unsigned long long>(resident ? resident->Version() : 0), static_cast<unsigned long long>(resident ? resident->Generation() : 0), layer, resident ? static_cast<int>(resident->Scaled()) : 0, resident ? resident->Descriptor().width : 0, resident ? resident->Descriptor().height : 0, resident ? resident->Descriptor().format : 0, static_cast<unsigned long long>(resident ? resident->GuestBytes() : 0), written ? static_cast<long long>(written->serial) : -1LL, cleared ? 1 : 0);
+    }
     bool dumpFrame = false;
     std::optional<int> cpuDump;
-    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+    if (frameDumpOutput.Enabled_nid_no_patch() && dumps.limit > 0 && dumps.Due()) {
         if (dumps.cpu || (passthrough && resident == nullptr)) {
             cpuDump = dumps.dumped++;
         } else {
@@ -4114,6 +4148,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
             dumpFrame = true;
             ++gpuDumps;
         }
+        if (traceFlip) std::fprintf(stderr, "[flip-trace] dump %d of 0x%llx\n", dumpFrame ? state->nextDumpIndex : *cpuDump, static_cast<unsigned long long>(buffer.address));
     }
     if (profile && std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
         lastReport = std::chrono::steady_clock::now();
@@ -4230,6 +4265,8 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         plane = nullptr;
     }
     const auto planeSource = plane != nullptr ? OverlayPlaneSource(graphicsContext(), *plane) : PlaneSource{};
+    static const bool tracePlane = std::getenv("APS5_TRACE_FLIP") != nullptr;
+    if (tracePlane && plane != nullptr) std::fprintf(stderr, "[flip-trace] plane addr=0x%llx %ux%u src=%s img=%p ver=%llu gen=%llu\n", static_cast<unsigned long long>(plane->address), plane->width, plane->height, planeSource.resident ? "resident" : "texels", planeSource.resident ? reinterpret_cast<void*>(planeSource.resident->Image()) : nullptr, static_cast<unsigned long long>(planeSource.resident ? planeSource.resident->Version() : 0), static_cast<unsigned long long>(planeSource.resident ? planeSource.resident->Generation() : 0));
     const auto systemLayout = SystemOverlayLayout(state->extent);
     const bool keyboard = systemLayout.has_value();
     const auto padStatusLines = PadStatusOverlayLines();
