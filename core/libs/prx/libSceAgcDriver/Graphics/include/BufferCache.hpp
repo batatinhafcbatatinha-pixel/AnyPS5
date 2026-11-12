@@ -20,11 +20,18 @@ namespace AgcDriver::Graphics {
 class Buffer;
 class Recorder;
 
+// APS5_BUFFER_CACHE: 0 off; 1 draw vertex/index ranges from the cache where it pays; 2 also indexed
+// draws as KytyPS5 makes them (renderDraw.cpp AcquireVertexBuffers at 87de64e0): the index buffer is
+// bound from the cache unread (no CPU scan for the highest index, no wait for GPU-written indices)
+// and the vertex buffers are bound whole, as their descriptors give them.
+int BufferCacheMode();
 bool BufferCacheEnabled();
 
 struct CachedBufferRange {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceSize offset = 0;
+    // Served from a resident staging copy GPU work wrote: the read needs its barrier after them.
+    bool behindGpuWrite = false;
 };
 
 // Under the GPU mutex, with `recorder` the active one. Returns a device-local binding of
@@ -36,7 +43,11 @@ struct CachedBufferRange {
 // too often to be worth it: the caller then uses its old path. `behindGpuWrite` is set when recorded
 // GPU work writes the range (the caller's read then needs its barrier after the upload, which this
 // call records).
-std::optional<CachedBufferRange> ObtainCachedBuffer(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, bool* behindGpuWrite = nullptr);
+// Ranges crossing a 4 MiB chunk boundary (up to 64 MiB) are served from span buffers. Without
+// `mayRefuse` the upload is made even when it ends an open render pass.
+// With `refuseRewritten`, a range whose blocks are uploaded about every use (data GPU work keeps
+// rewriting in host memory) is refused even outside a pass: the caller keeps its old path.
+std::optional<CachedBufferRange> ObtainCachedBuffer(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, bool* behindGpuWrite = nullptr, bool mayRefuse = true, bool refuseRewritten = false);
 
 // Guest -> device address table for address-based (GPU-side SRT) shaders, KytyPS5's BDA page table
 // made two-level: the root (BufferCacheTable) holds BufferCacheTableRoots device addresses of leaves,

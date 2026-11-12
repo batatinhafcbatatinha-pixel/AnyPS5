@@ -1681,6 +1681,9 @@ struct DrawInputs {
     // The index buffer is bound in place behind recorded GPU writes, its highest index unknown here:
     // the vertex ranges are taken whole from their descriptors, as an indirect draw's.
     bool maxIndexUnknown = false;
+    // The index buffer came from the buffer cache unread (APS5_BUFFER_CACHE=2): the whole vertex
+    // ranges come from it too, or are copied whole, never bound in place from host memory.
+    bool indicesFromCache = false;
     std::optional<std::uint32_t> indexCount;
     std::uint32_t listRestartPrimitive = 0;
     VertexInputLayout vertexInput;
@@ -1983,7 +1986,22 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // the device ('instruction pointer invalid') within minutes; off, the range is synced and
         // copied as before.
         static const bool gpuWrittenIndexInPlace = std::getenv("APS5_GPU_WRITTEN_INDEX_IN_PLACE") != nullptr;
-        if (gpuWrittenIndexInPlace && !context.drawInputsInPlace && !state.stages.mesh && indexBytes != 0 && GpuWrittenDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes))) {
+        // APS5_BUFFER_CACHE=2 (KytyPS5's draw inputs): the index range is bound from the buffer cache
+        // without reading it; its highest index stays unknown, so the vertex buffers are bound whole
+        // from the cache below. GPU-written indices are copied in after their writers, in queue order.
+        if (BufferCacheMode() >= 2 && !context.drawInputsInPlace && context.recorder != nullptr && !state.stages.mesh && indexBytes != 0 && draw.indexAddress % draw.indexSize == 0) {
+            bool behind = false;
+            if (const auto cached = ObtainCachedBuffer(context, *context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), &behind, true, true)) {
+                inputs.vertexInputBehindGpuWrite = inputs.vertexInputBehindGpuWrite || behind;
+                inputs.maxIndexUnknown = true;
+                inputs.indicesFromCache = true;
+                inputs.maxIndex = 0;
+                inputs.indexHandle = cached->buffer;
+                inputs.indexOffset = cached->offset;
+                inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
+            }
+        }
+        if (!inputs.maxIndexUnknown && gpuWrittenIndexInPlace && !context.drawInputsInPlace && !state.stages.mesh && indexBytes != 0 && GpuWrittenDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes))) {
             bool behind = false;
             if (const auto* forced = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, &behind, true)) {
                 static std::atomic<std::uint64_t> bound{0};
@@ -2134,7 +2152,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // which uploads only its changed blocks; the old paths below remain for what it refuses.
         if (BufferCacheEnabled() && !context.drawInputsInPlace && context.recorder != nullptr && begin % plan.alignments[range] == 0) {
             bool behind = false;
-            if (const auto cached = ObtainCachedBuffer(context, *context.recorder, begin, bytes, &behind)) {
+            if (const auto cached = ObtainCachedBuffer(context, *context.recorder, begin, bytes, &behind, true, inputs.indicesFromCache)) {
                 inputs.vertexInputBehindGpuWrite = inputs.vertexInputBehindGpuWrite || behind;
                 rangeHandles.push_back(cached->buffer);
                 rangeOffsets.push_back(cached->offset);
@@ -2142,6 +2160,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 continue;
             }
         }
+        // A whole range the cache refused (rewritten about every use) is read in place, not copied.
         const bool forceInPlace = !context.drawInputsInPlace && ((gpuWrittenInPlace && GpuWrittenDrawInput(context, begin, bytes)) || inputs.maxIndexUnknown);
         if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite, forceInPlace)) {
             if (forceInPlace) {

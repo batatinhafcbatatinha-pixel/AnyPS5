@@ -29,6 +29,7 @@ namespace {
 
 struct TableEntry {
     std::uint64_t hash;
+    VkDeviceAddress cacheRoot;
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::weak_ptr<Buffer> buffer;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spaceKeys;
@@ -313,6 +314,14 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
+    std::uint64_t cacheRoot = 0;
+    if (BufferCacheEnabled() && GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) {
+            cacheRoot = BufferCacheTable(context, *recorder);
+            MakeQueuedResident(context, *recorder);
+            SyncResident(context, *recorder);
+        }
+    }
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
@@ -327,6 +336,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.device = context.device;
         }
         for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
+            if (it->cacheRoot != cacheRoot) continue;
             const auto key = std::pair{serial, guardSerial};
             if (std::find(it->spaceKeys.begin(), it->spaceKeys.end(), key) == it->spaceKeys.end()) continue;
             if (auto shared = it->buffer.lock(); shared != nullptr) {
@@ -364,7 +374,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             // Compare the hash before taking a strong reference: locking a non-matching entry's
             // buffer could make this thread its last owner (a concurrent reap releasing it) and
             // run the pool release under the cache mutex; expired() takes no reference.
-            if (it->hash != hash) {
+            if (it->hash != hash || it->cacheRoot != cacheRoot) {
                 if (it->buffer.expired()) {
                     it = cache.entries.erase(it);
                 } else {
@@ -400,14 +410,6 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     // bit 0), for shaders that look a read up there first and fall back to the ranges when its page
     // is not resident (BufferCache.hpp). Only where this thread holds the GPU mutex (the root's first
     // clear is recorded).
-    std::uint64_t cacheRoot = 0;
-    if (BufferCacheEnabled() && GuestMemory::GpuMutex().HeldByThisThread()) {
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) {
-            cacheRoot = BufferCacheTable(context, *recorder);
-            MakeQueuedResident(context, *recorder);
-            SyncResident(context, *recorder);
-        }
-    }
     if (cacheRoot != 0) tableBytes += sizeof(cacheRoot);
     table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), cacheRoot != 0 ? 1u : 0u};
@@ -422,7 +424,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.device = context.device;
         }
         auto cachedRanges = filtered.has_value() ? std::move(*filtered) : cached.has_value() ? *cached->ranges : std::move(built);
-        cache.entries.push_front({hash, std::move(cachedRanges), table, {}});
+        cache.entries.push_front({hash, cacheRoot, std::move(cachedRanges), table, {}});
         if (serial != 0) cache.entries.front().spaceKeys.emplace_back(serial, guardSerial);
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }

@@ -2189,7 +2189,7 @@ private:
         const auto access = BufferAccessOf(inst.Opcode());
         // APS5_GPU_SRT: only a V# loaded from memory is read by the shader itself; one built from user
         // data or constants needs no capture read and stays a bound descriptor, as before.
-        const bool gpuRead = m_program.Resources().gpuSrt && LoadedFromMemory(descriptor);
+        const bool gpuRead = m_program.Resources().gpuSrt && !WrittenThrough(*handle) && LoadedFromMemory(descriptor);
         if (!gpuRead && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
@@ -2203,6 +2203,14 @@ private:
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
         return true;
+    }
+
+    static bool WrittenThrough(const IrValue& handle) {
+        for (const IrValue* use : handle.Uses()) {
+            const auto access = BufferAccessOf(use->Opcode());
+            if (access == BufferAccess::Write || access == BufferAccess::Atomic) return true;
+        }
+        return false;
     }
 
     static bool LoadedFromMemory(const DescriptorSource& descriptor) {
