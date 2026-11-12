@@ -4,7 +4,10 @@
 #include "Optimization/SrtWalker/SrtPlanBuilder.hpp"
 #include "Optimization/SrtWalker/SrtRuntimeValidator.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
+#include "Recompiler.hpp"
 
+#include <atomic>
+#include <cstdio>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -24,8 +27,28 @@ void SrtWalker::BuildPlan(IrProgram& program) const {
         throw std::runtime_error("shader SRT planning failed: cannot rebuild SRT after resource tracking");
     }
     program.Resources().srtPlanComplete = false;
-    Detail::PlanBuilder(program).Run();
+    program.Resources().gpuSrt = GpuSrtEligible(program);
+    if (program.Resources().gpuSrt) {
+        static std::atomic<std::uint32_t> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[gpu-srt] shader %016llx stage %u: SRT left to the GPU\n", static_cast<unsigned long long>(program.Resources().shaderHash), static_cast<unsigned>(program.Resources().stage));
+        program.Resources().srtReads.clear();
+        program.Metadata().dynamicReads.clear();
+    } else {
+        Detail::PlanBuilder(program).Run();
+    }
     program.Resources().srtPlanComplete = true;
+}
+
+bool SrtWalker::GpuSrtEligible(const IrProgram& program) {
+    const auto stages = GpuSrtStages();
+    if (stages == 0u || (stages == 1u && program.Resources().stage != IrShaderStage::Compute)) return false;
+    for (const auto& block : program.Blocks()) {
+        for (const IrValue* inst : block->Instructions()) {
+            const auto op = inst->Opcode();
+            if (op == IrOpcode::GetImageResource || op == IrOpcode::GetSamplerResource || op == IrOpcode::ImageBvhIntersectRay || ImageOpcodeInfoOf(op).access != ImageAccess::None) return false;
+        }
+    }
+    return true;
 }
 
 bool SrtWalker::ValidateRuntimeValue(const IrResourcePlan& program, const IrValue* value, RuntimeValueType type) const {

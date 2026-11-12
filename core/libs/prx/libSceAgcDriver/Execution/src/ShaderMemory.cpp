@@ -26,6 +26,7 @@
 #include <vector>
 #include <mutex>
 #include <unordered_map>
+#include <string>
 
 namespace AgcDriver {
 namespace {
@@ -329,6 +330,11 @@ ShaderMemory::Page& ShaderMemory::addPage(std::size_t position, std::uint64_t ba
     return *lastPage;
 }
 
+namespace {
+bool TraceSlowHooks();
+void NoteSlowHook(std::uint64_t address, std::uint64_t nanoseconds, bool wordwise);
+}
+
 ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
     if (base == lastBase) return *lastPage;
     const auto position = pageAtOrAfter(base);
@@ -352,10 +358,14 @@ void ShaderMemory::preparePage(Page& page, std::uint64_t base) {
             ++CaptureTotals().pagesWordwise;
             return;
         }
-        const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto started = CaptureProfiled() || TraceSlowHooks() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         GuestMemory::GuardRead(base, PageBytes);
         GuestMemory::FlushGpuWrites(base, PageBytes);
         if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
+        if (TraceSlowHooks()) {
+            const auto nanoseconds = NanosecondsSince(started);
+            if (nanoseconds >= 30000) NoteSlowHook(base, nanoseconds, false);
+        }
         page.lazy = true;
     }
 }
@@ -472,6 +482,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
             if (page.wordwise) {
                 const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+                if (TraceSlowHooks() && nanoseconds >= 30000) NoteSlowHook(address, nanoseconds, true);
                 if (nanoseconds >= WordWaitNanoseconds) {
                     ++CaptureTotals().wordWaits;
                     CaptureTotals().wordWaitNanoseconds += nanoseconds;
@@ -815,6 +826,64 @@ bool ShaderMemory::supplyWords(void* context, const std::shared_ptr<const Shader
 ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {
     auto& totals = CaptureTotals();
     return {totals.wordsKnown.load(std::memory_order_relaxed), totals.wordsKnownVerified.load(std::memory_order_relaxed), totals.wordsKnownMismatches.load(std::memory_order_relaxed)};
+}
+
+namespace {
+
+struct TraceProgramStorage {};
+
+bool TraceSlowHooks() {
+    static const bool enabled = std::getenv("APS5_TRACE_SLOW_CAPTURE_HOOKS") != nullptr;
+    return enabled;
+}
+
+void NoteSlowHook(std::uint64_t address, std::uint64_t nanoseconds, bool wordwise) {
+    struct Totals {
+        std::uint64_t count = 0, nanoseconds = 0;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Totals> programs, regions;
+    static Totals all, words;
+    static auto reported = std::chrono::steady_clock::now();
+    const auto program = HostThreadLocal<std::uint64_t, TraceProgramStorage>();
+    std::lock_guard lock(mutex);
+    for (auto* totals : {&programs[program], &regions[address >> 16u], &all}) {
+        ++totals->count;
+        totals->nanoseconds += nanoseconds;
+    }
+    if (wordwise) {
+        ++words.count;
+        words.nanoseconds += nanoseconds;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    const auto top = [](const std::unordered_map<std::uint64_t, Totals>& map, unsigned shift) {
+        std::vector<std::pair<std::uint64_t, Totals>> sorted(map.begin(), map.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.nanoseconds > b.second.nanoseconds; });
+        std::string text;
+        for (std::size_t i = 0; i < sorted.size() && i < 8; ++i) {
+            char item[96];
+            std::snprintf(item, sizeof(item), " 0x%llx:%llu/%.1fms", static_cast<unsigned long long>(sorted[i].first << shift), static_cast<unsigned long long>(sorted[i].second.count), static_cast<double>(sorted[i].second.nanoseconds) / 1e6);
+            text += item;
+        }
+        return text;
+    };
+    std::fprintf(stderr, "[slow-capture-hooks] (10 s) %llu capture reads over 30 us in the flush hook, %.1f ms (word by word %llu, %.1f ms); by program:%s; by 64 KiB region:%s\n", static_cast<unsigned long long>(all.count), static_cast<double>(all.nanoseconds) / 1e6, static_cast<unsigned long long>(words.count), static_cast<double>(words.nanoseconds) / 1e6, top(programs, 0).c_str(), top(regions, 16).c_str());
+    programs.clear();
+    regions.clear();
+    all = {};
+    words = {};
+}
+
+}
+
+bool ShaderMemory::TraceSlowHooks() {
+    return AgcDriver::TraceSlowHooks();
+}
+
+void ShaderMemory::SetTraceProgram(std::uint64_t program) {
+    if (TraceSlowHooks()) HostThreadLocal<std::uint64_t, TraceProgramStorage>() = program;
 }
 
 void ShaderMemory::CountHandleMemo(bool hit) {

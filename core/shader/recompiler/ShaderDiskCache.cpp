@@ -148,7 +148,7 @@ static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: upda
 static_assert(fieldCount<SampledResourcePair>() == 4, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
-static_assert(fieldCount<IrResourcePlan>() == 25, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(fieldCount<IrResourcePlan>() == 26, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 32, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 4, "DescriptorSource changed: update the plan encoder");
@@ -1213,6 +1213,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
     writer.Values(std::span<const std::uint8_t>(plan.pureFlatSlots));
     writer.Value(plan.denseValueIds);
     writer.Value(plan.requiresSpecializationMemory);
+    writer.Value(plan.gpuSrt);
     writer.Value(plan.srtPlanComplete);
     writer.Value(plan.resourceTrackingComplete);
     encodeShaderInfo(writer, plan.info);
@@ -1380,6 +1381,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     reader.Values(plan.pureFlatSlots);
     reader.Value(plan.denseValueIds);
     reader.Value(plan.requiresSpecializationMemory);
+    reader.Value(plan.gpuSrt);
     reader.Value(plan.srtPlanComplete);
     reader.Value(plan.resourceTrackingComplete);
     decodeShaderInfo(reader, plan.info);
@@ -1923,7 +1925,8 @@ DiskStore& store() {
 }
 
 std::uint64_t SourceVersion() {
-    return ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
+    const auto version = ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
+    return version ^ (static_cast<std::uint64_t>(GpuSrtStages()) * 0x632be59bd9b4e019ull);
 }
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {

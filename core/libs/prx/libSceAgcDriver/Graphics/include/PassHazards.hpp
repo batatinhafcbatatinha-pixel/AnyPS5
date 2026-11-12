@@ -64,6 +64,8 @@ public:
     void Add(const PassAccess& access);
     void BeginPass() { ++pass; }
     void SealWriteOnly();
+    // Whether the accesses added since the last Clear wrote any of `ranges` (or wrote unknown memory).
+    bool WritesOverlap(GuestRangeList ranges) const;
     void Clear();
     bool Empty() const;
 

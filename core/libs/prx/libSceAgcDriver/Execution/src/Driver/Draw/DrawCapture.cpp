@@ -14,6 +14,11 @@
 #include <stdexcept>
 #include <exception>
 #include <typeinfo>
+#include <array>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -107,6 +112,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     };
     const auto capture = [&] {
         const SampledReadScope sampling(evidenceReads);
+        ShaderMemory::SetTraceProgram(program.binary.codeAddress);
         try {
             return CaptureInvocation(shaderMemory, *program.snapshot, program.codeOffset, request, invocation);
         } catch (const std::exception& error) {
@@ -311,6 +317,124 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);
     }
+}
+
+// Debug aid: APS5_TRACE_DRAW_REUSE=1 compares every freshly captured draw stage with the previous
+// capture of the same program (code, offset, push offset) and prints, every 10 s, what differed:
+// the user words, the read addresses, the snapshot's descriptors (address fields or other fields)
+// and flat words, and the result's variant, specialization, binding shapes and push data. It
+// measures which captures a cache keyed on the program alone could serve by patching data.
+void NoteDrawReuse(const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<bool>& recompiled) {
+    static const bool enabled = std::getenv("APS5_TRACE_DRAW_REUSE") != nullptr;
+    if (!enabled) return;
+    struct Last {
+        std::vector<std::uint32_t> userData;
+        std::vector<std::pair<std::uint64_t, std::size_t>> regions;
+        ShaderRecompiler::ResourceSnapshot snapshot;
+        std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    };
+    enum Count : std::size_t { Stages, First, Identical, UserDiffer, UserBaseDiffer, RegionsSame, RegionsShifted, RegionsOther, BuffersAddr, BuffersOther, ImagesAddr, ImagesOther, SamplersDiffer, FlatDiffer, SnapshotSame, Variant, Specialization, BindingShape, GuestDescriptor, PushData, DataOnly, DataOnlyRegionsSame, Total };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Last> last;
+    static std::array<std::uint64_t, Total> counts{};
+    static auto reported = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    for (std::size_t i = 0; i < programs.size() && i < stageCaptures.size(); ++i) {
+        const auto& capture = stageCaptures[i];
+        if (i >= recompiled.size() || !recompiled[i] || capture.compiled == nullptr || capture.capture == nullptr) continue;
+        ++counts[Stages];
+        const auto key = (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(programs[i].snapshot.get())) * 0x9e3779b97f4a7c15ull) ^ (static_cast<std::uint64_t>(programs[i].codeOffset) << 20u) ^ capture.pushOffset;
+        Last now;
+        now.userData = programs[i].userData;
+        for (const auto& region : capture.regions) now.regions.emplace_back(region.guestAddress, region.bytes.size());
+        std::sort(now.regions.begin(), now.regions.end());
+        now.snapshot = capture.capture->snapshot;
+        now.compiled = capture.compiled;
+        auto [it, inserted] = last.try_emplace(key);
+        if (inserted) {
+            ++counts[First];
+            it->second = std::move(now);
+            continue;
+        }
+        const auto& was = it->second;
+        const bool userSame = was.userData == now.userData;
+        if (!userSame) {
+            ++counts[UserDiffer];
+            const auto base = capture.userDataUse.asBase;
+            for (std::size_t w = 0; w < now.userData.size() && w < was.userData.size() && w < 64; ++w) {
+                if (now.userData[w] != was.userData[w] && ((base >> w) & 1u) != 0) {
+                    ++counts[UserBaseDiffer];
+                    break;
+                }
+            }
+        }
+        const bool regionsSame = was.regions == now.regions;
+        if (regionsSame) {
+            ++counts[RegionsSame];
+        } else {
+            bool shifted = was.regions.size() == now.regions.size();
+            for (std::size_t r = 0; shifted && r < now.regions.size(); ++r) shifted = was.regions[r].second == now.regions[r].second;
+            ++counts[shifted ? RegionsShifted : RegionsOther];
+        }
+        const auto descriptors = [&](const std::vector<ShaderRecompiler::DescriptorValue>& a, const std::vector<ShaderRecompiler::DescriptorValue>& b, bool image, Count addr, Count other) {
+            if (a.size() != b.size()) {
+                ++counts[other];
+                return;
+            }
+            bool address = false, rest = false;
+            for (std::size_t d = 0; d < a.size(); ++d) {
+                if (a[d] == b[d]) continue;
+                for (std::size_t w = 0; w < 8; ++w) {
+                    const auto diff = a[d].dwords[w] ^ b[d].dwords[w];
+                    if (diff == 0) continue;
+                    const std::uint32_t addressMask = w == 0 ? ~0u : w == 1 ? (image ? 0xffu : 0xffffu) : 0u;
+                    if ((diff & addressMask) != 0) address = true;
+                    if ((diff & ~addressMask) != 0) rest = true;
+                }
+                if (a[d].dwordCount != b[d].dwordCount || a[d].availableDwordMask != b[d].availableDwordMask) rest = true;
+            }
+            if (address) ++counts[addr];
+            if (rest) ++counts[other];
+        };
+        descriptors(was.snapshot.buffers, now.snapshot.buffers, false, BuffersAddr, BuffersOther);
+        descriptors(was.snapshot.images, now.snapshot.images, true, ImagesAddr, ImagesOther);
+        if (was.snapshot.samplers != now.snapshot.samplers) ++counts[SamplersDiffer];
+        if (was.snapshot.flattenedSrt != now.snapshot.flattenedSrt) ++counts[FlatDiffer];
+        const bool snapshotSame = was.snapshot.buffers == now.snapshot.buffers && was.snapshot.images == now.snapshot.images && was.snapshot.samplers == now.snapshot.samplers && was.snapshot.flattenedSrt == now.snapshot.flattenedSrt;
+        if (snapshotSame) ++counts[SnapshotSame];
+        const auto& a = *was.compiled;
+        const auto& b = *now.compiled;
+        const bool variant = a.variantId != b.variantId;
+        const bool specialization = a.specializationId != b.specializationId || a.specialization.size() != b.specialization.size();
+        bool shape = a.bindings.size() != b.bindings.size();
+        bool guest = false;
+        for (std::size_t k = 0; !shape && k < a.bindings.size(); ++k) {
+            const auto& x = a.bindings[k];
+            const auto& y = b.bindings[k];
+            shape = x.kind != y.kind || x.role != y.role || x.descriptorSet != y.descriptorSet || x.binding != y.binding || x.count != y.count || x.imageShapes.size() != y.imageShapes.size() || x.imageShape.has_value() != y.imageShape.has_value() || x.bufferWritten != y.bufferWritten || x.imageWritten != y.imageWritten;
+            if (x.guestDescriptor != y.guestDescriptor) guest = true;
+        }
+        const bool push = a.pushConstants != b.pushConstants;
+        if (variant) ++counts[Variant];
+        if (specialization) ++counts[Specialization];
+        if (shape) ++counts[BindingShape];
+        if (guest) ++counts[GuestDescriptor];
+        if (push) ++counts[PushData];
+        if (!variant && !specialization && !shape) {
+            ++counts[DataOnly];
+            if (regionsSame) ++counts[DataOnlyRegionsSame];
+        }
+        if (userSame && regionsSame && snapshotSame && !variant && !specialization && !shape && !guest && !push) ++counts[Identical];
+        it->second = std::move(now);
+    }
+    if (last.size() > 65536) last.clear();
+    const auto clock = std::chrono::steady_clock::now();
+    if (clock - reported < std::chrono::seconds(10)) return;
+    reported = clock;
+    const auto c = [&](Count index) { return static_cast<unsigned long long>(counts[index]); };
+    std::fprintf(stderr, "[draw-reuse] (10 s) %llu fresh stage captures (%llu first of their program, %llu identical to the previous one); vs the previous capture of the program: user words differ %llu (a walked base among them %llu); read regions same %llu / same sizes shifted %llu / other %llu; snapshot same %llu; buffers differ in address %llu / other fields %llu; images address %llu / other %llu; samplers %llu; flat words %llu; result: variant %llu, specialization %llu, binding shape %llu, guest descriptors %llu, push data %llu; data-only (same variant, specialization, binding shapes) %llu (with the same read regions %llu)\n",
+        c(Stages), c(First), c(Identical), c(UserDiffer), c(UserBaseDiffer), c(RegionsSame), c(RegionsShifted), c(RegionsOther), c(SnapshotSame), c(BuffersAddr), c(BuffersOther), c(ImagesAddr), c(ImagesOther), c(SamplersDiffer), c(FlatDiffer), c(Variant), c(Specialization), c(BindingShape), c(GuestDescriptor), c(PushData), c(DataOnly), c(DataOnlyRegionsSame));
+    counts = {};
 }
 
 }

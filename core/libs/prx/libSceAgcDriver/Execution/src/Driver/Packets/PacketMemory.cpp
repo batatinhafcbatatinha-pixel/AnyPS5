@@ -12,6 +12,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include <vector>
+#include <cstdio>
+#include <chrono>
+#include <string>
+#include <unordered_map>
+#include <mutex>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -362,6 +368,45 @@ bool Driver::enqueueSampleDumpPacket(std::span<const std::uint32_t> packet, std:
     return true;
 }
 
+// Debug aid (APS5_TRACE_SLOW_CAPTURE_HOOKS=1): where queue 0's DMA packets and dispatches write, by
+// 64 KiB region, to match against the [slow-capture-hooks] regions (pages a capture waited for).
+void NoteWriteTarget(const char* kind, std::uint64_t address, std::uint64_t bytes) {
+    static const bool enabled = std::getenv("APS5_TRACE_SLOW_CAPTURE_HOOKS") != nullptr;
+    if (!enabled) return;
+    struct Totals {
+        std::uint64_t count = 0, bytes = 0;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Totals> regions;
+    static std::unordered_map<std::string, Totals> kinds;
+    static auto reported = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    for (auto* totals : {&regions[(address >> 16u) | (static_cast<std::uint64_t>(static_cast<unsigned char>(kind[0])) << 56u)], &kinds[kind]}) {
+        ++totals->count;
+        totals->bytes += bytes;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    std::vector<std::pair<std::uint64_t, Totals>> sorted(regions.begin(), regions.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.bytes != b.second.bytes ? a.second.bytes > b.second.bytes : a.second.count > b.second.count; });
+    std::string text;
+    for (const auto& [name, totals] : kinds) {
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %llu/%llu B", name.c_str(), static_cast<unsigned long long>(totals.count), static_cast<unsigned long long>(totals.bytes));
+        text += item;
+    }
+    text += "; by 64 KiB region:";
+    for (std::size_t i = 0; i < sorted.size() && i < 24; ++i) {
+        char item[96];
+        std::snprintf(item, sizeof(item), " %c:0x%llx:%llu/%llu B", static_cast<char>(sorted[i].first >> 56u), static_cast<unsigned long long>((sorted[i].first & 0xffffffffffffffull) << 16u), static_cast<unsigned long long>(sorted[i].second.count), static_cast<unsigned long long>(sorted[i].second.bytes));
+        text += item;
+    }
+    std::fprintf(stderr, "[write-targets] (10 s)%s\n", text.c_str());
+    regions.clear();
+    kinds.clear();
+}
+
 bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state) {
     if (opcode != 0x50 || queue != 0 || packet.size() < 7 || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return false;
     const auto source = ((packet[1] >> 29u) & 3u) | ((packet[6] >> 24u) & 4u) | ((packet[6] >> 25u) & 8u);
@@ -389,6 +434,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         std::vector<std::byte> bytes(store->Bytes().begin(), store->Bytes().end());
         const auto size = bytes.size();
         const bool gds = Pm4::DmaDestination(packet) == Pm4::DmaSelectGds;
+        NoteWriteTarget(gds ? "gds" : "data", address, size);
         const bool metadataFill = Pm4::DmaDestination(packet) != 1;
         const auto fillAddress = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
         const auto fillBytes = packet[6] & 0x3ffffffu;
@@ -409,6 +455,10 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
     }
     if (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3) Graphics::RequireNoMultisampleTarget(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[6] & 0x3ffffffu, "a DMA copy");
     const auto copy = Pm4::DecodeMemoryCopy(packet);
+    if (copy.has_value()) {
+        NoteWriteTarget("copy", copy->destination, copy->bytes);
+        NoteWriteTarget("source", copy->source, copy->bytes);
+    }
     if (!copy.has_value() || copy->destination % 4 != 0 || copy->bytes % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return false;
     DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::DmaCopy, [this, queue, copy = *copy] {
         DrawPipeline::Queue0().ReleaseRunningReads();

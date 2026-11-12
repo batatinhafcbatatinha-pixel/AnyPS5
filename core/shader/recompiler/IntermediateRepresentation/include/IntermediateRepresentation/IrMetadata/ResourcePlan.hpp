@@ -279,6 +279,9 @@ struct IrResourcePlan {
     bool denseValueIds = false;
     CompactResourcePlan compact;
     bool requiresSpecializationMemory = false;
+    // The GPU resolves this program's SRT at run time (GpuSrtStages): no flat slots, every buffer
+    // V# a gpuDescriptor.
+    bool gpuSrt = false;
     bool srtPlanComplete = false;
     bool resourceTrackingComplete = false;
     ShaderInfo info;

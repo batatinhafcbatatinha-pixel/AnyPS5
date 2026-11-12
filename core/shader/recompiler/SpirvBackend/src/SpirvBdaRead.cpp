@@ -393,6 +393,52 @@ std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std
     return result;
 }
 
+void EmitBufferAnchor(SpirvValueEmitContext& ctx, const IrValue& handle) {
+    auto& state = ctx.state;
+    if (!state.program.Resources().gpuSrt || !state.program.Info().usesDma || state.bdaAnchorFunction == 0 || state.module.InHelperFunction()) return;
+    if (handle.ArgumentCount() != 4u) return;
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto low = Unary(state, spv::OpUConvert, u64, ctx.Arg(handle, 0u));
+    const auto highWord = Binary(state, spv::OpBitwiseAnd, u32, ctx.Arg(handle, 1u), ConstantU32(state, 0xffffu));
+    const auto base = Binary(state, spv::OpBitwiseOr, u64, low, Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, highWord), BdaConstant(state, 32u)));
+    SpirvEmitterState::BufferAnchor anchor;
+    anchor.handle = &handle;
+    anchor.base = base;
+    EmitBdaAnchorRange(state, anchor.range, base);
+    state.bufferAnchors.push_back(anchor);
+}
+
+std::uint32_t EmitAnchoredBufferRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address) {
+    auto& state = ctx.state;
+    if (state.bufferAnchors.empty() || inst.ArgumentCount() == 0u) return 0u;
+    const IrValue* handle = inst.Argument(0)->Resolve();
+    const auto found = std::find_if(state.bufferAnchors.rbegin(), state.bufferAnchors.rend(), [&](const SpirvEmitterState::BufferAnchor& entry) { return entry.handle == handle; });
+    if (found == state.bufferAnchors.rend()) return 0u;
+    const auto& anchor = *found;
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    // rel = address - base + (base - begin): the byte's offset in the anchored range.
+    const auto relative = Binary(state, spv::OpIAdd, u64, Binary(state, spv::OpISub, u64, address, anchor.base), anchor.range.offset);
+    const auto width = BdaConstant(state, 4u);
+    const auto fits = Binary(state, spv::OpUGreaterThanEqual, boolean, anchor.range.size, width);
+    const auto inside = Binary(state, spv::OpULessThanEqual, boolean, relative, Binary(state, spv::OpISub, u64, anchor.range.size, width));
+    const auto above = Binary(state, spv::OpUGreaterThanEqual, boolean, address, anchor.base);
+    const auto translated = Binary(state, spv::OpIAdd, u64, anchor.range.device, relative);
+    auto direct = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpLogicalAnd, boolean, fits, inside), above);
+    direct = Binary(state, spv::OpLogicalAnd, boolean, direct, Unary(state, spv::OpLogicalNot, boolean, BdaAddressUnaligned(state, translated)));
+    const bool coherent = BdaCoherent(state, inst);
+    return EmitValueIfElse(state, direct, u32, [&] {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, translated);
+        const auto value = state.module.AllocateId();
+        if (coherent) state.module.AddFunction(spv::OpAtomicLoad, u32, value, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0u));
+        else state.module.AddFunction(spv::OpLoad, u32, value, pointer, BdaAccessMask(false), 4u);
+        return value;
+    }, [&] { return EmitBdaRead(ctx, inst, address, 32u); });
+}
+
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate) {
     if (immediate == 0) {
         return address;

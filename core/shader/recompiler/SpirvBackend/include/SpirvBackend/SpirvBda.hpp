@@ -49,6 +49,10 @@ void EmitBdaAnchorRange(SpirvEmitterState& state, SpirvEmitterState::BdaAnchor& 
 const SpirvEmitterState::BdaAnchor* FindBdaAnchor(const SpirvEmitterState& state, const IrValue& inst);
 std::array<std::uint32_t, 4> EmitAnchoredBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords, const std::function<std::array<std::uint32_t, 4>()>& lookup);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
+void EmitBufferAnchor(SpirvValueEmitContext& ctx, const IrValue& handle);
+// A 32-bit load through a runtime V# with an anchor: direct physical load when the access lies in
+// the anchored range and is aligned, the table path (EmitBdaRead) otherwise. 0 without an anchor.
+std::uint32_t EmitAnchoredBufferRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address);
 
 }
 

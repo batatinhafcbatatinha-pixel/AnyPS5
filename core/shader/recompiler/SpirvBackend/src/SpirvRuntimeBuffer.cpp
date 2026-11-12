@@ -262,7 +262,12 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
 }
 
 std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits, std::uint32_t enable = 0u, std::uint32_t boundedEnable = 0u) {
-    if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
+    if (context.Memory(instruction).gpuDescriptor) {
+        if (bits == 32u) {
+            if (const auto anchored = EmitAnchoredBufferRead(context, instruction, address); anchored != 0u) return anchored;
+        }
+        return EmitBdaRead(context, instruction, address, bits);
+    }
     auto& state = context.state;
     const auto access = directAccess(context, instruction, false, !context.Memory(instruction).coherent);
     const auto index = directWordIndex(state, access, address);

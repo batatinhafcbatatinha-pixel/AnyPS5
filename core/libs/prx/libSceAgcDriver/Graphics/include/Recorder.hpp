@@ -79,6 +79,9 @@ public:
     bool RunOpen() const { return open != nullptr && open->deferredDispatchQueue != 0; }
     void AfterRun(std::function<void(Recorder&)> work);
     bool CloseRunOwing(const void* owner);
+    // A draw's render pass is open and nothing recorded in it since its leading barrier (the pass
+    // hazards' scope) wrote `ranges`: earlier writes are ordered before the pass's draws already.
+    bool PassOpenWithoutWrites(GuestRangeList ranges) const;
     struct OverlapStatistics {
         std::uint64_t deferred, overlapped, flushed;
     };

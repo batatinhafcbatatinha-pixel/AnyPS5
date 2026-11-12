@@ -1931,6 +1931,27 @@ void ShaderResources::forgetDeferredInputs() {
     deferredSnapshots = {};
 }
 
+bool TraceImageAddress(std::uint64_t address);
+void AddTracedImageAddress(std::uint64_t address);
+
+namespace {
+// APS5_TRACE_COMPOSITE: the 3840x2160 color target of a draw build, from buildPrepare to buildComplete.
+std::uint64_t compositeTraceTarget(const void* resources, std::uint64_t address, bool take) {
+    static std::mutex mutex;
+    static std::unordered_map<const void*, std::uint64_t> targets;
+    std::lock_guard lock(mutex);
+    if (!take) {
+        targets[resources] = address;
+        return address;
+    }
+    const auto found = targets.find(resources);
+    if (found == targets.end()) return 0;
+    const auto value = found->second;
+    targets.erase(found);
+    return value;
+}
+}
+
 void ShaderResources::build(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
     buildPrepare(shaders, target, colorAttachments, indexAddress, indexBytes);
     buildComplete();
@@ -2253,6 +2274,7 @@ void ValidateRuntimeResources(const CompiledShader& shader, std::span<const std:
 }
 
 void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
+    if (std::getenv("APS5_TRACE_COMPOSITE") != nullptr && target != nullptr && ((target->extent.width == 3840u && target->extent.height == 2160u) || TraceImageAddress(target->address))) compositeTraceTarget(this, target->address, false);
     registeredImageViews.clear();
     for (const auto& shader : shaders) if (shader.registeredImageViews != nullptr) registeredImageViews.insert(registeredImageViews.end(), shader.registeredImageViews->begin(), shader.registeredImageViews->end());
     Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed after resource capture");
@@ -2835,6 +2857,34 @@ void ShaderResources::buildComplete() {
             dataPatches.push_back({static_cast<std::size_t>(allocation.dataAllocation), allocation.dataByte, allocation.adjustment});
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
+        // Debug aid: APS5_TRACE_COMPOSITE=<s> lists, for 4 s from <s> seconds after the first build,
+        // the sampled textures of every pass writing a 3840x2160 target or storage image.
+        static const double traceCompositeAt = [] {
+            const char* value = std::getenv("APS5_TRACE_COMPOSITE");
+            return value != nullptr ? std::atof(value) : -1.0;
+        }();
+        if (traceCompositeAt >= 0.0) {
+            static const auto traceStart = std::chrono::steady_clock::now();
+            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStart).count();
+            const auto big = [](std::uint32_t width, std::uint32_t height) { return width == 3840u && height == 2160u; };
+            std::uint64_t written = 0;
+            const auto drawTarget = compositeTraceTarget(this, 0, true);
+            if (drawTarget != 0) written = drawTarget;
+            for (const auto& image : storageTextures) {
+                if (image != nullptr && (big(image->Descriptor().width, image->Descriptor().height) || TraceImageAddress(image->Descriptor().baseAddress))) written = image->Descriptor().baseAddress;
+            }
+            if (written != 0 && elapsed >= traceCompositeAt && elapsed < traceCompositeAt + 4.0) {
+                for (const auto& image : storageTextures) {
+                    if (image != nullptr) std::fprintf(stderr, "[composite]   storage image=%p base=0x%llx %ux%u fmt=%u ver=%llu\n", reinterpret_cast<void*>(image->Image()), static_cast<unsigned long long>(image->Descriptor().baseAddress), image->Descriptor().width, image->Descriptor().height, image->Descriptor().format, static_cast<unsigned long long>(image->Version()));
+                }
+                std::fprintf(stderr, "[composite] t=%.3f %s writes 0x%llx: %zu textures, %zu lookups\n", elapsed, drawTarget != 0 ? "draw" : "dispatch", static_cast<unsigned long long>(written), textures.size(), lookupLog().size());
+                for (const auto& record : lookupLog()) {
+                    if (drawTarget != 0 && textures.size() == 7u && record.resource.width == 1280u && record.resource.height == 720u) AddTracedImageAddress(record.resource.baseAddress);
+                }
+                for (const auto& record : lookupLog()) std::fprintf(stderr, "[composite]   lookup 0x%llx %ux%u fmt=%u tile=%d obj=%p source=%p srcver=%llu gen=%llu\n", static_cast<unsigned long long>(record.resource.baseAddress), record.resource.width, record.resource.height, record.resource.format, static_cast<int>(record.resource.tileMode), record.object, static_cast<const void*>(record.source), static_cast<unsigned long long>(record.source != nullptr ? record.source->Version() : 0), static_cast<unsigned long long>(record.generation));
+                for (const auto& texture : textures) std::fprintf(stderr, "[composite]   bound obj=%p storage=%p ver=%llu addr=0x%llx\n", static_cast<const void*>(texture.get()), texture != nullptr ? static_cast<const void*>(texture->StorageSource()) : nullptr, static_cast<unsigned long long>(texture != nullptr && texture->StorageSource() != nullptr ? texture->StorageSource()->Version() : 0), static_cast<unsigned long long>(texture != nullptr && texture->StorageSource() != nullptr ? texture->StorageSource()->Descriptor().baseAddress : 0));
+            }
+        }
         noteReusable();
         completed = true;
         if (BuildProfiled()) {
@@ -4535,6 +4585,13 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         return true;
     };
     const GuestBufferMemory::ResidentClaim residentClaim(guestMemory);
+    // The stores below feed only the work recorded after this proof (the imported regions are read
+    // in place by the GPU, the written ranges written by it): they go in queue order without the CPU
+    // waiting for the ranges' earlier writers (StorageTexture::GpuOrderedScope, which falls back to
+    // the wait for anything not host-imported or with shadows to publish). Debug aid:
+    // APS5_NO_REUSE_FLUSH_GPU_ORDERED=1 waits as before.
+    static const bool reuseOrdered = std::getenv("APS5_NO_REUSE_FLUSH_GPU_ORDERED") == nullptr;
+    std::optional<StorageTexture::GpuOrderedScope> orderedStores(std::in_place, reuseOrdered);
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             struct RegionsTag {};
@@ -4546,7 +4603,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
             // published by the flush, as one over a pending image is stored.
             for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+                if (static const bool trace = std::getenv("APS5_RESIDENT_TRACE") != nullptr; trace && ResidentDirtyOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+                    static std::atomic<std::uint64_t> traced{0};
+                    if (const auto n = traced.fetch_add(1, std::memory_order_relaxed); n < 100 || n % 200 == 0) std::fprintf(stderr, "[resident-trace] reuse-region #%llu 0x%llx+0x%llx overlaps %d shadowSourced %d\n", static_cast<unsigned long long>(n), static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), region.overlaps, guestMemory.ShadowSourced(region.begin, region.end));
+                }
+                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", guestMemory.ShadowSourced(region.begin, region.end) ? PublishScope::None : PublishScope::Whole);
             }
         }
         if (importsReconcilable ? HostImportsReconciledUnchanged(context, importsProof) : HostImportsUnchanged(context, importsProof)) {
@@ -4556,13 +4617,14 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             importsProof = HostImportsIdentity(context);
         }
     } else {
-        for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+        for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", guestMemory.ShadowSourced(region.begin, region.end) ? PublishScope::None : PublishScope::Whole);
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
+    orderedStores.reset();
     if (!guestMemory.StagingDecisionsCurrent()) return finish(fast, false, ProofFailure::Changed);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
@@ -4894,10 +4956,12 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
     if (const auto found = index.find(key); found != index.end()) {
+        tableTotal -= found->second->second->TableElements();
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
     }
+    tableTotal += resources->TableElements();
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
     if (capacity == 0) {
@@ -4909,20 +4973,19 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     noteUse(key);
     while (entries.size() > capacity) {
         noteEvicted(entries.back().first);
+        tableTotal -= entries.back().second->TableElements();
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
         entries.pop_back();
     }
-    if (entries.front().second->TableElements() == 0) return;
-    std::uint64_t tables = 0;
-    for (const auto& entry : entries) tables += entry.second->TableElements();
-    for (auto it = std::prev(entries.end()); tables > TableElementBudget() && it != entries.begin();) {
+    if (entries.front().second->TableElements() == 0 || tableTotal <= TableElementBudget()) return;
+    for (auto it = std::prev(entries.end()); tableTotal > TableElementBudget() && it != entries.begin();) {
         const auto elements = it->second->TableElements();
         if (elements == 0) {
             --it;
             continue;
         }
-        tables -= elements;
+        tableTotal -= elements;
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = std::prev(entries.erase(it));
@@ -4956,6 +5019,7 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
+        tableTotal -= it->second->TableElements();
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -4969,6 +5033,7 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
             ++it;
             continue;
         }
+        tableTotal -= it->second->TableElements();
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
@@ -4997,6 +5062,7 @@ void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
     index.clear();
     entries.clear();
+    tableTotal = 0;
     evictedKeys.clear();
     evictedOrder.clear();
     evictionsSinceCheck = 0;
@@ -5043,6 +5109,7 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    tableTotal -= found->second->second->TableElements();
     entries.erase(found->second);
     index.erase(found);
 }
