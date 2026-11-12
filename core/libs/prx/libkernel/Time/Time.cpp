@@ -498,6 +498,11 @@ static bool ProcessCpuResolutionNanos(std::uint64_t* nanos) {
 #endif
 
 static int ReadClock(int clockId, KernelTimespec* tp) {
+    if (clockId == 21) {
+        if (ReadClock(2, tp) != 0) return -1;
+        tp->tv_nsec -= tp->tv_nsec % 1000;
+        return 0;
+    }
     if (IsCpuClock(clockId)) {
         const int id = static_cast<int>(static_cast<std::uint32_t>(clockId) & CPU_CLOCK_ID_MASK);
         const bool process = (static_cast<std::uint32_t>(clockId) & CPU_CLOCK_PROCESS_BIT) != 0;
@@ -851,7 +856,7 @@ int APS5_VABI sceKernelGettimeofday(KernelTimeval* tp) {
 }
 
 int APS5_VABI sceKernelGettimezone(KernelTimezone* tz) {
-    if (tz == nullptr) return SceKernelErrorEfault;
+    if (tz == nullptr) return 0;
     const auto now = static_cast<std::int64_t>(std::time(nullptr));
     const KernelTimezone zone{static_cast<std::int32_t>(HostZoneAt(now).standardEast / 60), static_cast<std::int32_t>(HostDaylightAmount(now) / 60)};
     return GuestCopyOut_nid_no_patch(tz, &zone, sizeof(zone)) ? 0 : SceKernelErrorEfault;
