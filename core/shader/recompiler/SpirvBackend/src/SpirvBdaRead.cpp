@@ -395,7 +395,9 @@ std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std
 
 void EmitBufferAnchor(SpirvValueEmitContext& ctx, const IrValue& handle) {
     auto& state = ctx.state;
-    if (!state.program.Resources().gpuSrt || !state.program.Info().usesDma || state.bdaAnchorFunction == 0 || state.module.InHelperFunction()) return;
+    // Debug aid: APS5_GPU_SRT_NO_ANCHORS=1 leaves runtime-V# loads on the table search.
+    static const bool anchors = std::getenv("APS5_GPU_SRT_NO_ANCHORS") == nullptr;
+    if (!anchors || !state.program.Resources().gpuSrt || !state.program.Info().usesDma || state.bdaAnchorFunction == 0 || state.module.InHelperFunction()) return;
     if (handle.ArgumentCount() != 4u) return;
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);

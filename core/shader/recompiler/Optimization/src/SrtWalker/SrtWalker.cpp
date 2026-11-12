@@ -28,13 +28,11 @@ void SrtWalker::BuildPlan(IrProgram& program) const {
     }
     program.Resources().srtPlanComplete = false;
     program.Resources().gpuSrt = GpuSrtEligible(program);
-    if (program.Resources().gpuSrt && GpuSrtStages() == 3u) {
-        Detail::PlanBuilder(program, true).Run();
-    } else if (program.Resources().gpuSrt) {
+    if (program.Resources().gpuSrt) {
         static std::atomic<std::uint32_t> logged{0};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[gpu-srt] shader %016llx stage %u: SRT left to the GPU\n", static_cast<unsigned long long>(program.Resources().shaderHash), static_cast<unsigned>(program.Resources().stage));
-        program.Resources().srtReads.clear();
-        program.Metadata().dynamicReads.clear();
+        // Only image/sampler descriptors and the V#s of written buffers are walked on the CPU.
+        Detail::PlanBuilder(program, true).Run();
     } else {
         Detail::PlanBuilder(program).Run();
     }

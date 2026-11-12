@@ -6,6 +6,7 @@
 #include "IntermediateRepresentation/IrBuilder.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ShaderRecompiler::Detail {
@@ -26,7 +27,16 @@ void PlanBuilder::Run() {
                     }
                 }
             }
-            if (IsDescriptorHandle(inst->Opcode()) && (!_imagesOnly || inst->Opcode() == IrOpcode::GetImageResource || inst->Opcode() == IrOpcode::GetSamplerResource)) {
+            // imagesOnly also plans the V# of every buffer a store or atomic goes through: written
+            // buffers stay bound descriptors (BDA stores bypass resident copies of the memory).
+            const auto writtenThrough = [](const IrValue* handle) {
+                for (const IrValue* use : handle->Uses()) {
+                    const auto access = BufferAccessOf(use->Opcode());
+                    if (access == BufferAccess::Write || access == BufferAccess::Atomic) return true;
+                }
+                return false;
+            };
+            if (IsDescriptorHandle(op) && (!_imagesOnly || op == IrOpcode::GetImageResource || op == IrOpcode::GetSamplerResource || (op == IrOpcode::GetBufferResource && writtenThrough(inst)))) {
                 for (std::size_t index = 0; index < inst->ArgumentCount(); index++) {
                     Collect(inst->Argument(index), 0);
                 }
@@ -34,7 +44,10 @@ void PlanBuilder::Run() {
         }
     }
     for (auto& block : _program.Blocks()) {
-        if (_imagesOnly) break;
+        // Debug aid: APS5_GPU_SRT_PLAN_RAW=1 still plans the immediate raw reads (flat slots, branch
+        // conditions) in an imagesOnly plan.
+        static const bool planRaw = std::getenv("APS5_GPU_SRT_PLAN_RAW") != nullptr;
+        if (_imagesOnly && !planRaw) break;
         for (IrValue* inst : block->Instructions()) {
             if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {
                 Collect(inst, inst->Flags<MemoryFlags>().pc);

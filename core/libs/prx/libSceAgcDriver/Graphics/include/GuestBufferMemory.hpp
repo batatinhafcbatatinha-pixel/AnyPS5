@@ -227,6 +227,11 @@ struct ResidentSource {
     std::shared_ptr<Buffer> keep;
 };
 std::optional<ResidentSource> ResidentSourceFor(VkDevice device, VkBuffer import, std::uint64_t address, std::size_t bytes);
+// A draw input (vertex or index range) lying inside a resident staging copy that holds its newest
+// bytes (no CPU write since the copy, as residentHit decides for a reused region; writers through
+// other paths drop the copy first): the GPU reads it there, behind a barrier after its recorded
+// writers, with no copy back to guest memory. Caller holds the GPU mutex. Counted in [bufcache].
+std::optional<ResidentSource> ResidentDrawSource(VkDevice device, std::uint64_t address, std::size_t bytes);
 void CountResidentSourceFallback(std::uint64_t bytes);
 class ResidentRangeClaim {
 public:

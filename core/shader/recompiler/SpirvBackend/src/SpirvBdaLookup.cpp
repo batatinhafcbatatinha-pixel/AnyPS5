@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <bit>
+#include <cstdlib>
 #include <utility>
 #include <iterator>
 #include <initializer_list>
@@ -84,10 +85,15 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow},
     });
-    if (permission == BdaAbi::Read && state.program.Resources().gpuSrt) {
+    // Debug aids to bisect the GPU-SRT lookup additions: APS5_GPU_SRT_NO_TABLE=1 (no page-table fast
+    // path), APS5_GPU_SRT_NO_ACCESSED=1 (no accessed-page notes).
+    static const bool tableLookups = std::getenv("APS5_GPU_SRT_NO_TABLE") == nullptr;
+    static const bool accessedNotes = std::getenv("APS5_GPU_SRT_NO_ACCESSED") == nullptr;
+    if (tableLookups && permission == BdaAbi::Read && state.program.Resources().gpuSrt) {
         // Read-only fast path: root[A >> RootShift] -> leaf, leaf[(A & leaf mask) >> PageShift] -> page,
         // device = page + (A & page mask), when the page is resident and the bytes stay in it; any 0
-        // entry falls through to the range search below.
+        // entry falls through to the range search below. It skips the range checks (permission,
+        // InvalidTable): the buffer cache's table is trusted, and only read lookups take it.
         const auto physicalU64 = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, u64);
         const auto loadEntry = [&](std::uint32_t at) {
             const auto pointer = state.module.AllocateId();
@@ -173,9 +179,12 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow},
     });
-    if (permission == BdaAbi::Read && state.program.Resources().gpuSrt && state.faultBufferVariable != 0) {
+    if (accessedNotes && permission == BdaAbi::Read && state.program.Resources().gpuSrt && state.faultBufferVariable != 0) {
         // The page table missed (or is absent): tell Graphics this page is used (cache flag only).
-        EmitIfCondition(state, cached, [&] {
+        // The u32 key holds addresses below 2^(32 + CachePageShift); higher ones are not noted. The
+        // count cannot pass AccessedPageSlots: a claim is a successful CAS on an empty slot.
+        const auto keyable = binary(spv::OpULessThan, boolean, address, BdaConstant(state, std::uint64_t{1} << (32u + BdaAbi::CachePageShift)));
+        EmitIfCondition(state, binary(spv::OpLogicalAnd, boolean, cached, keyable), [&] {
             const auto key = binary(spv::OpIAdd, u32, Unary(state, spv::OpUConvert, u32, binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::CachePageShift))), constant(1u));
             const auto hash = binary(spv::OpShiftRightLogical, u32, binary(spv::OpIMul, u32, key, constant(0x9e3779b1u)), constant(32u - static_cast<std::uint32_t>(std::countr_zero(BdaAbi::AccessedPageSlots))));
             const auto scope = constant(spv::ScopeDevice);

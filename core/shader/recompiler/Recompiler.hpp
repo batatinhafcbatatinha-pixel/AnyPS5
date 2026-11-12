@@ -929,6 +929,9 @@ struct CompiledShaderArtifact {
     std::vector<std::uint32_t> stencilReferences;
     bool stencilReplaySafe = false;
     bool bdaWrites = false;
+    // APS5_GPU_SRT resolved this program's SRT on the GPU (IrResourcePlan::gpuSrt): its BDA reads are
+    // SRT/V# reads a driver may serve from a cache page table instead of the whole address space.
+    bool gpuSrt = false;
     bool layerReplaySafe = false;
     bool gridScalable = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;

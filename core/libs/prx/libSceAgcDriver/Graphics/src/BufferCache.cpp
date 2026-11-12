@@ -33,14 +33,19 @@ constexpr std::uint64_t TablePageBytes = std::uint64_t{1} << BufferCacheTablePag
 constexpr std::uint64_t LeafSpan = std::uint64_t{1} << BufferCacheTableLeafBits;
 constexpr std::uint64_t LeafEntries = LeafSpan / TablePageBytes;
 
+// Ranges crossing a chunk boundary (whole vertex buffers) get a span buffer of their own, up to this
+// size; spans are only bound, never put into the address table.
+constexpr std::uint64_t SpanMaxBytes = std::uint64_t{64} << 20u;
+
 struct Chunk {
     std::shared_ptr<Buffer> buffer;
+    std::uint64_t bytes = 0;
     // The tracker generation each block was last uploaded at (0: never, or only partly).
-    std::array<std::uint64_t, BlocksPerChunk> uploaded{};
+    std::vector<std::uint64_t> uploaded;
     // Uses and uploads per block, saturating: decides whether an upload may end an open pass.
-    std::array<std::uint16_t, BlocksPerChunk> uses{};
-    std::array<std::uint16_t, BlocksPerChunk> uploads{};
-    bool mapped = false;
+    std::vector<std::uint16_t> uses;
+    std::vector<std::uint16_t> uploads;
+    std::array<bool, ChunkBytes / TablePageBytes> mapped{};
 };
 
 struct Stats {
@@ -56,12 +61,17 @@ struct Stats {
     std::uint64_t overBudget = 0;
     std::uint64_t resident = 0;
     std::uint64_t residentRefused = 0;
+    std::uint64_t residentSourced = 0;
+    std::uint64_t refusedRewritten = 0;
 };
 
 struct Cache {
     std::mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     std::unordered_map<std::uint64_t, Chunk> chunks;
+    // Span buffers by base (they may overlap: each is a read-only copy of guest memory).
+    std::map<std::uint64_t, Chunk> spans;
+    std::uint64_t spanBytes = 0;
     std::shared_ptr<Buffer> root;
     std::unordered_map<std::uint64_t, std::shared_ptr<Buffer>> leaves;
     // Resident ranges (begin -> end, merged), re-synced by SyncResident.
@@ -84,12 +94,14 @@ std::size_t budgetChunks() {
     return chunks;
 }
 
+std::uint64_t cachedBytes(const Cache& state);
+
 void report(Cache& state) {
     const auto now = std::chrono::steady_clock::now();
     if (now - state.lastReport < std::chrono::seconds(10)) return;
     state.lastReport = now;
     const auto& s = state.stats;
-    std::fprintf(stderr, "[bufcache] (10 s) %llu obtained: %llu clean, %llu uploaded (%.1f MiB, %llu ended a pass), refused: %llu in an open pass, %llu crossing a chunk, %llu without import, %llu untracked, %llu over budget; resident requests %llu (%llu refused); %zu chunks (%llu MiB), %zu table leaves\n", static_cast<unsigned long long>(s.obtained), static_cast<unsigned long long>(s.clean), static_cast<unsigned long long>(s.uploaded), static_cast<double>(s.uploadBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(s.passBreaks), static_cast<unsigned long long>(s.refusedInPass), static_cast<unsigned long long>(s.crossing), static_cast<unsigned long long>(s.noImport), static_cast<unsigned long long>(s.untracked), static_cast<unsigned long long>(s.overBudget), static_cast<unsigned long long>(s.resident), static_cast<unsigned long long>(s.residentRefused), state.chunks.size(), static_cast<unsigned long long>(state.chunks.size() * (ChunkBytes >> 20u)), state.leaves.size());
+    std::fprintf(stderr, "[bufcache] (10 s) %llu obtained: %llu clean, %llu uploaded (%.1f MiB, %llu ended a pass), refused: %llu in an open pass, %llu crossing a chunk, %llu without import, %llu untracked, %llu over budget; resident requests %llu (%llu refused); %llu read from resident staging, %llu refused as rewritten; %zu chunks (%llu MiB), %zu table leaves\n", static_cast<unsigned long long>(s.obtained), static_cast<unsigned long long>(s.clean), static_cast<unsigned long long>(s.uploaded), static_cast<double>(s.uploadBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(s.passBreaks), static_cast<unsigned long long>(s.refusedInPass), static_cast<unsigned long long>(s.crossing), static_cast<unsigned long long>(s.noImport), static_cast<unsigned long long>(s.untracked), static_cast<unsigned long long>(s.overBudget), static_cast<unsigned long long>(s.resident), static_cast<unsigned long long>(s.residentRefused), static_cast<unsigned long long>(s.residentSourced), static_cast<unsigned long long>(s.refusedRewritten), state.chunks.size() + state.spans.size(), static_cast<unsigned long long>(cachedBytes(state) >> 20u), state.leaves.size());
     state.stats = {};
 }
 
@@ -102,33 +114,84 @@ bool worthPassBreak(const Chunk& chunk, std::size_t block) {
 void resetFor(Cache& state, VkDevice device) {
     if (state.device == device) return;
     state.chunks.clear();
+    state.spans.clear();
+    state.spanBytes = 0;
     state.leaves.clear();
     state.root.reset();
     state.residentRanges.clear();
     state.device = device;
 }
 
-Chunk* chunkFor(Cache& state, const Context& context, std::uint64_t chunkBase) {
-    if (auto found = state.chunks.find(chunkBase); found != state.chunks.end()) return &found->second;
-    if (state.chunks.size() >= budgetChunks()) {
-        ++state.stats.overBudget;
-        return nullptr;
-    }
+Chunk makeChunk(const Context& context, std::uint64_t bytes) {
     Chunk chunk;
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (context.bufferDeviceAddress) usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    chunk.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(ChunkBytes), usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    return &state.chunks.emplace(chunkBase, std::move(chunk)).first->second;
+    chunk.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    chunk.bytes = bytes;
+    const auto blocks = static_cast<std::size_t>(bytes / BlockBytes);
+    chunk.uploaded.assign(blocks, 0);
+    chunk.uses.assign(blocks, 0);
+    chunk.uploads.assign(blocks, 0);
+    return chunk;
+}
+
+std::uint64_t cachedBytes(const Cache& state) {
+    return state.chunks.size() * ChunkBytes + state.spanBytes;
+}
+
+Chunk* chunkFor(Cache& state, const Context& context, std::uint64_t chunkBase) {
+    if (auto found = state.chunks.find(chunkBase); found != state.chunks.end()) return &found->second;
+    if (cachedBytes(state) + ChunkBytes > budgetChunks() * ChunkBytes) {
+        ++state.stats.overBudget;
+        return nullptr;
+    }
+    return &state.chunks.emplace(chunkBase, makeChunk(context, ChunkBytes)).first->second;
+}
+
+// The span holding [begin, end), made (chunk-aligned) when none does; spans it covers wholly are
+// dropped (their buffers kept by the recorder for work already recorded).
+Chunk* spanFor(Cache& state, const Context& context, Recorder& recorder, std::uint64_t begin, std::uint64_t end, std::uint64_t& spanBase) {
+    for (auto it = state.spans.upper_bound(begin); it != state.spans.begin();) {
+        --it;
+        if (it->first + SpanMaxBytes <= begin) break;
+        if (it->first <= begin && end <= it->first + it->second.bytes) {
+            spanBase = it->first;
+            return &it->second;
+        }
+    }
+    spanBase = begin / ChunkBytes * ChunkBytes;
+    const auto spanEnd = (end + ChunkBytes - 1) / ChunkBytes * ChunkBytes;
+    const auto bytes = spanEnd - spanBase;
+    if (bytes > SpanMaxBytes) {
+        ++state.stats.crossing;
+        return nullptr;
+    }
+    for (auto it = state.spans.lower_bound(spanBase); it != state.spans.end() && it->first < spanEnd;) {
+        if (it->first + it->second.bytes > spanEnd) {
+            ++it;
+            continue;
+        }
+        recorder.Keep(it->second.buffer, 0);
+        state.spanBytes -= it->second.bytes;
+        it = state.spans.erase(it);
+    }
+    if (cachedBytes(state) + bytes > budgetChunks() * ChunkBytes) {
+        ++state.stats.overBudget;
+        return nullptr;
+    }
+    state.spanBytes += bytes;
+    return &state.spans.insert_or_assign(spanBase, makeChunk(context, bytes)).first->second;
 }
 
 // Records the upload of the blocks of `chunk` that [from, to) touches and that changed since their
 // last upload (all of them when `allChanged`), from `import`. With `mayRefuse`, an upload that would
 // end an open render pass for frequently rewritten blocks is not made and false is returned.
-bool syncBlocks(Cache& state, const Context& context, Recorder& recorder, Chunk& chunk, std::uint64_t chunkBase, std::uint64_t from, std::uint64_t to, const HostImport& import, std::uint64_t generation, bool allChanged, bool mayRefuse) {
+bool syncBlocks(Cache& state, const Context& context, Recorder& recorder, Chunk& chunk, std::uint64_t chunkBase, std::uint64_t from, std::uint64_t to, const HostImport& import, std::uint64_t generation, bool allChanged, bool mayRefuse, bool refuseRewritten = false) {
     const auto firstBlock = static_cast<std::size_t>((from - chunkBase) / BlockBytes);
     const auto lastBlock = static_cast<std::size_t>((to - 1 - chunkBase) / BlockBytes);
     const auto blocks = lastBlock - firstBlock + 1;
-    std::array<std::uint8_t, BlocksPerChunk> changed{};
+    thread_local std::vector<std::uint8_t> changed;
+    changed.assign(blocks, 0);
     const auto blockBase = chunkBase + firstBlock * BlockBytes;
     GuestMemory::ChangedBlocks(blockBase, static_cast<std::size_t>(blocks * BlockBytes), std::span<const std::uint64_t>(chunk.uploaded.data() + firstBlock, blocks), std::span<std::uint8_t>(changed.data(), blocks));
     bool dirty = false;
@@ -148,6 +211,11 @@ bool syncBlocks(Cache& state, const Context& context, Recorder& recorder, Chunk&
     const bool passOpen = recorder.RenderPassOpen();
     if (mayRefuse && passOpen && !worth) {
         ++state.stats.refusedInPass;
+        return false;
+    }
+    // Rewritten about every use (GPU-built lists in host memory): not worth a copy at all.
+    if (refuseRewritten && !worth) {
+        ++state.stats.refusedRewritten;
         return false;
     }
     // The changed blocks, clipped to the import (a block partly outside it stays marked as never
@@ -201,8 +269,11 @@ Buffer* tableRoot(Cache& state, const Context& context, Recorder& recorder) {
 
 // Writes the table entries of a chunk's pages (creating its leaf if needed). Entries are written
 // with vkCmdUpdateBuffer in queue order, so work recorded after this call sees them.
-bool mapChunk(Cache& state, const Context& context, Recorder& recorder, Chunk& chunk, std::uint64_t chunkBase) {
-    if (chunk.mapped) return true;
+bool mapChunk(Cache& state, const Context& context, Recorder& recorder, Chunk& chunk, std::uint64_t chunkBase, std::uint64_t from, std::uint64_t to) {
+    const auto firstPage = static_cast<std::size_t>((from - chunkBase + TablePageBytes - 1) / TablePageBytes);
+    const auto lastPage = static_cast<std::size_t>((to - chunkBase) / TablePageBytes);
+    if (firstPage >= lastPage) return false;
+    if (std::all_of(chunk.mapped.begin() + firstPage, chunk.mapped.begin() + lastPage, [](bool mapped) { return mapped; })) return true;
     auto* root = tableRoot(state, context, recorder);
     if (root == nullptr || chunk.buffer->DeviceAddress() == 0) return false;
     const auto rootIndex = chunkBase >> BufferCacheTableLeafBits;
@@ -219,34 +290,48 @@ bool mapChunk(Cache& state, const Context& context, Recorder& recorder, Chunk& c
         update(commands, root->Handle(), rootIndex * sizeof(std::uint64_t), sizeof(leafAddress), &leafAddress);
     }
     std::array<std::uint64_t, ChunkBytes / TablePageBytes> entries{};
-    for (std::size_t page = 0; page < entries.size(); ++page) entries[page] = chunk.buffer->DeviceAddress() + page * TablePageBytes;
+    for (std::size_t page = firstPage; page < lastPage; ++page) entries[page] = chunk.buffer->DeviceAddress() + page * TablePageBytes;
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-    const auto leafOffset = ((chunkBase & (LeafSpan - 1)) / TablePageBytes) * sizeof(std::uint64_t);
-    update(commands, leaf->Handle(), leafOffset, sizeof(entries), entries.data());
+    const auto leafOffset = (((chunkBase & (LeafSpan - 1)) / TablePageBytes) + firstPage) * sizeof(std::uint64_t);
+    update(commands, leaf->Handle(), leafOffset, (lastPage - firstPage) * sizeof(std::uint64_t), entries.data() + firstPage);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    chunk.mapped = true;
+    std::fill(chunk.mapped.begin() + firstPage, chunk.mapped.begin() + lastPage, true);
     return true;
 }
 
 }
 
-bool BufferCacheEnabled() {
-    static const bool enabled = [] {
+int BufferCacheMode() {
+    static const int mode = [] {
         const char* text = std::getenv("APS5_BUFFER_CACHE");
-        return text != nullptr && text[0] != '0';
+        return text != nullptr ? std::atoi(text) : 0;
     }();
-    return enabled;
+    return mode;
 }
 
-std::optional<CachedBufferRange> ObtainCachedBuffer(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, bool* behindGpuWrite) {
-    if (!BufferCacheEnabled() || bytes == 0 || bytes > ChunkBytes || address > std::numeric_limits<std::uint64_t>::max() - bytes) return std::nullopt;
+bool BufferCacheEnabled() {
+    return BufferCacheMode() > 0;
+}
+
+std::optional<CachedBufferRange> ObtainCachedBuffer(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, bool* behindGpuWrite, bool mayRefuse, bool refuseRewritten) {
+    if (!BufferCacheEnabled() || bytes == 0 || bytes > SpanMaxBytes || address > std::numeric_limits<std::uint64_t>::max() - bytes) return std::nullopt;
     auto& state = cache();
     const auto end = address + bytes;
-    const auto chunkBase = address / ChunkBytes * ChunkBytes;
-    if ((end - 1) / ChunkBytes != address / ChunkBytes) {
-        std::lock_guard lock(state.mutex);
-        ++state.stats.crossing;
-        return std::nullopt;
+    const bool crossing = (end - 1) / ChunkBytes != address / ChunkBytes;
+    // Mode 2: data GPU work wrote into a resident staging copy (compute-built index lists, skinned
+    // vertices) is read there, as KytyPS5 reads GPU-written buffers from their cache buffer: no copy
+    // back to guest memory and up again. The caller's barrier orders the read after the writers.
+    if (BufferCacheMode() >= 2) {
+        if (auto resident = ResidentDrawSource(context.device, address, bytes)) {
+            recorder.Keep(resident->keep, 0);
+            recorder.NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+            std::lock_guard lock(state.mutex);
+            ++state.stats.obtained;
+            ++state.stats.residentSourced;
+            report(state);
+            if (behindGpuWrite != nullptr) *behindGpuWrite = true;
+            return CachedBufferRange{resident->buffer, resident->offset, true};
+        }
     }
     // The checks and flushes of an in-place read: pending image results and resident copies over
     // the range go to guest memory (recorded), queued labels and copied writers refuse, and the
@@ -264,11 +349,12 @@ std::optional<CachedBufferRange> ObtainCachedBuffer(const Context& context, Reco
     const auto generation = GuestMemory::CollectWrites(address, bytes);
     if (generation == 0) return refuse(&Stats::untracked);
     resetFor(state, context.device);
-    auto* chunk = chunkFor(state, context, chunkBase);
+    std::uint64_t chunkBase = address / ChunkBytes * ChunkBytes;
+    auto* chunk = crossing ? spanFor(state, context, recorder, address, end, chunkBase) : chunkFor(state, context, chunkBase);
     if (chunk == nullptr) return refuse(nullptr);
     // Recorded GPU work writing the range stamped its blocks when it was recorded, but a resident
     // copy-back or image store the flush above just recorded may not have: such a range is copied.
-    if (!syncBlocks(state, context, recorder, *chunk, chunkBase, address, end, *import, generation, behind, true)) return refuse(nullptr);
+    if (!syncBlocks(state, context, recorder, *chunk, chunkBase, address, end, *import, generation, behind, mayRefuse, refuseRewritten)) return refuse(nullptr);
     // The upload (if any) was recorded after every recorded writer, behind its barriers.
     if (behindGpuWrite != nullptr) *behindGpuWrite = false;
     report(state);
@@ -321,7 +407,7 @@ bool MakeResident(const Context& context, Recorder& recorder, std::uint64_t addr
         const auto generation = import != nullptr ? GuestMemory::CollectWrites(from, static_cast<std::size_t>(to - from)) : 0;
         resetFor(state, context.device);
         auto* chunk = import != nullptr && generation != 0 ? chunkFor(state, context, chunkBase) : nullptr;
-        if (chunk == nullptr || !mapChunk(state, context, recorder, *chunk, chunkBase) || !syncBlocks(state, context, recorder, *chunk, chunkBase, from, to, *import, generation, behind, false)) {
+        if (chunk == nullptr || !syncBlocks(state, context, recorder, *chunk, chunkBase, from, to, *import, generation, behind, false) || !mapChunk(state, context, recorder, *chunk, chunkBase, from, to)) {
             ++state.stats.residentRefused;
             whole = false;
         } else {
