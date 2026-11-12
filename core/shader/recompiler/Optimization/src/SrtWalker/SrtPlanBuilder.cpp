@@ -26,7 +26,7 @@ void PlanBuilder::Run() {
                     }
                 }
             }
-            if (IsDescriptorHandle(inst->Opcode())) {
+            if (IsDescriptorHandle(inst->Opcode()) && (!_imagesOnly || inst->Opcode() == IrOpcode::GetImageResource || inst->Opcode() == IrOpcode::GetSamplerResource)) {
                 for (std::size_t index = 0; index < inst->ArgumentCount(); index++) {
                     Collect(inst->Argument(index), 0);
                 }
@@ -34,6 +34,7 @@ void PlanBuilder::Run() {
         }
     }
     for (auto& block : _program.Blocks()) {
+        if (_imagesOnly) break;
         for (IrValue* inst : block->Instructions()) {
             if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {
                 Collect(inst, inst->Flags<MemoryFlags>().pc);

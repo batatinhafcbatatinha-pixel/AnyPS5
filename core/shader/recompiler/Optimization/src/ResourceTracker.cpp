@@ -2187,7 +2187,10 @@ private:
         std::uint32_t badDword = 0;
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
-        if (!m_program.Resources().gpuSrt && ValidateSource(descriptor, badDword)) {
+        // APS5_GPU_SRT: only a V# loaded from memory is read by the shader itself; one built from user
+        // data or constants needs no capture read and stays a bound descriptor, as before.
+        const bool gpuRead = m_program.Resources().gpuSrt && LoadedFromMemory(descriptor);
+        if (!gpuRead && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");
@@ -2200,6 +2203,26 @@ private:
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
         return true;
+    }
+
+    static bool LoadedFromMemory(const DescriptorSource& descriptor) {
+        std::vector<const IrValue*> pending;
+        std::unordered_set<const IrValue*> seen;
+        for (std::uint32_t dword = 0; dword < descriptor.dwordCount && dword < descriptor.dwords.size(); ++dword) {
+            if (descriptor.dwords[dword] != nullptr) pending.push_back(descriptor.dwords[dword]->Resolve());
+        }
+        while (!pending.empty()) {
+            const IrValue* value = pending.back();
+            pending.pop_back();
+            if (value == nullptr || !seen.insert(value).second) continue;
+            const auto op = value->Opcode();
+            if (op == IrOpcode::ReadConst || AccessesMemory(op)) return true;
+            if (seen.size() > 4096u) return true;
+            for (std::size_t argument = 0; argument < value->ArgumentCount(); ++argument) {
+                if (value->Argument(argument) != nullptr) pending.push_back(value->Argument(argument)->Resolve());
+            }
+        }
+        return false;
     }
 
     void ValidateAddressHandle(IrValue* value) const {

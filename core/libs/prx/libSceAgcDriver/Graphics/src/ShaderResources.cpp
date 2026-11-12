@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -1931,27 +1932,6 @@ void ShaderResources::forgetDeferredInputs() {
     deferredSnapshots = {};
 }
 
-bool TraceImageAddress(std::uint64_t address);
-void AddTracedImageAddress(std::uint64_t address);
-
-namespace {
-// APS5_TRACE_COMPOSITE: the 3840x2160 color target of a draw build, from buildPrepare to buildComplete.
-std::uint64_t compositeTraceTarget(const void* resources, std::uint64_t address, bool take) {
-    static std::mutex mutex;
-    static std::unordered_map<const void*, std::uint64_t> targets;
-    std::lock_guard lock(mutex);
-    if (!take) {
-        targets[resources] = address;
-        return address;
-    }
-    const auto found = targets.find(resources);
-    if (found == targets.end()) return 0;
-    const auto value = found->second;
-    targets.erase(found);
-    return value;
-}
-}
-
 void ShaderResources::build(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
     buildPrepare(shaders, target, colorAttachments, indexAddress, indexBytes);
     buildComplete();
@@ -2274,7 +2254,6 @@ void ValidateRuntimeResources(const CompiledShader& shader, std::span<const std:
 }
 
 void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
-    if (std::getenv("APS5_TRACE_COMPOSITE") != nullptr && target != nullptr && ((target->extent.width == 3840u && target->extent.height == 2160u) || TraceImageAddress(target->address))) compositeTraceTarget(this, target->address, false);
     registeredImageViews.clear();
     for (const auto& shader : shaders) if (shader.registeredImageViews != nullptr) registeredImageViews.insert(registeredImageViews.end(), shader.registeredImageViews->begin(), shader.registeredImageViews->end());
     Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed after resource capture");
@@ -2857,34 +2836,6 @@ void ShaderResources::buildComplete() {
             dataPatches.push_back({static_cast<std::size_t>(allocation.dataAllocation), allocation.dataByte, allocation.adjustment});
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
-        // Debug aid: APS5_TRACE_COMPOSITE=<s> lists, for 4 s from <s> seconds after the first build,
-        // the sampled textures of every pass writing a 3840x2160 target or storage image.
-        static const double traceCompositeAt = [] {
-            const char* value = std::getenv("APS5_TRACE_COMPOSITE");
-            return value != nullptr ? std::atof(value) : -1.0;
-        }();
-        if (traceCompositeAt >= 0.0) {
-            static const auto traceStart = std::chrono::steady_clock::now();
-            const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - traceStart).count();
-            const auto big = [](std::uint32_t width, std::uint32_t height) { return width == 3840u && height == 2160u; };
-            std::uint64_t written = 0;
-            const auto drawTarget = compositeTraceTarget(this, 0, true);
-            if (drawTarget != 0) written = drawTarget;
-            for (const auto& image : storageTextures) {
-                if (image != nullptr && (big(image->Descriptor().width, image->Descriptor().height) || TraceImageAddress(image->Descriptor().baseAddress))) written = image->Descriptor().baseAddress;
-            }
-            if (written != 0 && elapsed >= traceCompositeAt && elapsed < traceCompositeAt + 4.0) {
-                for (const auto& image : storageTextures) {
-                    if (image != nullptr) std::fprintf(stderr, "[composite]   storage image=%p base=0x%llx %ux%u fmt=%u ver=%llu\n", reinterpret_cast<void*>(image->Image()), static_cast<unsigned long long>(image->Descriptor().baseAddress), image->Descriptor().width, image->Descriptor().height, image->Descriptor().format, static_cast<unsigned long long>(image->Version()));
-                }
-                std::fprintf(stderr, "[composite] t=%.3f %s writes 0x%llx: %zu textures, %zu lookups\n", elapsed, drawTarget != 0 ? "draw" : "dispatch", static_cast<unsigned long long>(written), textures.size(), lookupLog().size());
-                for (const auto& record : lookupLog()) {
-                    if (drawTarget != 0 && textures.size() == 7u && record.resource.width == 1280u && record.resource.height == 720u) AddTracedImageAddress(record.resource.baseAddress);
-                }
-                for (const auto& record : lookupLog()) std::fprintf(stderr, "[composite]   lookup 0x%llx %ux%u fmt=%u tile=%d obj=%p source=%p srcver=%llu gen=%llu\n", static_cast<unsigned long long>(record.resource.baseAddress), record.resource.width, record.resource.height, record.resource.format, static_cast<int>(record.resource.tileMode), record.object, static_cast<const void*>(record.source), static_cast<unsigned long long>(record.source != nullptr ? record.source->Version() : 0), static_cast<unsigned long long>(record.generation));
-                for (const auto& texture : textures) std::fprintf(stderr, "[composite]   bound obj=%p storage=%p ver=%llu addr=0x%llx\n", static_cast<const void*>(texture.get()), texture != nullptr ? static_cast<const void*>(texture->StorageSource()) : nullptr, static_cast<unsigned long long>(texture != nullptr && texture->StorageSource() != nullptr ? texture->StorageSource()->Version() : 0), static_cast<unsigned long long>(texture != nullptr && texture->StorageSource() != nullptr ? texture->StorageSource()->Descriptor().baseAddress : 0));
-            }
-        }
         noteReusable();
         completed = true;
         if (BuildProfiled()) {
@@ -4629,6 +4580,12 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
             guestMemory.RecordStagingCopies(*recorder);
+            // APS5_BUFFER_CACHE=1: address-based stages may read through the cache's page table
+            // (BdaResources), whose resident pages are brought up to date before this use.
+            if (usesBda && BufferCacheEnabled()) {
+                MakeQueuedResident(context, *recorder);
+                SyncResident(context, *recorder);
+            }
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
             return finish(fast, false);

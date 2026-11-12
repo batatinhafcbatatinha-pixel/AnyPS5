@@ -6395,7 +6395,12 @@ std::optional<ResidentSource> ResidentSourceFor(VkDevice device, VkBuffer import
         std::lock_guard lock(registry.mutex);
         const auto found = std::find_if(registry.entries.begin(), registry.entries.end(), [&](const ResidentEntry& entry) { return entry.context.device == device && entry.copySource == import && entry.begin <= address && end <= entry.end; });
         if (found == registry.entries.end()) return std::nullopt;
-        if (GuestMemory::UnchangedSinceCollected(address, bytes, found->generation)) {
+        // The copy serves the upload only while nothing has written the range since it was taken:
+        // neither the CPU nor stored GPU results (an image write-back lands in the import, not in
+        // this copy). A CPU-only check let a copy taken before such stores keep feeding refreshes
+        // of the image with its old texels: title B's TAA history images froze at the last frame
+        // of a cutscene and one display buffer in three showed it for the rest of the session.
+        if (GuestMemory::UnchangedSinceCollected(address, bytes, found->generation) && GuestMemory::UnchangedSince(address, bytes, found->generation)) {
             found->lastUse = ++registry.clock;
             registry.sourced.fetch_add(1, std::memory_order_relaxed);
             registry.sourcedBytes.fetch_add(bytes, std::memory_order_relaxed);

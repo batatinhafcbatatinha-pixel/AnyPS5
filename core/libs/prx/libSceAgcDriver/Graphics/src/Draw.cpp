@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -49,9 +50,6 @@
 #include <utility>
 
 namespace AgcDriver::Graphics {
-
-// Texture.cpp, APS5_TRACE_IMAGES (debug aid).
-bool TraceImageAddress(std::uint64_t address);
 
 void WriteCheckpointMarker(const Context& context, VkCommandBuffer commands, std::uint64_t serial, std::uint32_t queue);
 void WriteNvCheckpointToken(const Context& context, VkCommandBuffer commands, std::uint64_t token, std::uint32_t queue);
@@ -1998,15 +1996,19 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
             }
         }
-        const auto* import = inputs.maxIndexUnknown ? nullptr : InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
+        // APS5_BUFFER_CACHE=1: an index range no recorded GPU work writes is bound from the device-local
+        // buffer cache (its highest index read from guest memory, as an in-place range's).
+        std::optional<CachedBufferRange> cachedIndex;
+        if (!inputs.maxIndexUnknown && BufferCacheEnabled() && !context.drawInputsInPlace && context.recorder != nullptr && !state.stages.mesh && draw.indexAddress % draw.indexSize == 0 && !GpuWrittenDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes))) cachedIndex = ObtainCachedBuffer(context, *context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes));
+        const auto* import = inputs.maxIndexUnknown || cachedIndex.has_value() ? nullptr : InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
         if (inputs.maxIndexUnknown) {
             // Bound above; nothing of the CPU path below applies.
         } else {
-        if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        if (import == nullptr && !cachedIndex.has_value()) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
-        if (import != nullptr) {
+        if (import != nullptr || cachedIndex.has_value()) {
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
             highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
@@ -2030,6 +2032,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
                 highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
                 import = nullptr;
+                cachedIndex.reset();
                 copy = DrawInputCopy{};
                 copy.buffer = std::move(clamped);
                 if (!highest) {
@@ -2047,6 +2050,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import != nullptr) {
             inputs.indexHandle = import->buffer;
             inputs.indexOffset = HostImportOffset(*import, draw.indexAddress);
+            inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
+        } else if (cachedIndex.has_value()) {
+            inputs.indexHandle = cachedIndex->buffer;
+            inputs.indexOffset = cachedIndex->offset;
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
         } else {
             inputs.indices = std::move(copy.buffer);
@@ -2123,6 +2130,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // batch and wait for the GPU (the flush hook's sync), stalling the committer. Debug aid:
         // APS5_NO_GPU_WRITTEN_INPUTS_IN_PLACE=1 copies those too.
         static const bool gpuWrittenInPlace = std::getenv("APS5_NO_GPU_WRITTEN_INPUTS_IN_PLACE") == nullptr;
+        // APS5_BUFFER_CACHE=1: the range is bound from the device-local buffer cache (BufferCache.cpp),
+        // which uploads only its changed blocks; the old paths below remain for what it refuses.
+        if (BufferCacheEnabled() && !context.drawInputsInPlace && context.recorder != nullptr && begin % plan.alignments[range] == 0) {
+            bool behind = false;
+            if (const auto cached = ObtainCachedBuffer(context, *context.recorder, begin, bytes, &behind)) {
+                inputs.vertexInputBehindGpuWrite = inputs.vertexInputBehindGpuWrite || behind;
+                rangeHandles.push_back(cached->buffer);
+                rangeOffsets.push_back(cached->offset);
+                inputs.inPlaceReads.emplace_back(begin, end);
+                continue;
+            }
+        }
         const bool forceInPlace = !context.drawInputsInPlace && ((gpuWrittenInPlace && GpuWrittenDrawInput(context, begin, bytes)) || inputs.maxIndexUnknown);
         if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite, forceInPlace)) {
             if (forceInPlace) {
@@ -3562,7 +3581,6 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
-            if (TraceImageAddress(color.address)) std::fprintf(stderr, "[image-trace] draw target 0x%llx %ux%u vkfmt=%d mip=%u slice=%u: image=%p base=0x%llx %ux%u fmt=%u ver=%llu\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), color.mip, color.arraySlice, reinterpret_cast<void*>(binding.resident->Image()), static_cast<unsigned long long>(binding.resident->Descriptor().baseAddress), binding.resident->Descriptor().width, binding.resident->Descriptor().height, binding.resident->Descriptor().format, static_cast<unsigned long long>(binding.resident->Version()));
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
             targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
             continue;

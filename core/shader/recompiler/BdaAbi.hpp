@@ -11,6 +11,14 @@ namespace ShaderRecompiler::BdaAbi {
 inline constexpr std::uint32_t Version = 1;
 inline constexpr std::uint32_t Read = 1;
 inline constexpr std::uint32_t Write = 2;
+// Header::reserved bit 0: the buffer cache's two-level page table root (a u64 device address) follows
+// the last Range. Read-only lookups then try root[A >> CacheLeafShift] -> leaf,
+// leaf[(A & ((1 << CacheLeafShift) - 1)) >> CachePageShift] -> page device address (0: not resident)
+// before the range search. Must match Graphics/include/BufferCache.hpp.
+inline constexpr std::uint32_t CacheRootFlag = 1;
+inline constexpr std::uint32_t CachePageShift = 14;
+inline constexpr std::uint32_t CacheLeafShift = 30;
+inline constexpr std::uint64_t CacheRoots = 1024;
 
 struct Header {
     std::uint32_t version;
@@ -65,12 +73,42 @@ inline constexpr std::uint32_t WrittenSlotsWord = WrittenCountWord + 1;
 inline constexpr std::uint32_t WrittenListWord = WrittenSlotsWord + 2 * WrittenPageSlots;
 inline constexpr std::uint32_t SrtGuardWord = WrittenListWord + WrittenPageSlots;
 inline constexpr std::uint32_t SrtGuardStageShift = 24;
-inline constexpr std::size_t FaultBufferBytes = (SrtGuardWord + 1) * sizeof(std::uint32_t);
+// Accessed pages (APS5_GPU_SRT with the buffer cache root present): a read lookup that missed the
+// cache page table but resolved through a range notes its 2^CachePageShift-byte page here: key
+// (A >> CachePageShift) + 1 claimed in AccessedSlotsWord (open addressing, AccessedPageProbes probes),
+// the claimed slot index appended at AccessedListWord, AccessedCountWord counting them. Graphics makes
+// the pages resident after the batch and clears the region (ForEachAccessedPage).
+inline constexpr std::uint32_t AccessedPageSlots = 512;
+inline constexpr std::uint32_t AccessedPageProbes = 8;
+inline constexpr std::uint32_t AccessedCountWord = SrtGuardWord + 1;
+inline constexpr std::uint32_t AccessedSlotsWord = AccessedCountWord + 1;
+inline constexpr std::uint32_t AccessedListWord = AccessedSlotsWord + AccessedPageSlots;
+inline constexpr std::size_t FaultBufferBytes = (AccessedListWord + AccessedPageSlots) * sizeof(std::uint32_t);
+static_assert((AccessedPageSlots & (AccessedPageSlots - 1)) == 0);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
 static_assert(WrittenChunkPages == 32);
 
 inline constexpr std::uint32_t WrittenChunkKey(std::uint64_t address) {
     return static_cast<std::uint32_t>(address >> WrittenChunkShift) + 1u;
+}
+
+// Calls visit(page address) for each noted accessed page and clears the region. False on a
+// malformed record (the region is left as is).
+template<typename TVisit>
+bool ForEachAccessedPage(std::uint32_t* words, std::uint32_t pageShift, TVisit&& visit) {
+    const auto count = words[AccessedCountWord];
+    if (count > AccessedPageSlots) return false;
+    for (std::uint32_t claim = 0; claim < count; ++claim) {
+        const auto slot = words[AccessedListWord + claim];
+        if (slot >= AccessedPageSlots || words[AccessedSlotsWord + slot] == 0) return false;
+    }
+    for (std::uint32_t claim = 0; claim < count; ++claim) {
+        const auto slot = words[AccessedListWord + claim];
+        visit(static_cast<std::uint64_t>(words[AccessedSlotsWord + slot] - 1u) << pageShift);
+        words[AccessedSlotsWord + slot] = 0;
+    }
+    words[AccessedCountWord] = 0;
+    return true;
 }
 
 template<typename TMark>

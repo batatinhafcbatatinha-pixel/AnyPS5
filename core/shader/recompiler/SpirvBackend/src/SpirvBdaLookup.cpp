@@ -64,21 +64,69 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         }
         leaveIf(binary(spv::OpINotEqual, boolean, reason, constant(0u)), reason);
     };
+    std::vector<std::uint32_t> pendingMerges;
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
     const auto count = BdaLoadWord(state, constant(1));
-    const auto available = binary(spv::OpISub, u32, length, constant(4));
+    // Header word 3 bit 0 (BdaAbi::CacheRootFlag): the device address of the buffer cache's page table
+    // root (Graphics BufferCache.hpp) follows the last range as two words.
+    const auto flags = BdaLoadWord(state, constant(3));
+    const auto cached = binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, flags, constant(BdaAbi::CacheRootFlag)), constant(0));
+    const auto available = binary(spv::OpISub, u32, binary(spv::OpISub, u32, length, constant(4)), Select(state, u32, cached, constant(2), constant(0)));
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
     failFirst({
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable},
-        {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)), BdaAbi::FaultReason::InvalidTable},
+        {binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, flags, constant(~BdaAbi::CacheRootFlag)), constant(0)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow},
     });
+    if (permission == BdaAbi::Read && state.program.Resources().gpuSrt) {
+        // Read-only fast path: root[A >> RootShift] -> leaf, leaf[(A & leaf mask) >> PageShift] -> page,
+        // device = page + (A & page mask), when the page is resident and the bytes stay in it; any 0
+        // entry falls through to the range search below.
+        const auto physicalU64 = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, u64);
+        const auto loadEntry = [&](std::uint32_t at) {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToPtr, physicalU64, pointer, at);
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, u64, value, pointer, spv::MemoryAccessAlignedMask, 8u);
+            return value;
+        };
+        const auto rootIndex = binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::CacheLeafShift));
+        const auto inRoot = binary(spv::OpULessThan, boolean, rootIndex, BdaConstant(state, BdaAbi::CacheRoots));
+        const auto pageOffset = binary(spv::OpBitwiseAnd, u64, address, BdaConstant(state, (std::uint64_t{1} << BdaAbi::CachePageShift) - 1u));
+        const auto inPage = binary(spv::OpULessThanEqual, boolean, binary(spv::OpIAdd, u64, pageOffset, Unary(state, spv::OpUConvert, u64, bytes)), BdaConstant(state, std::uint64_t{1} << BdaAbi::CachePageShift));
+        const auto tryTable = binary(spv::OpLogicalAnd, boolean, binary(spv::OpLogicalAnd, boolean, cached, inRoot), inPage);
+        const auto zero64 = BdaConstant(state, 0u);
+        const auto page = EmitValueIfElse(state, tryTable, u64, [&] {
+            const auto root = BdaLoadAddress(state, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, count, constant(8))));
+            const auto leaf = EmitValueIfElse(state, binary(spv::OpINotEqual, boolean, root, zero64), u64, [&] {
+                return loadEntry(binary(spv::OpIAdd, u64, root, binary(spv::OpShiftLeftLogical, u64, rootIndex, BdaConstant(state, 3u))));
+            }, [&] { return zero64; });
+            return EmitValueIfElse(state, binary(spv::OpINotEqual, boolean, leaf, zero64), u64, [&] {
+                const auto leafIndex = binary(spv::OpShiftRightLogical, u64, binary(spv::OpBitwiseAnd, u64, address, BdaConstant(state, (std::uint64_t{1} << BdaAbi::CacheLeafShift) - 1u)), BdaConstant(state, BdaAbi::CachePageShift));
+                return loadEntry(binary(spv::OpIAdd, u64, leaf, binary(spv::OpShiftLeftLogical, u64, leafIndex, BdaConstant(state, 3u))));
+            }, [&] { return zero64; });
+        }, [&] { return zero64; });
+        const auto hit = state.module.AllocateId();
+        const auto miss = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, miss, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, binary(spv::OpINotEqual, boolean, page, zero64), hit, miss);
+        EmitLabel(state, hit);
+        if (rangeResult) {
+            const auto pageBegin = binary(spv::OpISub, u64, address, pageOffset);
+            const auto range = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, pageBegin, binary(spv::OpIAdd, u64, pageBegin, BdaConstant(state, std::uint64_t{1} << BdaAbi::CachePageShift)), page);
+            leave(range);
+        } else {
+            leave(binary(spv::OpIAdd, u64, page, pageOffset));
+        }
+        EmitLabel(state, miss);
+    }
     const auto header = state.module.AllocateId();
     const auto body = state.module.AllocateId();
     const auto continuation = state.module.AllocateId();
@@ -125,6 +173,44 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         {binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow},
         {binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow},
     });
+    if (permission == BdaAbi::Read && state.program.Resources().gpuSrt && state.faultBufferVariable != 0) {
+        // The page table missed (or is absent): tell Graphics this page is used (cache flag only).
+        EmitIfCondition(state, cached, [&] {
+            const auto key = binary(spv::OpIAdd, u32, Unary(state, spv::OpUConvert, u32, binary(spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::CachePageShift))), constant(1u));
+            const auto hash = binary(spv::OpShiftRightLogical, u32, binary(spv::OpIMul, u32, key, constant(0x9e3779b1u)), constant(32u - static_cast<std::uint32_t>(std::countr_zero(BdaAbi::AccessedPageSlots))));
+            const auto scope = constant(spv::ScopeDevice);
+            const auto relaxed = constant(spv::MemorySemanticsMaskNone);
+            for (std::uint32_t probe = 0; probe < BdaAbi::AccessedPageProbes; ++probe) {
+                // Unrolled probes, each skipped once an earlier one found or claimed the key.
+                const auto slot = binary(spv::OpBitwiseAnd, u32, binary(spv::OpIAdd, u32, hash, constant(probe)), constant(BdaAbi::AccessedPageSlots - 1u));
+                const auto word = binary(spv::OpIAdd, u32, constant(BdaAbi::AccessedSlotsWord), slot);
+                const auto previous = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAtomicCompareExchange, u32, previous, BdaWord(state, state.faultBufferVariable, word), scope, relaxed, relaxed, key, constant(0u));
+                EmitIfCondition(state, binary(spv::OpIEqual, boolean, previous, constant(0u)), [&] {
+                    const auto claim = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpAtomicIAdd, u32, claim, BdaWord(state, state.faultBufferVariable, constant(BdaAbi::AccessedCountWord)), scope, relaxed, constant(1u));
+                    EmitIfCondition(state, binary(spv::OpULessThan, boolean, claim, constant(BdaAbi::AccessedPageSlots)), [&] {
+                        state.module.AddFunction(spv::OpAtomicStore, BdaWord(state, state.faultBufferVariable, binary(spv::OpIAdd, u32, constant(BdaAbi::AccessedListWord), claim)), scope, relaxed, slot);
+                    });
+                });
+                // Stop probing when this slot holds the key now (claimed here or earlier).
+                const auto settled = binary(spv::OpLogicalOr, boolean, binary(spv::OpIEqual, boolean, previous, constant(0u)), binary(spv::OpIEqual, boolean, previous, key));
+                if (probe + 1u < BdaAbi::AccessedPageProbes) {
+                    const auto next = state.module.AllocateId();
+                    const auto done = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpSelectionMerge, done, spv::SelectionControlMaskNone);
+                    state.module.AddFunction(spv::OpBranchConditional, settled, done, next);
+                    EmitLabel(state, next);
+                    pendingMerges.push_back(done);
+                }
+            }
+            for (auto merge = pendingMerges.rbegin(); merge != pendingMerges.rend(); ++merge) {
+                state.module.AddFunction(spv::OpBranch, *merge);
+                EmitLabel(state, *merge);
+            }
+            pendingMerges.clear();
+        });
+    }
     if (rangeResult) {
         const auto last = binary(spv::OpUGreaterThanEqual, boolean, index, count);
         const auto next = BdaLoadAddress(state, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, Select(state, u32, last, binary(spv::OpISub, u32, index, constant(1)), index), constant(8))));

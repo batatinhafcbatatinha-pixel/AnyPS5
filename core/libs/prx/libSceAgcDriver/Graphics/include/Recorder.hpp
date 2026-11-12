@@ -82,6 +82,8 @@ public:
     // A draw's render pass is open and nothing recorded in it since its leading barrier (the pass
     // hazards' scope) wrote `ranges`: earlier writes are ordered before the pass's draws already.
     bool PassOpenWithoutWrites(GuestRangeList ranges) const;
+    // A draw's render pass is open in the open batch (Commands() would end it).
+    bool RenderPassOpen() const;
     struct OverlapStatistics {
         std::uint64_t deferred, overlapped, flushed;
     };

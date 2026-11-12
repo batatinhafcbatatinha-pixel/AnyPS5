@@ -221,6 +221,8 @@ private:
     void traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss);
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
+    static std::int64_t forwardedSlot(const DispatchVariant& variant, std::size_t word);
+    static std::shared_ptr<DispatchVariant> forwardedCopy(const DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> forwarded);
     static void patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::uint32_t slot, std::uint32_t value);
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);

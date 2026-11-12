@@ -1801,6 +1801,10 @@ void Recorder::AfterRun(std::function<void(Recorder&)> work) {
     open->afterRun.push_back(std::move(work));
 }
 
+bool Recorder::RenderPassOpen() const {
+    return open != nullptr && open->renderPass.open;
+}
+
 bool Recorder::PassOpenWithoutWrites(GuestRangeList ranges) const {
     return open != nullptr && open->renderPass.open && !RunOpen() && !open->passHazards.WritesOverlap(ranges);
 }
