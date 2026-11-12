@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "ImageTableAbi.hpp"
@@ -394,10 +396,24 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     }
     Require(ShaderRecompiler::BdaAbi::RangesOrdered(ranges.data(), ranges.size()), "BDA table ranges do not ascend by begin");
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
+    // APS5_BUFFER_CACHE=1: the buffer cache's page-table root follows the ranges (Header.reserved
+    // bit 0), for shaders that look a read up there first and fall back to the ranges when its page
+    // is not resident (BufferCache.hpp). Only where this thread holds the GPU mutex (the root's first
+    // clear is recorded).
+    std::uint64_t cacheRoot = 0;
+    if (BufferCacheEnabled() && GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) {
+            cacheRoot = BufferCacheTable(context, *recorder);
+            MakeQueuedResident(context, *recorder);
+            SyncResident(context, *recorder);
+        }
+    }
+    if (cacheRoot != 0) tableBytes += sizeof(cacheRoot);
     table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
+    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), cacheRoot != 0 ? 1u : 0u};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
     if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
+    if (cacheRoot != 0) std::memcpy(table->Bytes().data() + sizeof(header) + ranges.size() * sizeof(ranges.front()), &cacheRoot, sizeof(cacheRoot));
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
         ++cache.misses;
@@ -477,6 +493,9 @@ void BdaResources::CheckUse(const BdaResources* record) const {
 
 void BdaResources::checkFault(const BdaResources& record) const {
     if (record.faultChunk == nullptr) return;
+    // Pages GPU-side SRT reads resolved through the ranges because the cache table did not hold them:
+    // queued to become resident (BufferCache.hpp), and the record's region cleared.
+    static_cast<void>(ShaderRecompiler::BdaAbi::ForEachAccessedPage(reinterpret_cast<std::uint32_t*>(record.faultBytes().data()), ShaderRecompiler::BdaAbi::CachePageShift, [](std::uint64_t page) { QueueResident(page, std::size_t{1} << ShaderRecompiler::BdaAbi::CachePageShift); }));
     if (!reportOnly) markWrittenPages(record);
     ShaderRecompiler::BdaAbi::Fault report{};
     std::memcpy(&report, record.faultBytes().data(), sizeof(report));

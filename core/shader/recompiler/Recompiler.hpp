@@ -1041,7 +1041,8 @@ void SetDebugProbeActive(bool active);
 // D:/ps5/perf/REWRITE-STATE.md). The SRT walk is not flattened on the CPU: raw scalar loads stay
 // address reads through the BDA page table and every buffer V# is read by the shader itself
 // (MemoryInfo::gpuDescriptor). Applies to programs without image or sampler operations.
-// 0: off (default); 1: compute programs; 2: every stage.
+// 0: off (default); 1: compute programs; 2: every stage; 3: every stage and also programs with
+// images, whose image/sampler descriptors are still resolved by the CPU walk (hybrid).
 [[nodiscard]] std::uint32_t GpuSrtStages();
 
 struct RectListShaders {

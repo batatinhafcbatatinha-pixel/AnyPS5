@@ -111,7 +111,7 @@ std::uint32_t GpuSrtStages() {
     static const std::uint32_t stages = [] {
         const char* text = std::getenv("APS5_GPU_SRT");
         if (text == nullptr || *text == '\0' || std::strcmp(text, "0") == 0) return 0u;
-        return std::strcmp(text, "2") == 0 ? 2u : 1u;
+        return std::strcmp(text, "3") == 0 ? 3u : std::strcmp(text, "2") == 0 ? 2u : 1u;
     }();
     return stages;
 }

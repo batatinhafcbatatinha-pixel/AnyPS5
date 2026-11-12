@@ -112,12 +112,6 @@ void ResetCheckpointSnapshots() noexcept;
 #include <vector>
 #include <utility>
 
-namespace AgcDriver::Graphics {
-// Texture.cpp, APS5_TRACE_IMAGES (debug aid).
-std::vector<std::uint64_t> TracedImageAddresses();
-void TraceLiveImagesOver(std::uint64_t address, std::size_t bytes, const char* tag);
-}
-
 namespace AgcDriver {
 
 std::string SoftwareFallbackWarning(VkPhysicalDeviceType selectedType, std::string_view selectedName, std::string_view hardwareName, PresentationRejection rejection, bool requested) {
@@ -4132,10 +4126,6 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer, const Displ
         static std::uint64_t traced = 0;
         static const auto start = std::chrono::steady_clock::now();
         const auto written = Graphics::StorageTexture::LastWrite(buffer.address);
-        const auto cover = Graphics::StorageTexture::ClassifyFill(buffer.address, bytes);
-        for (const auto traced : Graphics::TracedImageAddresses()) Graphics::TraceLiveImagesOver(traced, 1, "flip");
-        const auto live = Graphics::StorageTexture::FindLive(buffer.address, bytes);
-        std::fprintf(stderr, "[flip-trace] images over 0x%llx: cover=%d covered=%p fmt=%u ver=%llu others=%zu inside=%zu; newest live=%p fmt=%u ver=%llu\n", static_cast<unsigned long long>(buffer.address), static_cast<int>(cover.cover), cover.image ? reinterpret_cast<void*>(cover.image->Image()) : nullptr, cover.image ? cover.image->Descriptor().format : 0u, static_cast<unsigned long long>(cover.image ? cover.image->Version() : 0), cover.others, cover.inside, live ? reinterpret_cast<void*>(live->Image()) : nullptr, live ? live->Descriptor().format : 0u, static_cast<unsigned long long>(live ? live->Version() : 0));
         std::fprintf(stderr, "[flip-trace] #%llu t=%.2f addr=0x%llx %ux%u fmt=0x%llx tile=%u dcc=0x%llx plane=0x%llx src=%s img=%p ver=%llu gen=%llu layer=%u scaled=%d desc=%ux%u/%u bytes=0x%llx lastwrite=%lld cleared=%d\n", static_cast<unsigned long long>(++traced), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, static_cast<unsigned long long>(buffer.pixelFormat), buffer.tilingMode, static_cast<unsigned long long>(buffer.dccAddress), static_cast<unsigned long long>(plane ? plane->address : 0), resident ? (convert ? "resident-convert" : "resident") : (cleared ? "clear" : "guest"), resident ? reinterpret_cast<void*>(resident->Image()) : nullptr, static_cast<unsigned long long>(resident ? resident->Version() : 0), static_cast<unsigned long long>(resident ? resident->Generation() : 0), layer, resident ? static_cast<int>(resident->Scaled()) : 0, resident ? resident->Descriptor().width : 0, resident ? resident->Descriptor().height : 0, resident ? resident->Descriptor().format : 0, static_cast<unsigned long long>(resident ? resident->GuestBytes() : 0), written ? static_cast<long long>(written->serial) : -1LL, cleared ? 1 : 0);
     }
     bool dumpFrame = false;

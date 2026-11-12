@@ -4,8 +4,94 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <span>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Why the shape entry's stages could or could not serve a draw whose register key missed: a used
+// user word changed that cannot be forwarded, the captured memory differs, served as kept, or
+// served with changed forwarded words patched into a copy of the result
+// (APS5_TRACE_DRAW_DATA_REUSE=1 prints the counts every 10 s).
+struct DataReuseCounts {
+    std::uint64_t userWords = 0, memory = 0, plain = 0, patched = 0;
+};
+
+void NoteDataReuse(const DataReuseCounts& counts) {
+    static const bool enabled = std::getenv("APS5_TRACE_DRAW_DATA_REUSE") != nullptr;
+    if (!enabled) return;
+    static std::mutex mutex;
+    static DataReuseCounts totals;
+    static auto reported = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    totals.userWords += counts.userWords;
+    totals.memory += counts.memory;
+    totals.plain += counts.plain;
+    totals.patched += counts.patched;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    std::fprintf(stderr, "[draw-data-reuse] (10 s) shape-entry stage variants: refused for a changed user word %llu, captured memory differs %llu, served %llu, served with forwarded user words patched %llu\n", static_cast<unsigned long long>(totals.userWords), static_cast<unsigned long long>(totals.memory), static_cast<unsigned long long>(totals.plain), static_cast<unsigned long long>(totals.patched));
+    totals = {};
+}
+
+// Changed user words a kept stage tolerates (APS5_DRAW_FORWARDED_HITS=1, meant for APS5_GPU_SRT=3,
+// where the SRT pointers the shader reads itself are forwarded push data): each must be one its
+// shader only reads at run time as forwarded push data (one slot of shaderDataUserWords), never
+// walked by the capture (a base or a value of the SRT walk) nor a vertex fetch register; the slot
+// is then patched as an indirect record's word is (patchForwardedWord).
+bool ForwardedHits() {
+    static const bool enabled = std::getenv("APS5_DRAW_FORWARDED_HITS") != nullptr;
+    return enabled;
+}
+
+}
+
+std::int64_t Driver::forwardedSlot(const DispatchVariant& variant, std::size_t word) {
+    if (!ForwardedHits() || word >= 64u || variant.compiled == nullptr || variant.userDataMask == ~std::uint64_t{0} || ((variant.userWordsWalked >> word) & 1u) != 0) return -1;
+    if (variant.vertexInfo != nullptr) {
+        for (const auto reg : {static_cast<std::uint32_t>(variant.vertexInfo->fetchAttribReg), static_cast<std::uint32_t>(variant.vertexInfo->fetchBufferReg)}) {
+            if (word == reg || word == static_cast<std::size_t>(reg) + 1u) return -1;
+        }
+    }
+    const auto& slots = variant.compiled->shaderDataUserWords;
+    const auto found = std::find(slots.begin(), slots.end(), static_cast<std::uint32_t>(word));
+    if (found == slots.end() || std::find(found + 1, slots.end(), static_cast<std::uint32_t>(word)) != slots.end()) return -1;
+    return found - slots.begin();
+}
+
+std::shared_ptr<DispatchVariant> Driver::forwardedCopy(const DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> forwarded) {
+    auto result = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    for (const auto& [slot, value] : forwarded) patchForwardedWord(*result, slot, value);
+    auto copy = std::make_shared<DispatchVariant>();
+    copy->runs = variant.runs;
+    copy->words = variant.words;
+    copy->shared = variant.shared;
+    copy->forgetSerial = variant.forgetSerial;
+    copy->compiled = std::move(result);
+    copy->registeredViews = variant.registeredViews;
+    copy->meshIndexDescriptor = variant.meshIndexDescriptor;
+    copy->shader = variant.shader;
+    copy->dataPositions = variant.dataPositions;
+    copy->dataSlots = variant.dataSlots;
+    copy->flatBinding = variant.flatBinding;
+    copy->pushOffset = variant.pushOffset;
+    copy->runBases = variant.runBases;
+    copy->relocatableWords = variant.relocatableWords;
+    copy->userWordsWalked = variant.userWordsWalked;
+    copy->valueWords = variant.valueWords;
+    copy->valueSlots = variant.valueSlots;
+    copy->calleeWords = variant.calleeWords;
+    copy->calleeReads = variant.calleeReads;
+    copy->userDataMask = variant.userDataMask;
+    copy->vertexInfo = variant.vertexInfo;
+    return copy;
+}
 
 void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData) {
     using Role = ShaderRecompiler::ProgramRole;
@@ -250,6 +336,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             }
         } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> forwarded;
+            DataReuseCounts reuse;
+            const struct ReuseNote {
+                DataReuseCounts& counts;
+                ~ReuseNote() { NoteDataReuse(counts); }
+            } reuseNote{reuse};
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
             std::optional<SampledReadScope> sampling;
             for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -260,16 +352,33 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 for (const auto& variant : dataEntry->stages[i]) {
                     if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) continue;
                     bool usedEqual = true;
+                    forwarded.clear();
                     for (std::size_t w = 0; w < now.size() && usedEqual; ++w) {
-                        if (now[w] != was[w] && (w >= 64u || ((variant->userDataMask >> w) & 1u) != 0)) usedEqual = false;
+                        if (now[w] == was[w] || (w < 64u && ((variant->userDataMask >> w) & 1u) == 0)) continue;
+                        const auto slot = forwardedSlot(*variant, w);
+                        if (slot < 0) usedEqual = false;
+                        else forwarded.emplace_back(static_cast<std::uint32_t>(slot), now[w]);
                     }
-                    if (!usedEqual) continue;
+                    if (!usedEqual) {
+                        ++reuse.userWords;
+                        continue;
+                    }
                     if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
                     std::vector<ShaderRecompiler::MemoryRegion> regions;
                     appendEntryRegions(*variant, regions);
                     auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
+                    if (result != EntryOutcome::Equal) {
+                        ++reuse.memory;
+                        continue;
+                    }
+                    if (forwarded.empty()) {
+                        ++reuse.plain;
+                        candidates.emplace_back(variant, std::move(regions));
+                        continue;
+                    }
+                    ++reuse.patched;
+                    candidates.emplace_back(forwardedCopy(*variant, forwarded), std::move(regions));
                 }
             }
         }

@@ -13,7 +13,9 @@ namespace ShaderRecompiler::Detail {
 
 class PlanBuilder {
 public:
-    explicit PlanBuilder(IrProgram& program) : _program(program) {}
+    // imagesOnly (APS5_GPU_SRT=3): plan only the reads image and sampler descriptors depend on;
+    // every other SRT read stays a run-time BDA read.
+    explicit PlanBuilder(IrProgram& program, bool imagesOnly = false) : _program(program), _imagesOnly(imagesOnly) {}
 
     void Run();
 
@@ -29,6 +31,7 @@ private:
     void PatchReads();
 
     IrProgram& _program;
+    bool _imagesOnly = false;
     std::vector<IrValue*> _visiting;
     std::unordered_map<IrValue*, std::size_t> _visitingIndex;
     std::unordered_set<IrValue*> _visited;
