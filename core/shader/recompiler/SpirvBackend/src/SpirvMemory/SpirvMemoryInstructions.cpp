@@ -597,7 +597,10 @@ std::uint32_t RouteFlatAccess(SpirvEmitterState& state, std::uint32_t address, s
 
 void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t bits) {
     const auto& mem = ctx.Memory(inst);
-    if (bits == 32u && mem.planningOnly) {
+    // APS5_GPU_SRT_VERIFY_RAW=1 (SrtPlanBuilder): a walked word's GPU read is compared with the walk's
+    // value, so planning-only reads of GPU-SRT programs are emitted too.
+    static const bool verifyRaw = std::getenv("APS5_GPU_SRT_VERIFY_RAW") != nullptr;
+    if (bits == 32u && mem.planningOnly && !(verifyRaw && ctx.state.program.Resources().gpuSrt)) {
         return;
     }
     if (RoutesApertures(ctx.state, mem)) {

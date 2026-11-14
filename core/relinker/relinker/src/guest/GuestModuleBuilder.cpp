@@ -324,7 +324,10 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     };
     for (const auto& name : neededNames) {
         const auto found = findGuest(name);
-        if (found != guestNames.end() && (!windows || standardDirectory(found->second))) require(found->second);
+        // On Windows a runtime module the executable needs waits for the title to load it, so that its
+        // module_start sees the start arguments. An executable that does not import
+        // sceKernelLoadStartModule never loads it: it is started at startup like any needed module.
+        if (found != guestNames.end() && (!windows || !executableLoadsModules || standardDirectory(found->second))) require(found->second);
     }
     for (const auto provider : executableProviders) require(provider);
     for (std::size_t index = 0; index < images.size(); ++index) {

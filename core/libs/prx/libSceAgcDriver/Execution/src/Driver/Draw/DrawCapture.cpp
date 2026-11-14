@@ -65,8 +65,39 @@ void TraceShaderRequestFailure(std::uint64_t token, const Submission& submission
 
 }
 
+namespace {
+
+// Debug aid: APS5_TRACE_CAPTURE_SPLIT=1 prints, every 10 s, the time materializeDrawStage spent
+// (capture + materialize) on stages whose result binds images or image tables vs stages without
+// them: the share item 3's per-draw skip of image-free programs can save.
+void NoteCaptureSplit(const ShaderRecompiler::RecompileResult& compiled, std::chrono::steady_clock::time_point started) {
+    static const bool enabled = std::getenv("APS5_TRACE_CAPTURE_SPLIT") != nullptr;
+    if (!enabled) return;
+    using Role = ShaderRecompiler::DescriptorRole;
+    const bool images = std::any_of(compiled.bindings.begin(), compiled.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) {
+        return binding.role == Role::GuestImages || binding.role == Role::GuestSamplers || binding.role == Role::ImageTable || binding.role == Role::SamplerTable || binding.role == Role::ImageTableMap || binding.role == Role::ImageStorageTable;
+    });
+    const bool runtime = ShaderRecompiler::RuntimeResolved(compiled);
+    const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+    static std::mutex mutex;
+    static std::array<std::uint64_t, 6> totals{};
+    static auto reported = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    const std::size_t bucket = images ? 0 : runtime ? 2 : 4;
+    ++totals[bucket];
+    totals[bucket + 1] += nanoseconds;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    std::fprintf(stderr, "[capture-split] (10 s) capture+materialize: stages with images %llu, %.1f ms; image-free runtime-resolved %llu, %.1f ms; other image-free %llu, %.1f ms\n", static_cast<unsigned long long>(totals[0]), static_cast<double>(totals[1]) / 1e6, static_cast<unsigned long long>(totals[2]), static_cast<double>(totals[3]) / 1e6, static_cast<unsigned long long>(totals[4]), static_cast<double>(totals[5]) / 1e6);
+    totals = {};
+}
+
+}
+
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::uint64_t traceToken, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) try {
     PerformanceTimer timing("Shader.DrawStage");
+    const auto splitStarted = std::chrono::steady_clock::now();
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
     const auto& program = programs[i];
@@ -174,6 +205,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     timing.Mark("materialize");
     const auto walked = capture->userDataUse.asValue | capture->userDataUse.asBase;
     auto mask = walked == 0 ? ~std::uint64_t{0} : walked | stageCapture.compiled->userDataRegisterReads;
+    // A GPU-SRT stage reads the user words forwarded to it as push data itself (SRT pointers it walks
+    // on the GPU): a draw-cache hit must see them equal too, or it keeps the old pointers (the mode-3/4
+    // save-load stall, bisect eva_u14..u18).
+    for (const auto word : stageCapture.compiled->shaderDataUserWords) mask |= word < 64u ? std::uint64_t{1} << word : ~std::uint64_t{0};
     if (vertexInfos[i]) {
         for (const auto reg : {static_cast<std::uint32_t>(vertexInfos[i]->fetchAttribReg), static_cast<std::uint32_t>(vertexInfos[i]->fetchBufferReg)}) {
             mask |= reg + 1u < 64u ? std::uint64_t{3} << reg : ~std::uint64_t{0};
@@ -181,6 +216,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
     stageCapture.userDataMask = mask;
     phaseTiming.Phase(DrawRowRecompile);
+    NoteCaptureSplit(*stageCapture.compiled, splitStarted);
     return stageCapture.compiled;
 } catch (const std::exception& error) {
     if (!SkipRefusedDraws()) throw;

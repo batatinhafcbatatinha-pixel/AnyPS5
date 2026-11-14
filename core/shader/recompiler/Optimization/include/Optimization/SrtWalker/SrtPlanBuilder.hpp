@@ -11,6 +11,9 @@
 
 namespace ShaderRecompiler::Detail {
 
+// Whether a program stores to or atomically updates any image (APS5_GPU_SRT=4 keeps its images bound).
+bool ProgramWritesImages(const IrProgram& program);
+
 class PlanBuilder {
 public:
     // imagesOnly (APS5_GPU_SRT=3): plan only the reads image and sampler descriptors depend on;
@@ -26,6 +29,9 @@ private:
         bool keep = false;
     };
 
+    bool DependsOnShaderBase(const IrValue* value) const;
+    void FindShaderBased();
+    std::unordered_set<const IrValue*> _shaderBased;
     void Collect(IrValue* raw, std::uint32_t usePc);
     void Record(IrValue* inst);
     void PatchReads();

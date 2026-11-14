@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
 #include "prx/libSceMouse/include/MouseState.hpp"
 #include "prx/libSceIme/include/ModalDialog.hpp"
@@ -92,6 +93,9 @@ bool MouseInput::CaptureWanted(bool allowed) const {
 }
 
 void MouseInput::UpdateCapture(bool allowed) {
+    // APS5_NO_MOUSE_CAPTURE=1: unattended runs on a shared desktop never take the pointer.
+    static const bool never = std::getenv("APS5_NO_MOUSE_CAPTURE") != nullptr;
+    if (never) allowed = false;
     if (!allowed) {
         captured = false;
         return;

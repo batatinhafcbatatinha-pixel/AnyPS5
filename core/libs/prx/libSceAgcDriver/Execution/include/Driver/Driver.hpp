@@ -222,7 +222,11 @@ private:
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
     static std::int64_t forwardedSlot(const DispatchVariant& variant, std::size_t word);
-    static std::shared_ptr<DispatchVariant> forwardedCopy(const DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> forwarded);
+    static std::shared_ptr<DispatchVariant> forwardedCopy(const DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> forwarded, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* vertexInfo = nullptr);
+    // M4: the last runtime-resolved variant of each program (DrawLookup.cpp), offered as a stage
+    // candidate when no shape entry serves the draw.
+    static void rememberRuntimeVariant(const DrawProgram& program, std::uint32_t role, std::shared_ptr<DispatchVariant> variant);
+    static std::shared_ptr<DispatchVariant> runtimeVariantFor(const DrawProgram& program, std::uint32_t role, std::vector<std::uint32_t>& userData);
     static void patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::uint32_t slot, std::uint32_t value);
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);

@@ -176,8 +176,10 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     if (!program.Resources().srtReads.empty()) {
         addBinding(next, DescriptorBindingKind::FlattenedSrt);
     }
-    const bool imageTables = std::ranges::any_of(info.images, [](const ImageResource& image) { return image.table != NoTable; });
-    const bool samplerTables = std::ranges::any_of(info.samplers, [](const SamplerResource& sampler) { return sampler.table != NoTable; });
+    // Global image programs (APS5_GPU_SRT=4) read their tables from the device-wide set
+    // (GlobalImageAbi::DescriptorSet) instead of per-draw table bindings.
+    const bool imageTables = !info.globalImages && std::ranges::any_of(info.images, [](const ImageResource& image) { return image.table != NoTable; });
+    const bool samplerTables = !info.globalImages && std::ranges::any_of(info.samplers, [](const SamplerResource& sampler) { return sampler.table != NoTable; });
     if (samplerTables) {
         addBinding(next, DescriptorBindingKind::SamplerTable);
     }
@@ -187,7 +189,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     if (imageTables) {
         addBinding(next, DescriptorBindingKind::ImageTable);
     }
-    if (std::ranges::any_of(info.images, [](const ImageResource& image) { return image.table != NoTable && image.resourceClass == ImageResourceClass::Storage && image.tableOperation == TableOperation::Supported; })) {
+    if (!info.globalImages && std::ranges::any_of(info.images, [](const ImageResource& image) { return image.table != NoTable && image.resourceClass == ImageResourceClass::Storage && image.tableOperation == TableOperation::Supported; })) {
         addBinding(next, DescriptorBindingKind::ImageStorageTable);
     }
 

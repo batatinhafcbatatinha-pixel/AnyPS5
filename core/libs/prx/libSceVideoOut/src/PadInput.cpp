@@ -383,6 +383,8 @@ void PadInput::reloadInputMapping() {
 }
 
 void PadInput::setMouseMode(bool enabled) {
+    static const bool never = std::getenv("APS5_NO_MOUSE_CAPTURE") != nullptr;  // see MouseInput::UpdateCapture
+    if (never) enabled = false;
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "0");
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "0");
     if (SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE) != 0) throw std::runtime_error(std::string("Pad: relative mouse mode failed: ") + SDL_GetError());

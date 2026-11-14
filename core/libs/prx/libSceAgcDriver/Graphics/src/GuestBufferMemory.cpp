@@ -6588,7 +6588,7 @@ std::optional<ResidentSource> ResidentSourceFor(VkDevice device, VkBuffer import
     return std::nullopt;
 }
 
-std::optional<ResidentSource> ResidentDrawSource(VkDevice device, std::uint64_t address, std::size_t bytes) {
+std::optional<ResidentSource> ResidentDrawSource(VkDevice device, VkBuffer import, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || !ResidentStagingOverlaps(address, bytes)) return std::nullopt;
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
     // Image results or unit shadows pending over the range belong in guest memory first: the old path.
@@ -6597,7 +6597,7 @@ std::optional<ResidentSource> ResidentDrawSource(VkDevice device, std::uint64_t 
     std::lock_guard gpu(GuestMemory::GpuMutex());
     auto& registry = Residents();
     std::lock_guard lock(registry.mutex);
-    const auto found = std::find_if(registry.entries.begin(), registry.entries.end(), [&](const ResidentEntry& entry) { return entry.context.device == device && entry.begin <= address && end <= entry.end; });
+    const auto found = std::find_if(registry.entries.begin(), registry.entries.end(), [&](const ResidentEntry& entry) { return entry.context.device == device && entry.copySource == import && entry.begin <= address && end <= entry.end; });
     if (found == registry.entries.end() || !GuestMemory::UnchangedSinceCollected(address, bytes, found->generation)) return std::nullopt;
     found->lastUse = ++registry.clock;
     registry.sourced.fetch_add(1, std::memory_order_relaxed);

@@ -46,6 +46,17 @@ class DeviceBuffer;
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+// Hot GPU-written ranges (the analogue of KytyPS5's eager download of hot pages, Max's gain there):
+// ranges a capture read had to wait for because recorded GPU work still wrote them are learned
+// (NoteHotWrite, from the flush hook); a later dispatch writing one asks for an early submit of the
+// open batch (RequestEarlySubmitIfHot, from ShaderResources::MarkGpuWrites), which the driver makes
+// at the end of the dispatch packet (TakeEarlySubmitRequest): the GPU then runs the writer while the
+// worker goes on, and the next capture of that range finds it done instead of submitting and waiting.
+// APS5_NO_HOT_EARLY_SUBMIT=1 disables it.
+void NoteHotWrite(std::uint64_t address, std::size_t bytes);
+void RequestEarlySubmitIfHot(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes);
+bool TakeEarlySubmitRequest();
+
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).

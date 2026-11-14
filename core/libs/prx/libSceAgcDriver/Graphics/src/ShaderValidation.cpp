@@ -1,3 +1,4 @@
+#include "GlobalImageAbi.hpp"
 #include "BdaAbi.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -444,6 +445,9 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             case spv::OpTypeRuntimeArray:
             case spv::OpTypeStruct:
             case spv::OpTypePointer:
+            case spv::OpTypeImage:
+            case spv::OpTypeSampler:
+            case spv::OpTypeSampledImage:
                 Require(count >= 2 && module.types.emplace(instruction[1], std::vector<std::uint32_t>(instruction.begin(), instruction.end())).second, "invalid or duplicate SPIR-V type");
                 break;
             case spv::OpVariable:
@@ -581,6 +585,14 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             Require(mesh, "workgroup memory outside a mesh shader");
         } else if (variable.storage == spv::StorageClassUniformConstant) {
             Require(decoration.set && decoration.binding, "unbound shader resource");
+            if (*decoration.set == ShaderRecompiler::GlobalImageAbi::DescriptorSet) {
+                Require(shader.globalImages && *decoration.binding <= ShaderRecompiler::GlobalImageAbi::SamplerBinding, "invalid global image binding");
+                Require(type.size() == 3 && (type[0] & 0xffffu) == spv::OpTypeRuntimeArray, "global images require runtime descriptor arrays");
+                const auto& element = module.Type(type[2]);
+                const auto expected = *decoration.binding == ShaderRecompiler::GlobalImageAbi::SamplerBinding ? spv::OpTypeSampler : spv::OpTypeImage;
+                Require(!element.empty() && (element[0] & 0xffffu) == expected, "invalid global descriptor type");
+                continue;
+            }
             const auto key = std::make_pair(*decoration.set, *decoration.binding);
             const auto binding = std::find_if(shader.bindings.begin(), shader.bindings.end(), [&](const auto& item) { return item.descriptorSet == key.first && item.binding == key.second; });
             Require(descriptors.insert(key).second || (binding != shader.bindings.end() && (binding->role == ShaderRecompiler::DescriptorRole::ImageTable || binding->role == ShaderRecompiler::DescriptorRole::ImageStorageTable)), "duplicate SPIR-V resource binding");
@@ -597,6 +609,15 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             Require(binding->count != 0u && binding->count <= capacity && count != module.constants.end() && count->second == binding->count, "typed heap array length disagrees with compact binding");
         } else {
             Require(variable.storage == spv::StorageClassStorageBuffer && decoration.set && decoration.binding, "unsupported or unbound shader resource");
+            if (*decoration.set == ShaderRecompiler::GlobalImageAbi::DescriptorSet) {
+                Require(shader.globalImages && *decoration.binding == ShaderRecompiler::GlobalImageAbi::MapBinding, "invalid global image map binding");
+                Require(type.size() == 3 && (type[0] & 0xffffu) == spv::OpTypeStruct && module.decorations[typeId].block, "global image map must be a block");
+                const auto& words = module.Type(type[2]);
+                Require(words.size() == 3 && (words[0] & 0xffffu) == spv::OpTypeRuntimeArray && module.Signature(words[2]) == "u32", "global image map must contain u32 words");
+                const auto offset = module.offsets.find({typeId, 0});
+                Require(offset != module.offsets.end() && offset->second == 0 && module.decorations[type[2]].stride == 4, "invalid global image map layout");
+                continue;
+            }
             const auto key = std::make_pair(*decoration.set, *decoration.binding);
             if (*decoration.set == ShaderRecompiler::MeshWindowDescriptorSet) {
                 Require(mesh && *decoration.binding == 0u, "mesh window buffer binding is wrong");

@@ -1007,6 +1007,27 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
     NoteDrawReuse(programs, stageCaptures, recompiled);
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
+    // M4: freshly captured runtime-resolved stages are remembered per program (DrawLookup.cpp), so the
+    // next draw of the program reuses them with its user words patched instead of capturing again. A
+    // stage the draw cache did not admit gets a plain variant when nothing CPU-decoded backs it.
+    for (std::size_t i = 0; i < programs.size() && !drawHit; ++i) {
+        if (reused[i] || roles[i] == Role::GeometryBack) continue;
+        if (i < fresh.size() && fresh[i] != nullptr) {
+            rememberRuntimeVariant(programs[i], static_cast<std::uint32_t>(roles[i]), fresh[i]);
+            continue;
+        }
+        const auto& capture = stageCaptures[i];
+        if (capture.compiled == nullptr || !decodeReads[i].empty() || !ShaderRecompiler::RuntimeResolved(*capture.compiled)) continue;
+        auto variant = std::make_shared<DispatchVariant>();
+        variant->compiled = capture.compiled;
+        variant->registeredViews = capture.registeredViews;
+        variant->shader = programs[i].snapshot;
+        variant->forgetSerial = capture.forgetSerial;
+        variant->pushOffset = capture.pushOffset;
+        variant->userDataMask = capture.userDataMask;
+        if (vertexInfos[i]) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfos[i]);
+        rememberRuntimeVariant(programs[i], static_cast<std::uint32_t>(roles[i]), std::move(variant));
+    }
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {

@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 
 namespace ShaderRecompiler::BdaAbi {
@@ -43,7 +44,7 @@ inline bool RangesOrdered(const Range* ranges, std::size_t count) {
 }
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
-enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall, WindowLaneSpill };
+enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable, UnlinkedCall, WindowLaneSpill, StaleCache };
 
 struct Fault {
     FaultState state;
@@ -83,8 +84,30 @@ inline constexpr std::uint32_t AccessedPageProbes = 8;
 inline constexpr std::uint32_t AccessedCountWord = SrtGuardWord + 1;
 inline constexpr std::uint32_t AccessedSlotsWord = AccessedCountWord + 1;
 inline constexpr std::uint32_t AccessedListWord = AccessedSlotsWord + AccessedPageSlots;
-inline constexpr std::size_t FaultBufferBytes = (AccessedListWord + AccessedPageSlots) * sizeof(std::uint32_t);
+// Global image misses (APS5_GPU_SRT=4, GlobalImageAbi.hpp): a shader whose T#/S# key is not in the
+// global image map claims a slot keyed by the key's hash: MissClaimsWord + (hash + probe) &
+// (GlobalImageMisses - 1) for GlobalImageMissProbes probes, CAS 0 -> (hash | 1); the lane that
+// claimed it stores kind + 8 key words at MissRecordsWord + slot * GlobalImageMissRecordWords and
+// counts MissCountWord. Lanes finding their own hash in a slot stop (the same key, or a colliding one
+// noted again in a later batch). Graphics reads it after the batch (ForEachGlobalImageMiss).
+inline constexpr std::uint32_t GlobalImageMisses = 256;
+inline constexpr std::uint32_t GlobalImageMissProbes = 8;
+inline constexpr std::uint32_t GlobalImageMissRecordWords = 9;
+inline constexpr std::uint32_t MissCountWord = AccessedListWord + AccessedPageSlots;
+inline constexpr std::uint32_t MissClaimsWord = MissCountWord + 1;
+inline constexpr std::uint32_t MissRecordsWord = MissClaimsWord + GlobalImageMisses;
+// Global image slots sampled by the batch (GlobalImageAbi::MaxImageSlots bits): a hit sets its slot's
+// bit (a plain load first, an atomic OR only when clear); Graphics reads and clears it after the batch
+// (ForEachUsedGlobalImageSlot).
+inline constexpr std::uint32_t GlobalImageUsedWords = 16384u / 32u;
+inline constexpr std::uint32_t GlobalImageUsedWord = MissRecordsWord + GlobalImageMisses * GlobalImageMissRecordWords;
+// APS5_GPU_SRT_GLOBAL_COUNT (diagnostic): subgroups whose first lane's global image lookup hit /
+// missed, then the same for samplers (4 words), read and cleared by Graphics after the batch.
+inline constexpr std::uint32_t GlobalImageCountWord = GlobalImageUsedWord + GlobalImageUsedWords;
+inline constexpr std::uint32_t GlobalImageCountWords = 4;
+inline constexpr std::size_t FaultBufferBytes = (GlobalImageCountWord + GlobalImageCountWords) * sizeof(std::uint32_t);
 static_assert((AccessedPageSlots & (AccessedPageSlots - 1)) == 0);
+static_assert((GlobalImageMisses & (GlobalImageMisses - 1)) == 0);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
 static_assert(WrittenChunkPages == 32);
 
@@ -92,23 +115,51 @@ inline constexpr std::uint32_t WrittenChunkKey(std::uint64_t address) {
     return static_cast<std::uint32_t>(address >> WrittenChunkShift) + 1u;
 }
 
-// Calls visit(page address) for each noted accessed page and clears the region. False on a
-// malformed record (the region is left as is).
+// Calls visit(page address) for each noted accessed page and clears the region. False when the count
+// was out of range (the region is still visited and cleared).
 template<typename TVisit>
 bool ForEachAccessedPage(std::uint32_t* words, std::uint32_t pageShift, TVisit&& visit) {
-    const auto count = words[AccessedCountWord];
-    if (count > AccessedPageSlots) return false;
-    for (std::uint32_t claim = 0; claim < count; ++claim) {
-        const auto slot = words[AccessedListWord + claim];
-        if (slot >= AccessedPageSlots || words[AccessedSlotsWord + slot] == 0) return false;
-    }
-    for (std::uint32_t claim = 0; claim < count; ++claim) {
-        const auto slot = words[AccessedListWord + claim];
-        visit(static_cast<std::uint64_t>(words[AccessedSlotsWord + slot] - 1u) << pageShift);
+    // The count is bounded by the slots (a claim is a successful CAS on an empty slot), but a stale or
+    // corrupted region must not stick: every slot is visited and cleared whatever the count says.
+    const bool wellFormed = words[AccessedCountWord] <= AccessedPageSlots;
+    for (std::uint32_t slot = 0; slot < AccessedPageSlots; ++slot) {
+        const auto key = words[AccessedSlotsWord + slot];
+        if (key == 0) continue;
+        visit(static_cast<std::uint64_t>(key - 1u) << pageShift);
         words[AccessedSlotsWord + slot] = 0;
     }
+    for (std::uint32_t claim = 0; claim < AccessedPageSlots; ++claim) words[AccessedListWord + claim] = 0;
     words[AccessedCountWord] = 0;
-    return true;
+    return wellFormed;
+}
+
+// Calls visit(kind, key) (key: 8 words) for each noted global image miss and clears the region.
+template<typename TVisit>
+void ForEachGlobalImageMiss(std::uint32_t* words, TVisit&& visit) {
+    if (words[MissCountWord] == 0) return;
+    for (std::uint32_t slot = 0; slot < GlobalImageMisses; ++slot) {
+        if (words[MissClaimsWord + slot] == 0) continue;
+        const auto* record = words + MissRecordsWord + slot * GlobalImageMissRecordWords;
+        if (record[0] != 0) visit(record[0], std::span<const std::uint32_t, 8>(record + 1, 8));
+        words[MissClaimsWord + slot] = 0;
+        for (std::uint32_t word = 0; word < GlobalImageMissRecordWords; ++word) words[MissRecordsWord + slot * GlobalImageMissRecordWords + word] = 0;
+    }
+    words[MissCountWord] = 0;
+}
+
+// Calls visit(slot) for each global image slot marked used and clears the bitmap.
+template<typename TVisit>
+void ForEachUsedGlobalImageSlot(std::uint32_t* words, TVisit&& visit) {
+    for (std::uint32_t word = 0; word < GlobalImageUsedWords; ++word) {
+        auto bits = words[GlobalImageUsedWord + word];
+        if (bits == 0) continue;
+        words[GlobalImageUsedWord + word] = 0;
+        while (bits != 0) {
+            const auto bit = static_cast<std::uint32_t>(std::countr_zero(bits));
+            visit(word * 32u + bit);
+            bits &= bits - 1u;
+        }
+    }
 }
 
 template<typename TMark>

@@ -1,5 +1,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "BdaAbi.hpp"
+#include "GlobalImageAbi.hpp"
+#include "Recompiler.hpp"
 #include "PipelineSpecialization.hpp"
 #include "StencilReplay.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
@@ -496,6 +498,42 @@ void DefineOutputs(SpirvEmitterState& state) {
     }
 }
 
+namespace {
+
+// APS5_GPU_SRT=4 (M3): the image/sampler tables of a global image program live in the device-wide set
+// GlobalImageAbi::DescriptorSet: one runtime image array per (sampled type, view type), each aliasing
+// the binding of its view type; the sampler array; the global image map in place of the table map.
+void DefineGlobalImageSet(SpirvEmitterState& state) {
+    const auto define = [&](std::uint32_t type, const char* name, std::uint32_t storage, std::uint32_t binding) {
+        const auto variable = state.module.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+        state.module.AddName(variable, name);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, GlobalImageAbi::DescriptorSet);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+        return variable;
+    };
+    RequireTableIndexing(state);
+    const auto& info = state.program.Info();
+    for (std::uint32_t resource = 0; resource < info.images.size(); ++resource) {
+        const auto& image = info.images[resource];
+        if (image.table == NoTable) continue;
+        for (const auto& mode : info.runtimeImageModes.at(resource)) {
+            if (!TableModeEmitted(mode) || mode.resourceClass != ImageResourceClass::Sampled) continue;
+            const auto kind = DescriptorBindingForImage(mode);
+            if (std::any_of(state.tableImageVariables.begin(), state.tableImageVariables.end(), [&](const SpirvTableImageVariable& variable) { return variable.kind == kind; })) continue;
+            const auto name = "global_images_" + std::to_string(static_cast<std::uint32_t>(kind));
+            state.tableImageVariables.push_back({kind, define(state.module.Type(spv::OpTypeRuntimeArray, ImageType(state, mode)), name.c_str(), spv::StorageClassUniformConstant, ResourceMaterializer::GlobalImageViewBindingOf(mode))});
+            if (mode.dimension == RdnaImageDimension::Dim1D || mode.dimension == RdnaImageDimension::Dim1DArray) state.module.EmitCapability(spv::CapabilitySampled1D);
+        }
+    }
+    if (std::ranges::any_of(info.samplers, [](const SamplerResource& sampler) { return sampler.table != NoTable; })) {
+        state.tableSamplerVariable = define(state.module.Type(spv::OpTypeRuntimeArray, state.module.Type(spv::OpTypeSampler)), "global_samplers", spv::StorageClassUniformConstant, GlobalImageAbi::SamplerBinding);
+    }
+    state.tableMapVariable = define(StorageBufferBlockType(state), "global_image_map", spv::StorageClassStorageBuffer, GlobalImageAbi::MapBinding);
+    state.module.AddAnnotation(spv::OpDecorate, state.tableMapVariable, spv::DecorationNonWritable);
+}
+
+}
+
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
@@ -605,6 +643,7 @@ void DefineDescriptors(SpirvEmitterState& state) {
         }
         }
     }
+    if (state.program.Info().globalImages) DefineGlobalImageSet(state);
     if (LdsInDeviceMemory(state)) {
         state.ldsBufferVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferBlockType(state)), spv::StorageClassStorageBuffer);
         state.module.AddName(state.ldsBufferVariable, "workgroup_memory");

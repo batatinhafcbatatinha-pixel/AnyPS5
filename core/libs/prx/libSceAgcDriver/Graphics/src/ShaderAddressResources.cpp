@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <chrono>
@@ -231,7 +233,21 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         const bool tableFaultsOnly = std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; });
         faultChecks = faultChecks || tables != 0 || (faults != 0 && (!tableFaultsOnly || shader.program->imageTableFaults != 0 || shader.program->poisonedSrtReads != 0 || shader.program->windowLaneGuards != 0 || shader.program->descriptorFaults != 0 || loopGuarded));
     }
-    if (usesBda) {
+    // APS5_GPU_SRT_LIGHT=1 (with APS5_BUFFER_CACHE): stages that resolve their SRT on the GPU and never
+    // store through addresses read guest memory through the buffer cache's page table (BdaResources
+    // appends its root); their build takes no lease of the registered allocations and no address space
+    // (no resident drops, no address-space ranges): the table holds only the build's own regions, and
+    // a page not resident yet falls back to them, then reads 0 and is noted to become resident
+    // (BdaAbi accessed pages) before the next use. REWRITE-STATE.md, "light BDA contract".
+    if (usesBda && !bdaReadOnly && BufferCacheEnabled()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) NoteTableUnsafeWrites(recorder->OpenSerial());
+    }
+    static const bool lightContract = std::getenv("APS5_GPU_SRT_LIGHT") != nullptr;
+    const bool light = usesBda && lightContract && BufferCacheEnabled() && std::ranges::all_of(shaders, [](const CompiledShader& shader) {
+        const bool tables = std::ranges::any_of(shader.program->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
+        return !tables || (shader.program->gpuSrt && !shader.program->bdaWrites);
+    });
+    if (usesBda && !light) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         guestMemory.AcquireRegistered();

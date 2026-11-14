@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
@@ -1991,7 +1992,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // from the cache below. GPU-written indices are copied in after their writers, in queue order.
         if (BufferCacheMode() >= 2 && !context.drawInputsInPlace && context.recorder != nullptr && !state.stages.mesh && indexBytes != 0 && draw.indexAddress % draw.indexSize == 0) {
             bool behind = false;
-            if (const auto cached = ObtainCachedBuffer(context, *context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), &behind, true, true)) {
+            // An index buffer offset must be a multiple of the index size (a resident copy's base is
+            // an allocation's in practice, but nothing enforces it): otherwise the old path.
+            if (const auto cached = ObtainCachedBuffer(context, *context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), &behind, true, true); cached.has_value() && cached->offset % draw.indexSize == 0) {
                 inputs.vertexInputBehindGpuWrite = inputs.vertexInputBehindGpuWrite || behind;
                 inputs.maxIndexUnknown = true;
                 inputs.indicesFromCache = true;
@@ -2152,7 +2155,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // which uploads only its changed blocks; the old paths below remain for what it refuses.
         if (BufferCacheEnabled() && !context.drawInputsInPlace && context.recorder != nullptr && begin % plan.alignments[range] == 0) {
             bool behind = false;
-            if (const auto cached = ObtainCachedBuffer(context, *context.recorder, begin, bytes, &behind, true, inputs.indicesFromCache)) {
+            if (const auto cached = ObtainCachedBuffer(context, *context.recorder, begin, bytes, &behind, true, inputs.indicesFromCache); cached.has_value() && cached->offset % plan.alignments[range] == 0) {
                 inputs.vertexInputBehindGpuWrite = inputs.vertexInputBehindGpuWrite || behind;
                 rangeHandles.push_back(cached->buffer);
                 rangeOffsets.push_back(cached->offset);
@@ -3003,7 +3006,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
-    const auto passImages = resources.StorageImages();
+    auto passImages = resources.StorageImages();
     std::vector<std::pair<VkImage, bool>> passAttachments;
     passAttachments.reserve(record.targets.size());
     for (const auto& target : record.targets) {
@@ -3012,6 +3015,22 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     for (const auto image : record.multisampleImages) passAttachments.emplace_back(image, true);
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
+    const bool globalImages = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->globalImages; });
+    if (globalImages) {
+        FlushBindless(context, *recorder);
+        // The global set's GPU-backed textures are this draw's reads (the direct path lists the ones
+        // it binds): the recorder orders the draw after the passes that wrote them.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> excluded;
+        if (state.depth) {
+            const auto bytes = static_cast<std::uint64_t>(state.depth->extent.width) * state.depth->extent.height * 4u;
+            excluded.emplace_back(state.depth->address, state.depth->address + bytes);
+            if (state.depth->stencilAddress != 0) excluded.emplace_back(state.depth->stencilAddress, state.depth->stencilAddress + bytes);
+        }
+        auto listed = passAttachments;
+        const auto attachments = listed.size();
+        BindlessDrawReads(context, listed, passReads, excluded);
+        passImages.insert(passImages.end(), listed.begin() + static_cast<std::ptrdiff_t>(attachments), listed.end());
+    }
     const auto drawUse = resources.BeginDrawUse(*recorder);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
@@ -3134,6 +3153,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
+    if (globalImages) {
+        const auto set = BindlessSet(context);
+        Require(set != VK_NULL_HANDLE, "global images require a descriptor set");
+        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::GlobalImageAbi::DescriptorSet, 1, &set, 0, nullptr);
+    }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
@@ -4069,6 +4093,9 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    const bool globalImages = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->globalImages; });
+    Require(!globalImages || recorded, "global images require an active recorder");
+    if (globalImages) FlushBindless(context, *recorder);
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
     if (recorded) prepared.spaceKeep = reserveSpaceKeep(*recorder, *resources);
     if (recorded) recorder->PrepareSampleSlot();
@@ -4163,6 +4190,11 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     resources->BindDrawUse(commands, pipeline->Layout(), drawUse.get());
     if (pixelLdsSubgroup != 0u) BindPixelFunctionLds(context, commands, pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, pipeline->Layout());
+    if (globalImages) {
+        const auto set = BindlessSet(context);
+        Require(set != VK_NULL_HANDLE, "global images require a descriptor set");
+        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::GlobalImageAbi::DescriptorSet, 1, &set, 0, nullptr);
+    }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");

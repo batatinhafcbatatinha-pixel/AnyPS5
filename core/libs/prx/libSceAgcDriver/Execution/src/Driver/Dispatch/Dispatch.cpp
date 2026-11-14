@@ -702,6 +702,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         break;
     }
     phaseTiming.Phase(PhaseDevice);
+    // The dispatch wrote a range captures keep waiting for: its batch goes to the GPU now
+    // (Graphics::TakeEarlySubmitRequest, Recorder.hpp).
+    if (Graphics::TakeEarlySubmitRequest()) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr) recorder->Submit();
+    }
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
     if (profile) deviceMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
     phaseTiming.Phase(PhaseTail);

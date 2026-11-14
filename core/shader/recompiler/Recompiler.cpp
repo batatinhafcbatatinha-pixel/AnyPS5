@@ -779,6 +779,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
     result.bdaWrites = program.Info().bdaWrites;
     result.gpuSrt = program.Resources().gpuSrt;
+    result.globalImages = program.Info().globalImages;
     if (stencilReplay) {
         result.stencilReferences = StencilReferenceValues(program, request.context.pixel.has_value() && request.context.pixel->stencilOperationValueExport ? 8u : 0u);
         result.stencilReferenceDword = bindings.layout.stencilReferenceDword;
@@ -849,6 +850,19 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     return recordEmissionFailure(emissionFailure, [&] {
         prepareInterface(request, program);
         auto variant = emitVariant(request, program);
+        // Debug aid (APS5_DUMP_SPIRV, see buildSpecializedModule): also the unspecialized module of
+        // each GPU-SRT program, named by its code address and stage, to find the program of a module.
+        static const char* dumpDirectory = std::getenv("APS5_DUMP_SPIRV");
+        if (dumpDirectory != nullptr && variant.artifact.gpuSrt) {
+            static std::atomic<std::uint32_t> serial{0};
+            char name[96];
+            std::snprintf(name, sizeof(name), "/prog_%llx_s%u_%u.spv", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage), serial.fetch_add(1, std::memory_order_relaxed));
+            const auto words = variant.artifact.spirv.Words();
+            if (std::FILE* file = std::fopen((std::string(dumpDirectory) + name).c_str(), "wb")) {
+                std::fwrite(words.data(), sizeof(std::uint32_t), words.size(), file);
+                std::fclose(file);
+            }
+        }
         variant.info = std::move(program).TakeCompiledInfo();
         return variant;
     });
@@ -983,7 +997,7 @@ SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, 
         const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
         if (op == spv::OpEntryPoint && count >= 2u) compute = materialized[cursor + 1u] == spv::ExecutionModelGLCompute;
         if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
-        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet && (materialized[cursor + 3u] == PixelFunctionLdsDescriptorSet || materialized[cursor + 3u] == MeshWindowDescriptorSet || (compute && materialized[cursor + 3u] == WorkgroupMemoryDescriptorSet))) ldsBuffers.insert(materialized[cursor + 1u]);
+        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet && (materialized[cursor + 3u] == PixelFunctionLdsDescriptorSet || materialized[cursor + 3u] == MeshWindowDescriptorSet || (compute && materialized[cursor + 3u] == WorkgroupMemoryDescriptorSet) || materialized[cursor + 3u] == GlobalImageAbi::DescriptorSet)) ldsBuffers.insert(materialized[cursor + 1u]);
         if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationSpecId) {
             const auto id = materialized[cursor + 3u];
             if (!PipelineSpecialization::IsWorkgroupOffset(id)) module->specialization.push_back({id, supplied.at(id)});
@@ -998,6 +1012,20 @@ SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, 
     module->hash = spirv.ContentHash();
     module->spirv = spirv.Weaken();
     module->specializationId = constants.empty() ? 0u : nextVariantId();
+    // Debug aid: APS5_DUMP_SPIRV=DIR writes each specialized module of a GPU-SRT program (all
+    // programs with APS5_DUMP_SPIRV_ALL=1) to DIR/<content hash>.spv before Vulkan sees it, for
+    // offline validation and driver compiles (NVIDIA pipeline compiler crashes).
+    static const char* dumpDirectory = std::getenv("APS5_DUMP_SPIRV");
+    static const bool dumpAll = std::getenv("APS5_DUMP_SPIRV_ALL") != nullptr;
+    if (dumpDirectory != nullptr && (dumpAll || artifact.gpuSrt)) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "/%016llx.spv", static_cast<unsigned long long>(module->hash.low));
+        const auto words = spirv.Words();
+        if (std::FILE* file = std::fopen((std::string(dumpDirectory) + name).c_str(), "wb")) {
+            std::fwrite(words.data(), sizeof(std::uint32_t), words.size(), file);
+            std::fclose(file);
+        }
+    }
     return {std::move(module), std::move(spirv)};
 }
 
@@ -1244,6 +1272,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .stencilReplaySafe = artifact.stencilReplaySafe,
         .bdaWrites = artifact.bdaWrites,
         .gpuSrt = artifact.gpuSrt,
+        .globalImages = artifact.globalImages,
         .layerReplaySafe = artifact.layerReplaySafe,
         .gridScalable = artifact.gridScalable,
         .stencilReferenceDword = artifact.stencilReferenceDword,

@@ -9,6 +9,9 @@
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "ThreadOwned.hpp"
 #include "ImageTableAbi.hpp"
+#include "GlobalImageAbi.hpp"
+#include "Optimization/DescriptorBindingBuilder.hpp"
+#include "Recompiler.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -741,6 +744,7 @@ public:
 
     void Run() {
         tables = ImageTableSnapshot{};
+        if (plan.info.globalImages) return;  // global columns: the shader looks the words up itself
         std::uint32_t count = 0;
         bool hasIndirect = false;
         for (const auto& image : plan.info.images) {
@@ -1941,6 +1945,7 @@ std::size_t resolutionFootprint(const ResolvedImageTables& resolved, const std::
 ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey) {
     namespace Abi = ImageTableAbi;
     ResolvedImageTables out;
+    if (info.globalImages) return out;  // the global image set replaces the per-draw tables
     std::uint32_t count = 0;
     for (const auto& image : info.images) {
         if (image.table != NoTable) count = std::max(count, image.table + 1u);
@@ -2612,6 +2617,147 @@ void ResourceMaterializer::PrepareImageModes(ShaderInfo& info) {
     info.runtimeImageModes.clear();
     info.runtimeImageModes.reserve(info.images.size());
     for (const auto& image : info.images) info.runtimeImageModes.push_back(RuntimeImageModes(image));
+    if (info.globalImages) {
+        for (const auto& image : info.images) {
+            if (image.table != NoTable) RegisterGlobalImageClass(image);
+        }
+    }
+}
+
+namespace {
+
+// APS5_GPU_SRT=4 (M3) global image classes: kind word -> the program-side image whose static runtime
+// modes the record's mode index points into (GlobalImageAbi.hpp). Filled whenever a global image
+// program's modes are prepared (compile, plan extraction, disk-cache load).
+struct GlobalImageClasses {
+    std::mutex mutex;
+    std::unordered_map<std::uint32_t, ImageResource> images;
+    std::unordered_set<std::uint32_t> conflicts;
+};
+
+GlobalImageClasses& globalImageClasses() {
+    static GlobalImageClasses classes;
+    return classes;
+}
+
+ImageResource canonicalGlobalImage(const ImageResource& image) {
+    auto canonical = image;
+    canonical.source = 0u;
+    canonical.firstUsePc = 0u;
+    canonical.table = 0u;
+    return canonical;
+}
+
+DescriptorImageShape globalImageShape(RdnaImageDimension dimension) {
+    switch (dimension) {
+        case RdnaImageDimension::Dim1D: return DescriptorImageShape::Image1D;
+        case RdnaImageDimension::Dim1DArray: return DescriptorImageShape::Image1DArray;
+        case RdnaImageDimension::Dim3D: return DescriptorImageShape::Image3D;
+        case RdnaImageDimension::Dim2DArray: return DescriptorImageShape::Image2DArray;
+        case RdnaImageDimension::Dim2DMsaa: return DescriptorImageShape::Image2DMultisample;
+        case RdnaImageDimension::Dim2DMsaaArray: return DescriptorImageShape::Image2DMultisampleArray;
+        default: return DescriptorImageShape::Image2D;
+    }
+}
+
+}
+
+std::uint32_t ResourceMaterializer::GlobalImageKind(const ImageResource& image) {
+    // FNV-1a over every field that can change the mode list or the mode a T# selects (the fields the
+    // disk cache stores, without the program-specific source, first use and table index).
+    std::uint32_t hash = 2166136261u;
+    const auto mix = [&](std::uint32_t value) {
+        for (std::uint32_t byte = 0; byte < 4u; ++byte) hash = (hash ^ ((value >> (byte * 8u)) & 0xffu)) * 16777619u;
+    };
+    const auto& i = image;
+    for (const std::uint32_t value : {static_cast<std::uint32_t>(i.resourceClass), static_cast<std::uint32_t>(i.numericClass), static_cast<std::uint32_t>(i.dimension), static_cast<std::uint32_t>(i.mipMode), i.mipCount, static_cast<std::uint32_t>(i.conversionFormat), i.shaderSwizzle, i.srgbDecodeFormats, i.maxArrayLayers, i.byElements, i.byComponents, static_cast<std::uint32_t>(i.packedFormat), i.emulatedCompare, static_cast<std::uint32_t>(i.tableOperation)}) mix(value);
+    std::uint64_t bits = 0u;
+    std::uint32_t bit = 0u;
+    for (const bool flag : {i.read, i.written, i.atomic, i.atomic64, i.depthCompare, i.cube, i.r128, i.srgbDecode, i.srgbDecodeCompatible, i.depthBits, i.depthUnorm16, i.packed, i.fmaskCompatible, i.depthBitsCompatible, i.constantSwizzle, i.constantSwizzleCompatible, i.cubeFaceCompatible, i.flatVolumeCompatible, i.singleMipPlaneBiasCompatible, i.volumeArraySampleCompatible, i.adjustedSample, i.flatLineCompatible, i.flatVolumeLineCompatible, i.dimensionQueryOnly, i.sampledOnly, i.foldTexelOffsetsOnly, i.convertedSamples, i.remappedDepth1D, i.layerRowsCompatible, i.layerRows, i.optionalDescriptor, i.volumeGather, i.targetMerge}) {
+        bits |= static_cast<std::uint64_t>(flag ? 1u : 0u) << bit++;
+    }
+    mix(static_cast<std::uint32_t>(bits));
+    mix(static_cast<std::uint32_t>(bits >> 32u));
+    // Image kinds are 1 mod 4; GlobalImageSamplerKind is 3.
+    return (hash & ~3u) | 1u;
+}
+
+void ResourceMaterializer::RegisterGlobalImageClass(const ImageResource& image) {
+    const auto kind = GlobalImageKind(image);
+    auto canonical = canonicalGlobalImage(image);
+    auto& classes = globalImageClasses();
+    std::lock_guard lock(classes.mutex);
+    const auto [found, inserted] = classes.images.emplace(kind, canonical);
+    if (!inserted && !(found->second == canonical) && classes.conflicts.insert(kind).second) {
+        std::fprintf(stderr, "[global-images] kind %08x names two different images; its keys stay unresolved\n", kind);
+    }
+}
+
+bool ResourceMaterializer::ResolveGlobalImageKey(std::uint32_t kind, std::span<const std::uint32_t, 8> key, GlobalImageKeyResolution& out) {
+    namespace Abi = ImageTableAbi;
+    out = GlobalImageKeyResolution{};
+    if (kind == GlobalImageSamplerKind) {
+        out.sampler = true;
+        std::copy_n(key.begin(), 4u, out.words.begin());
+        if ((key[0] & (1u << 15u)) != 0u) {
+            out.flags = Abi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::Unnormalized));
+        } else if (((key[0] >> 29u) & 3u) != 0u) {
+            out.flags = Abi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::Reduction));
+        }
+        for (std::uint32_t variant = 0; variant < Abi::SamplerEntryElements; ++variant) {
+            auto& words = out.samplerWords[variant];
+            std::copy_n(key.begin(), 4u, words.begin());
+            if ((variant & 1u) != 0u) words[2] = PointFilteredSamplerWord(words[0], words[2]);
+        }
+        return true;
+    }
+    ImageResource image;
+    {
+        auto& classes = globalImageClasses();
+        std::lock_guard lock(classes.mutex);
+        const auto found = classes.images.find(kind);
+        if (found == classes.images.end() || classes.conflicts.contains(kind)) {
+            static std::atomic<std::uint32_t> reported{0};
+            if (found == classes.images.end() && reported.fetch_add(1, std::memory_order_relaxed) < 20u) std::fprintf(stderr, "[global-images] miss of kind %08x: no prepared program has it (key stays unresolved)\n", kind);
+            return false;
+        }
+        image = found->second;
+    }
+    const auto modes = RuntimeImageModes(image);
+    DescriptorValue words;
+    words.dwordCount = 8u;
+    std::copy(key.begin(), key.end(), words.dwords.begin());
+    out.dword3 = key[3];
+    if (modes.empty()) {
+        out.flags = Abi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::UnsupportedOperation));
+        return true;
+    }
+    const auto decoded = decodeTableEntry(image, modes, words, 0u, 0u);
+    if ((decoded & DecodeFailed) != 0u) {
+        out.flags = Abi::PoisonCode(decoded & ~DecodeFailed);
+        return true;
+    }
+    const auto& mode = modes.at(decoded);
+    if (mode.dimension == RdnaImageDimension::Dim2DMsaa || mode.dimension == RdnaImageDimension::Dim2DMsaaArray) {
+        out.flags = Abi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::Multisampled));
+        return true;
+    }
+    std::copy(key.begin(), key.end(), out.words.begin());
+    if (mode.conversionFormat != IrBufferFormat::Invalid || mode.depthBits) out.words[3] = (out.words[3] & ~0xfffu) | ShaderImageIdentitySwizzle;
+    out.flags = decoded << Abi::ModeShift;
+    out.shape = globalImageShape(mode.dimension);
+    out.viewBinding = static_cast<std::uint32_t>(GlobalImageViewBinding(out.shape));
+    out.depthCompare = mode.depthCompare;
+    out.bindingKind = static_cast<std::uint32_t>(DescriptorBindingForImage(mode));
+    return true;
+}
+
+std::uint32_t ResourceMaterializer::GlobalImageViewBindingOf(const ImageResource& mode) {
+    return static_cast<std::uint32_t>(GlobalImageViewBinding(globalImageShape(mode.dimension)));
+}
+
+bool ResolveGlobalImageKey(std::uint32_t kind, std::span<const std::uint32_t, 8> key, GlobalImageKeyResolution& out) {
+    return ResourceMaterializer::ResolveGlobalImageKey(kind, key, out);
 }
 
 namespace {
@@ -2846,14 +2992,14 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
             throw std::runtime_error("ResourceMaterializer::ExtractPlan image references an unknown descriptor source");
         }
         if (image.table != NoTable) {
-            plan.requiresSpecializationMemory = true;
+            plan.requiresSpecializationMemory = plan.requiresSpecializationMemory || !plan.info.globalImages;
         } else {
             addSource(image.source);
         }
     }
     for (const auto& sampler : plan.info.samplers) {
         if (sampler.table != NoTable) {
-            plan.requiresSpecializationMemory = true;
+            plan.requiresSpecializationMemory = plan.requiresSpecializationMemory || !plan.info.globalImages;
         } else {
             addSource(sampler.source);
         }

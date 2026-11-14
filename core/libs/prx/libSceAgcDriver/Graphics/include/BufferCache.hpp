@@ -78,6 +78,13 @@ void MakeQueuedResident(const Context& context, Recorder& recorder);
 // SynchronizeBda before work that reads through the table): call under the GPU mutex before recording
 // work that reads through the table, so it never reads bytes older than guest memory at that point.
 void SyncResident(const Context& context, Recorder& recorder);
+// Address stores of GPU work (BDA writes) reach guest memory but are only marked written after their
+// batch (BdaResources::markWrittenPages), so the cache pages of the table can be stale until then.
+// NoteTableUnsafeWrites(serial): work of submission `serial` stores through addresses;
+// TableReadsCurrent: no such work is still in flight (else builds leave the table out).
+void NoteTableUnsafeWrites(std::uint64_t serial);
+bool TableReadsCurrent(const Recorder& recorder);
+bool TableUsed();
 
 // Forgets every cached chunk of the device (device teardown).
 void ClearBufferCache(VkDevice device);

@@ -39,6 +39,9 @@ struct ShaderInfo {
     bool layerExported = false;
     bool smoothOffsetBarycentrics = false;
     bool gridScalable = false;
+    // APS5_GPU_SRT=4 (M3): every image/sampler table of the program is a global column (TableColumn::
+    // global): the tables are the global image set (GlobalImageAbi.hpp), with no per-draw table map.
+    bool globalImages = false;
 
     bool operator==(const ShaderInfo& other) const = default;
 };
