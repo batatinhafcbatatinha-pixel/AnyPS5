@@ -161,6 +161,11 @@ public:
     bool RefreshedPerUse() const { return perUseCopy == PerUseCopy::RemadePerUse; }
     void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
     bool Released() const { return released.load(std::memory_order_acquire); }
+    // M3: the present (Recorder::Presents) at which a shader last sampled this texture through the
+    // global image set (BindlessTable, from the used-slot bitmap); the texture cache's eviction treats
+    // it as a use, since such uses make no CPU lookup.
+    void NoteBindlessUse(std::uint64_t present) { bindlessUse.store(present, std::memory_order_relaxed); }
+    std::uint64_t BindlessUse() const { return bindlessUse.load(std::memory_order_relaxed); }
     void MarkReleased() { released.store(true, std::memory_order_release); }
 
 private:
@@ -197,6 +202,7 @@ private:
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;
     PerUseCopy perUseCopy = PerUseCopy::None;
+    std::atomic<std::uint64_t> bindlessUse{0};
     std::atomic<bool> released{false};
     bool copiedOnce = false;
     bool srgbExpand = false;

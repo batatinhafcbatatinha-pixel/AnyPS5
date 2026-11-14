@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -380,6 +381,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     using Stage = ShaderRecompiler::ShaderStage;
     if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders)) return false;
     keys = {};
+    const bool globalImages = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->globalImages; });
     for (const auto& shader : shaders) {
         const auto identity = shader.program->Identity();
         if (shader.stage == Stage::Geometry || identity.Empty()) return false;
@@ -394,7 +396,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
             appendKey(key, state.fragmentGuestExtent);
             appendKey(key, state.fragmentHostExtent);
         }
-        if (resources.split) {
+        if (resources.split && !globalImages) {
             auto& sets = shader.stage == Stage::Fragment ? keys.fragmentSets : keys.preRasterizationSets;
             for (const auto& binding : shader.program->bindings) {
                 Require(binding.descriptorSet < 2u, "split pipeline library descriptor set exceeds two slots");
@@ -402,7 +404,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
             }
         }
     }
-    if (resources.split) {
+    if (resources.split && !globalImages) {
         const auto unused = 3u & ~(keys.preRasterizationSets | keys.fragmentSets);
         keys.preRasterizationSets |= unused & 1u;
         keys.fragmentSets |= unused & 2u;
@@ -472,6 +474,24 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         appendKey(*key, context.sampleLocationGridSampleCounts);
         appendKey(*key, context.storageImageMultisample);
         appendKey(*key, context.shaderStencilExport);
+    }
+    // Global images (M3): the pipeline layout is one unsplit layout of five sets (Pipeline below:
+    // main, fragment or empty, two empty, the global image set), so every part is built with it and
+    // its key names all of them (without libraries each such pipeline compiled whole: the cold save
+    // load spent its time in vkCreateGraphicsPipelines and scene.py called it hung, eva_u33/u35).
+    if (globalImages) {
+        keys.preRasterizationSets = keys.fragmentSets = 0;
+        appendKey(keys.layout, 0x474c4f42u);
+        appendKey(keys.layout, pushStagesOf(context));
+        appendKey(keys.layout, resources.split);
+        appendKey(keys.layout, resources.mainKey.size());
+        for (const auto word : resources.mainKey) appendKey(keys.layout, word);
+        if (resources.split) {
+            appendKey(keys.layout, resources.fragmentKey.size());
+            for (const auto word : resources.fragmentKey) appendKey(keys.layout, word);
+        }
+        keys.preRasterizationLayout = keys.fragmentLayout = keys.layout;
+        return true;
     }
     if (!resources.split) {
         appendKey(keys.layout, pushStagesOf(context));
@@ -577,13 +597,16 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         // layout, so later draws bind their own ShaderResources' set under it.
         const bool pixelLds = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
         const bool meshWindow = UsesMeshWindow(shaders);
-        const auto pixelLdsLayouts = pixelLds || meshWindow ? PixelFunctionLdsSetLayouts(context) : PixelFunctionLdsLayouts{};
-        const std::array<VkDescriptorSetLayout, 4> setLayouts{resources.main, (pixelLds || meshWindow) && !resources.split ? pixelLdsLayouts.empty : resources.fragment, pixelLds ? pixelLdsLayouts.buffer : pixelLdsLayouts.empty, meshWindow ? MeshWindowSetLayout(context) : VK_NULL_HANDLE};
+        const bool globalImages = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->globalImages; });
+        const auto globalLayout = globalImages ? BindlessSetLayout(context) : VK_NULL_HANDLE;
+        Require(!globalImages || globalLayout != VK_NULL_HANDLE, "global images require bindless descriptor support");
+        const auto pixelLdsLayouts = pixelLds || meshWindow || globalImages ? PixelFunctionLdsSetLayouts(context) : PixelFunctionLdsLayouts{};
+        const std::array<VkDescriptorSetLayout, 5> setLayouts{resources.main, (pixelLds || meshWindow || globalImages) && !resources.split ? pixelLdsLayouts.empty : resources.fragment, pixelLds ? pixelLdsLayouts.buffer : pixelLdsLayouts.empty, meshWindow ? MeshWindowSetLayout(context) : pixelLdsLayouts.empty, globalLayout};
         const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};
         const std::array<VkPushConstantRange, 2> slots{{{pushStagesOf(context), 0, PipelinePushSlotBytes}, {VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes}}};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.flags = pixelLds || meshWindow || !resources.split ? 0 : VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
-        layoutInfo.setLayoutCount = meshWindow ? 4u : pixelLds ? 3u : resources.split ? 2u : 1u;
+        layoutInfo.flags = globalImages || pixelLds || meshWindow || !resources.split ? 0 : VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
+        layoutInfo.setLayoutCount = globalImages ? 5u : meshWindow ? 4u : pixelLds ? 3u : resources.split ? 2u : 1u;
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;

@@ -71,6 +71,8 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+struct GlobalImageKeyResolution;
+
 class ResourceMaterializer {
 public:
     static std::uint32_t EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index);
@@ -80,6 +82,12 @@ public:
     static RuntimeImageModeMatch TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
     static std::uint32_t RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
     static void PrepareImageModes(ShaderInfo& info);
+    // APS5_GPU_SRT=4 (M3): the global image map kind word of an image (GlobalImageAbi.hpp), the class
+    // registry PrepareImageModes fills, and the record of a missed key (Recompiler.hpp).
+    static std::uint32_t GlobalImageKind(const ImageResource& image);
+    static void RegisterGlobalImageClass(const ImageResource& image);
+    static bool ResolveGlobalImageKey(std::uint32_t kind, std::span<const std::uint32_t, 8> key, GlobalImageKeyResolution& out);
+    static std::uint32_t GlobalImageViewBindingOf(const ImageResource& mode);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     static std::shared_ptr<const ResolvedImageTables> ResolveImageTablesShared(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey);
     static bool NullImageDescriptor(const ImageResource& image, const DescriptorValue& descriptor);

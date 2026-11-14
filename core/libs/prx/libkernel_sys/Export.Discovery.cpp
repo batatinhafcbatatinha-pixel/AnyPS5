@@ -14,6 +14,8 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -1826,15 +1828,18 @@ int APS5_VABI sceKernelWaitCommandBufferCompletion(std::uint32_t id) {
 }
 
 int APS5_VABI sceKernelWriteEventQueueOnCompletionCommand(void* dst, std::uint64_t equeue, std::int32_t ident, std::uint64_t data, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p equeue=0x%llx ident=0x%llx data=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(equeue), static_cast<unsigned long long>(ident), static_cast<unsigned long long>(data), outSize);
     if (equeue > EqueueLimit) return SCE_KERNEL_ERROR_EINVAL;
     return WriteCommand(dst, Apr::WriteKernelEventQueueCommand{{Apr::Opcode::WriteKernelEventQueue, sizeof(Apr::WriteKernelEventQueueCommand)}, equeue & GuestAddressMask, static_cast<std::uint64_t>(ident), data, 0}, outSize);
 }
 
 int APS5_VABI sceKernelWriteMapCommand(void* dst, std::uint64_t address, std::uint64_t size, std::uint64_t type, std::uint64_t protection, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx size=0x%llx type=0x%llx protection=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(type), static_cast<unsigned long long>(protection), outSize);
     return WriteAmmCommand({protection}, Apr::EncodeAmmMap(Apr::Opcode::AmmMap, address, 0, size, static_cast<std::int32_t>(type), static_cast<std::int32_t>(protection)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteMapCommand2(void* dst, std::uint64_t address, std::uint64_t size, std::int32_t type, std::int32_t protection, std::int32_t prt, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx size=0x%llx type=0x%llx protection=0x%llx prt=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(type), static_cast<unsigned long long>(protection), static_cast<unsigned long long>(prt), outSize);
     if (prt == 0) return sceKernelWriteMapCommand(dst, address, size, static_cast<std::uint32_t>(type), static_cast<std::uint32_t>(protection), outSize);
     if (!InsideAmmMapRange(address, size)) return SCE_KERNEL_ERROR_EINVAL;
     if (type != 0 || protection != 0) NotImplemented_nid_no_patch("sceKernelWriteMapCommand2: a PRT map with a type or protection");
@@ -1842,47 +1847,57 @@ int APS5_VABI sceKernelWriteMapCommand2(void* dst, std::uint64_t address, std::u
 }
 
 int APS5_VABI sceKernelWriteMapDirectCommand(void* dst, std::uint64_t address, std::uint64_t directOffset, std::uint64_t size, std::uint64_t type, std::uint64_t protection, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx directOffset=0x%llx size=0x%llx type=0x%llx protection=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(directOffset), static_cast<unsigned long long>(size), static_cast<unsigned long long>(type), static_cast<unsigned long long>(protection), outSize);
     return WriteAmmCommand({protection}, Apr::EncodeAmmMap(Apr::Opcode::AmmMapDirect, address, directOffset, size, static_cast<std::int32_t>(type), static_cast<std::int32_t>(protection)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteMapDirectWithGpuMaskIdCommand(void* dst, std::uint64_t address, std::uint64_t directOffset, std::uint64_t size, std::uint64_t type, std::uint64_t protection, std::uint64_t gpuMaskId, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx directOffset=0x%llx size=0x%llx type=0x%llx protection=0x%llx gpuMaskId=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(directOffset), static_cast<unsigned long long>(size), static_cast<unsigned long long>(type), static_cast<unsigned long long>(protection), static_cast<unsigned long long>(gpuMaskId), outSize);
     (void)gpuMaskId;
     return WriteAmmCommand({protection}, Apr::EncodeAmmMap(Apr::Opcode::AmmMapDirect, address, directOffset, size, static_cast<std::int32_t>(type), static_cast<std::int32_t>(protection)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteMapWithGpuMaskIdCommand(void* dst, std::uint64_t address, std::uint64_t size, std::uint64_t type, std::uint64_t protection, std::uint64_t gpuMaskId, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx size=0x%llx type=0x%llx protection=0x%llx gpuMaskId=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(type), static_cast<unsigned long long>(protection), static_cast<unsigned long long>(gpuMaskId), outSize);
     (void)gpuMaskId;
     return WriteAmmCommand({protection}, Apr::EncodeAmmMap(Apr::Opcode::AmmMap, address, 0, size, static_cast<std::int32_t>(type), static_cast<std::int32_t>(protection)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteModifyMtypeProtectWithGpuMaskIdCommand(void* dst, std::uint64_t address, std::uint64_t size, std::uint64_t type, std::uint64_t protection, std::uint64_t mask, std::uint64_t gpuMaskId, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx size=0x%llx type=0x%llx protection=0x%llx mask=0x%llx gpuMaskId=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(type), static_cast<unsigned long long>(protection), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(gpuMaskId), outSize);
     (void)gpuMaskId;
     return WriteAmmCommand({protection, mask}, Apr::EncodeAmmProtect(Apr::Opcode::AmmModifyMtypeProtect, address, size, static_cast<std::int32_t>(type), static_cast<std::int32_t>(protection), static_cast<std::int32_t>(mask)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteModifyProtectCommand(void* dst, std::uint64_t address, std::uint64_t size, std::uint64_t protection, std::uint64_t mask, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx size=0x%llx protection=0x%llx mask=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(protection), static_cast<unsigned long long>(mask), outSize);
     return WriteAmmCommand({protection, mask}, Apr::EncodeAmmProtect(Apr::Opcode::AmmModifyProtect, address, size, 0, static_cast<std::int32_t>(protection), static_cast<std::int32_t>(mask)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteModifyProtectWithGpuMaskIdCommand(void* dst, std::uint64_t address, std::uint64_t size, std::uint64_t protection, std::uint64_t mask, std::uint64_t gpuMaskId, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx size=0x%llx protection=0x%llx mask=0x%llx gpuMaskId=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), static_cast<unsigned long long>(protection), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(gpuMaskId), outSize);
     (void)gpuMaskId;
     return WriteAmmCommand({protection, mask}, Apr::EncodeAmmProtect(Apr::Opcode::AmmModifyProtect, address, size, 0, static_cast<std::int32_t>(protection), static_cast<std::int32_t>(mask)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteMultiMapCommand(void* dst, std::uint64_t address, std::uint64_t alias, std::uint64_t size, std::uint64_t protection, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx alias=0x%llx size=0x%llx protection=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(alias), static_cast<unsigned long long>(size), static_cast<unsigned long long>(protection), outSize);
     return WriteAmmCommand({protection}, Apr::EncodeAmmRemap(Apr::Opcode::AmmMultiMap, address, alias, size, static_cast<std::int32_t>(protection)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteMultiMapWithGpuMaskIdCommand(void* dst, std::uint64_t address, std::uint64_t alias, std::uint64_t size, std::uint64_t protection, std::uint64_t gpuMaskId, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx alias=0x%llx size=0x%llx protection=0x%llx gpuMaskId=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(alias), static_cast<unsigned long long>(size), static_cast<unsigned long long>(protection), static_cast<unsigned long long>(gpuMaskId), outSize);
     (void)gpuMaskId;
     return WriteAmmCommand({protection}, Apr::EncodeAmmRemap(Apr::Opcode::AmmMultiMap, address, alias, size, static_cast<std::int32_t>(protection)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteRemapCommand(void* dst, std::uint64_t address, std::uint64_t source, std::uint64_t size, std::uint64_t protection, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx source=0x%llx size=0x%llx protection=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(source), static_cast<unsigned long long>(size), static_cast<unsigned long long>(protection), outSize);
     return WriteAmmCommand({protection}, Apr::EncodeAmmRemap(Apr::Opcode::AmmRemap, address, source, size, static_cast<std::int32_t>(protection)), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteRemapWithGpuMaskIdCommand(void* dst, std::uint64_t address, std::uint64_t source, std::uint64_t size, std::uint64_t protection, std::uint64_t gpuMaskId, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx source=0x%llx size=0x%llx protection=0x%llx gpuMaskId=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(source), static_cast<unsigned long long>(size), static_cast<unsigned long long>(protection), static_cast<unsigned long long>(gpuMaskId), outSize);
     (void)gpuMaskId;
     return WriteAmmCommand({protection}, Apr::EncodeAmmRemap(Apr::Opcode::AmmRemap, address, source, size, static_cast<std::int32_t>(protection)), dst, outSize);
 }
@@ -1898,15 +1913,18 @@ int APS5_VABI sceKernelWriteSdkEventLogV(void) {
 }
 
 int APS5_VABI sceKernelWriteUnmapCommand(void* dst, std::uint64_t address, std::uint64_t size, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx size=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), outSize);
     return WriteAmmCommand({}, Apr::EncodeAmmUnmap(address, size), dst, outSize);
 }
 
 int APS5_VABI sceKernelWriteUnmapToPrtCommand(void* dst, std::uint64_t address, std::uint64_t size, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx size=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(size), outSize);
     if (!InsideAmmMapRange(address, size)) return SCE_KERNEL_ERROR_EINVAL;
     return WriteCommand(dst, Apr::AmmUnmapCommand{{Apr::Opcode::AmmUnmapToPrt, sizeof(Apr::AmmUnmapCommand)}, address & GuestAddressMask, size & AmmSizeMask}, outSize);
 }
 
 int APS5_VABI sceKernelWriteWaitOnAddressCommand(void* dst, std::uint64_t address, std::uint64_t reference, std::int32_t compare, std::int32_t flush, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx reference=0x%llx compare=0x%llx flush=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(reference), static_cast<unsigned long long>(compare), static_cast<unsigned long long>(flush), outSize);
     (void)flush;
     if (compare > 3) return SCE_KERNEL_ERROR_EINVAL;
     if (dst && (address & 7u) != 0u) NotImplemented_nid_no_patch("sceKernelWriteWaitOnAddressCommand: a wait on an unaligned address");
@@ -1914,16 +1932,19 @@ int APS5_VABI sceKernelWriteWaitOnAddressCommand(void* dst, std::uint64_t addres
 }
 
 int APS5_VABI sceKernelWriteWaitOnCounterCommand(void* dst, std::uint8_t counter, std::uint32_t reference, std::int32_t compare, std::int32_t flush, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p counter=0x%llx reference=0x%llx compare=0x%llx flush=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(counter), static_cast<unsigned long long>(reference), static_cast<unsigned long long>(compare), static_cast<unsigned long long>(flush), outSize);
     (void)flush;
     if (compare > 3) return SCE_KERNEL_ERROR_EINVAL;
     return WriteCommand(dst, Apr::WaitCommand{{Apr::Opcode::WaitOnCounter, sizeof(Apr::WaitCommand)}, 0, reference, ~0ull, counter, static_cast<std::uint8_t>(compare & 7), Apr::CounterAccess::Size4, 0}, outSize);
 }
 
 int APS5_VABI sceKernelWriteWriteAddressCommand(void* dst, std::uint64_t address, std::uint64_t value, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p address=0x%llx value=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(address), static_cast<unsigned long long>(value), outSize);
     return WriteCommand(dst, Apr::WriteAddressCommand{{Apr::Opcode::WriteAddress, sizeof(Apr::WriteAddressCommand)}, address & GuestAddressMask & ~std::uint64_t{7}, value, 0, 0}, outSize);
 }
 
 int APS5_VABI sceKernelWriteWriteCounterCommand(void* dst, std::uint8_t counter, std::uint32_t value, std::uint64_t* outSize) {
+    if (std::getenv("APS5_TRACE_APR")) std::fprintf(stderr, "[apr-writer] %s dst=%p counter=0x%llx value=0x%llx outSize=%p\n", __func__, dst, static_cast<unsigned long long>(counter), static_cast<unsigned long long>(value), outSize);
     return WriteCommand(dst, Apr::WriteCounterCommand{{Apr::Opcode::WriteCounter, sizeof(Apr::WriteCounterCommand)}, counter, Apr::CounterAccess::Size4, Apr::CounterOperation::Store, 0, value}, outSize);
 }
 

@@ -43,6 +43,10 @@ SELF = (b'\x4f\x15\x3d\x1d', b'\x54\x14\xf5\xee')   # fSELF / SELF containers (P
 MODULE_EXTS = ('.prx', '.sprx')
 STANDARD_MODULE_DIRS = ('sce_module', 'sce_modules', 'prx')
 SKIP_DIRS = {'sce_sys'}
+# Bundled copies of these libraries are not relinked: the title uses the AnyPS5 library instead.
+# libSceAmpr records the commands that the AnyPS5 kernel runs; the copy title A carries
+# in fakelib/ keeps them in its own tables, so the kernel never sees the reads it asks for.
+PORT_LIBRARIES = {'libsceampr'}
 
 
 def log(text):
@@ -223,6 +227,7 @@ def build(port):
     if not clean_elf(game / 'eboot.bin', src / 'eboot.elf'):
         raise SystemExit('eboot.bin is neither an ELF nor a SELF container')
     module_dirs = set()
+    replaced = set()
     for folder, dirs, files in os.walk(game):
         rel = Path(folder).relative_to(game)
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not is_link(Path(folder) / d)]
@@ -231,6 +236,8 @@ def build(port):
         for name in files:
             if Path(name).suffix.lower() not in MODULE_EXTS:
                 continue
+            if Path(name).stem.lower() in PORT_LIBRARIES and (libs / f'{Path(name).stem}.prx').is_file():
+                replaced.add(name)
             if clean_elf(Path(folder) / name, src / rel / name):
                 module_dirs.add(rel.as_posix())
     extra = sorted(d for d in module_dirs if d not in STANDARD_MODULE_DIRS)
@@ -245,6 +252,9 @@ def build(port):
     cmd = [str(relinker), '--windows'] + os.environ.get('PS5PORT_RELINK_FLAGS', '').split()
     for d in extra:
         cmd += ['--module-dir', d if d != '' else '.']
+    for name in sorted(replaced):
+        log(f"{name}: the title's copy is replaced by the AnyPS5 library")
+        cmd += ['--exclude-sce-module', name]
     cmd += [str((src / 'eboot.elf').resolve()), 'app.exe']
     log('Relinking for Windows (AnyPS5 relinker) ...')
     result = subprocess.run(cmd, cwd=out, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')

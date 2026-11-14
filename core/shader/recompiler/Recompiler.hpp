@@ -3,6 +3,7 @@
 
 #include "RuntimeAbi.hpp"
 #include "PipelineSpecialization.hpp"
+#include "GlobalImageAbi.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
 #include <array>
@@ -279,6 +280,13 @@ struct ShaderVertexStageInfo {
     float pointSizeMax = 0.0f;
 };
 
+// What a compiled vertex-family stage depends on in its ShaderVertexStageInfo (M4 for vertex stages,
+// REWRITE-STATE.md item 3): everything but the vertex buffers' base addresses and record counts,
+// which only the driver's buffer bindings use. Attributes the decoder merges into one buffer
+// (ShaderInputInfoBuilder: same stride and fetch index, bases closer than the stride) keep their
+// relative offsets. Two infos with equal keys compile to the same stage.
+inline std::uint64_t VertexLayoutKey(const struct ShaderVertexStageInfo& info);
+
 struct ShaderFloatMode {
     std::uint32_t floatMode = 0;
     bool dx10Clamp = false;
@@ -292,6 +300,36 @@ inline constexpr std::uint32_t InterpolationQuiet = 1u;
 inline constexpr std::uint32_t InterpolationFlush32 = 2u;
 inline constexpr std::uint32_t InterpolationFlush16 = 4u;
 inline constexpr std::uint32_t InterpolationRound16Shift = 3u;
+
+inline std::uint64_t VertexLayoutKey(const ShaderVertexStageInfo& info) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) {
+        hash ^= value;
+        hash *= 0x100000001b3ull;
+    };
+    const auto count = std::min<std::uint32_t>(info.resourcesNum, ShaderVertexStageInfo::MaxResources);
+    mix(count);
+    for (const std::uint64_t value : {static_cast<std::uint64_t>(info.fetchAttribReg), static_cast<std::uint64_t>(info.fetchBufferReg), static_cast<std::uint64_t>(info.fetchEmbedded), static_cast<std::uint64_t>(info.paClVsOutCntl), static_cast<std::uint64_t>(info.depthRemapMode), static_cast<std::uint64_t>(info.pointList), static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(info.pointSize)), static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(info.pointSizeMin)), static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(info.pointSizeMax))}) mix(value);
+    const auto base = [&](std::uint32_t r) { return (static_cast<std::uint64_t>(info.resources[r].fields[0]) | (static_cast<std::uint64_t>(info.resources[r].fields[1]) << 32u)) & 0xffffffffffffull; };
+    const auto stride = [&](std::uint32_t r) { return (info.resources[r].fields[1] >> 16u) & 0x3fffu; };
+    for (std::uint32_t r = 0; r < count; ++r) {
+        mix(info.resources[r].fields[1] >> 16u);
+        mix(info.resources[r].fields[3]);
+        const auto& destination = info.resourcesDst[r];
+        mix(static_cast<std::uint32_t>(destination.registerStart));
+        mix(static_cast<std::uint32_t>(destination.registersNum));
+        mix(static_cast<std::uint32_t>(destination.attrId));
+        mix(destination.fetchIndex);
+        for (std::uint32_t other = 0; other < r; ++other) {
+            if (stride(other) != stride(r) || info.resourcesDst[other].fetchIndex != destination.fetchIndex) continue;
+            const auto delta = static_cast<std::int64_t>(base(r)) - static_cast<std::int64_t>(base(other));
+            const auto distance = delta < 0 ? -delta : delta;
+            mix(other);
+            mix(distance < static_cast<std::int64_t>(stride(r)) ? static_cast<std::uint64_t>(delta) : 0x8000000000000000ull);
+        }
+    }
+    return hash;
+}
 
 struct GuestContext {
     std::uint32_t waveSize;
@@ -932,6 +970,9 @@ struct CompiledShaderArtifact {
     // APS5_GPU_SRT resolved this program's SRT on the GPU (IrResourcePlan::gpuSrt): its BDA reads are
     // SRT/V# reads a driver may serve from a cache page table instead of the whole address space.
     bool gpuSrt = false;
+    // APS5_GPU_SRT=4 (M3): the program samples through the device-wide global image set
+    // (GlobalImageAbi::DescriptorSet, bound by the driver; misses in BdaAbi::ForEachGlobalImageMiss).
+    bool globalImages = false;
     bool layerReplaySafe = false;
     bool gridScalable = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
@@ -1006,6 +1047,62 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
 
 [[nodiscard]] std::optional<MeshBarycentricLayout> MeshBarycentricLayoutOf(const RecompileResult& fragment);
 
+// A result whose resources the GPU resolves entirely at run time (APS5_GPU_SRT): no binding carries a
+// CPU-captured descriptor, flat SRT word or image table, so the result depends on the guest memory
+// only through BDA reads made by the shader, and on the draw only through its user data words
+// (forwarded as push data, ShaderInvocation::shaderDataUserWords) and the request (stage inputs,
+// vertex fetch info, thread limits). A driver may then reuse it for later draws of the same program
+// and request with the forwarded words patched, without capturing or materializing again.
+// APS5_GPU_SRT=4 (M3, GlobalImageAbi.hpp): what Graphics needs to fill the global image map for a key
+// a shader missed (BdaAbi::ForEachGlobalImageMiss): the record words and the view or sampler to make.
+inline constexpr std::uint32_t GlobalImageSamplerKind = 3u;
+struct GlobalImageKeyResolution {
+    bool sampler = false;
+    // Map entry record: flags (mode index << ImageTableAbi::ModeShift, or ImageTableAbi::PoisonFlag |
+    // reason: then nothing is made and the shader samples 0), dword3 (T# word 3).
+    std::uint32_t flags = 0;
+    std::uint32_t dword3 = 0;
+    // Images: the T# the view is made from (swizzle cleared for converted modes, as image tables do),
+    // its shape, the GlobalImageAbi::ViewBinding array the element goes in, depth compare, and the
+    // recompiler's binding kind (DescriptorBindingKind: sampled numeric class).
+    std::array<std::uint32_t, 8> words{};
+    DescriptorImageShape shape = DescriptorImageShape::Image2D;
+    std::uint32_t viewBinding = 0;
+    bool depthCompare = false;
+    std::uint32_t bindingKind = 0;
+    // Samplers: ImageTableAbi::SamplerEntryElements consecutive elements {filtered, point, compare,
+    // compare point}: their S# words (point variants already point-filtered); compare = variant >= 2.
+    std::array<std::array<std::uint32_t, 4>, 4> samplerWords{};
+};
+// False when no program with this kind was prepared in this process (keep the key unresolved).
+[[nodiscard]] bool ResolveGlobalImageKey(std::uint32_t kind, std::span<const std::uint32_t, 8> key, GlobalImageKeyResolution& out);
+
+inline GlobalImageAbi::ViewBinding GlobalImageViewBinding(DescriptorImageShape shape) {
+    switch (shape) {
+        case DescriptorImageShape::Image1D: return GlobalImageAbi::ViewBinding::Image1D;
+        case DescriptorImageShape::Image1DArray: return GlobalImageAbi::ViewBinding::Image1DArray;
+        case DescriptorImageShape::Image3D: return GlobalImageAbi::ViewBinding::Image3D;
+        case DescriptorImageShape::ImageCube: return GlobalImageAbi::ViewBinding::Cube;
+        case DescriptorImageShape::Image2DArray:
+        case DescriptorImageShape::Image2DMultisampleArray: return GlobalImageAbi::ViewBinding::Image2DArray;
+        default: return GlobalImageAbi::ViewBinding::Image2D;
+    }
+}
+
+[[nodiscard]] inline bool RuntimeResolved(const RecompileResult& result) {
+    if (!result.gpuSrt) return false;
+    for (const auto& binding : result.bindings) {
+        switch (binding.role) {
+            case DescriptorRole::BdaPagetable:
+            case DescriptorRole::FaultBuffer:
+            case DescriptorRole::ShaderData:
+            case DescriptorRole::Gds: break;
+            default: return false;
+        }
+    }
+    return true;
+}
+
 struct MeshOutputUse {
     std::uint32_t flatParameters = 0;
     std::uint32_t perVertexParameters = 0;
@@ -1045,7 +1142,9 @@ void SetDebugProbeActive(bool active);
 // address reads through the BDA page table and every buffer V# is read by the shader itself
 // (MemoryInfo::gpuDescriptor). Applies to programs without image or sampler operations.
 // 0: off (default); 1: compute programs; 2: every stage; 3: every stage and also programs with
-// images, whose image/sampler descriptors are still resolved by the CPU walk (hybrid).
+// images, whose image/sampler descriptors are still resolved by the CPU walk (hybrid); 4: as 3, and
+// sampled images and samplers are looked up by the shader in the global image map (M3,
+// GlobalImageAbi.hpp; RecompileResult::globalImageClasses).
 [[nodiscard]] std::uint32_t GpuSrtStages();
 
 struct RectListShaders {

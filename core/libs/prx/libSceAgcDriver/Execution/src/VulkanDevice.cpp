@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -3438,7 +3440,15 @@ bool AliasCopy(const Graphics::Context& context, std::uint64_t destination, std:
         copyAliasCreated.fetch_add(1, std::memory_order_relaxed);
     }
     const char* refusal = nullptr;
-    if (!plan.to->CopyFrom(*plan.from, refusal)) throw std::runtime_error(std::string("AGC graphics: an image copy its check allowed was refused: ") + refusal);
+    if (!plan.to->CopyFrom(*plan.from, refusal)) {
+        // An image the storage cache released between the plan and the copy (the destination made
+        // just above can be released at once under budget pressure): the copy goes through memory.
+        if (refusal != nullptr && std::string_view(refusal) == "released") {
+            copyAliasRefused.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        throw std::runtime_error(std::string("AGC graphics: an image copy its check allowed was refused: ") + refusal);
+    }
     copiesAliased.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -5903,6 +5913,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     VkAccessFlags covered = 0;
     bool overlapped = false;
     const std::array<const void*, 2> runOwners{record.resources.get(), resources.MemoryOwner()};
+    if (record.shader->program->globalImages) Graphics::FlushBindless(context, recorder);
     const auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, runAccesses, &covered, overlapped) : recorder.Commands(&covered);
     constexpr VkAccessFlags runLeadingCovered = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     if (overlapCapable && !overlapped && (covered & runLeadingCovered) != runLeadingCovered) covered = 0;
@@ -6005,6 +6016,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.grid != std::array<std::uint32_t, 4>{} ? splitComputePipeline(context, *record.shader->program, *record.objects, {0u, 0u, 0u}, record.grid) : record.objects->pipeline);
     if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
+    if (record.shader->program->globalImages) {
+        const auto set = Graphics::BindlessSet(context);
+        Graphics::Require(set != VK_NULL_HANDLE, "global images require a descriptor set");
+        context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::GlobalImageAbi::DescriptorSet, 1, &set, 0, nullptr);
+    }
     if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
     else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
@@ -6161,10 +6177,13 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     objects->module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     objects->resourcesLayout = setLayout;
     const bool scratchPool = shader.scratchPoolSlotDwords != 0;
-    const std::array<VkDescriptorSetLayout, 3> setLayouts{setLayout, shader.workgroupMemoryDwords != 0 || scratchPool ? state->workgroupMemoryLayout : VK_NULL_HANDLE, scratchPool ? state->workgroupMemoryLayout : VK_NULL_HANDLE};
+    const auto emptyLayout = shader.globalImages ? Graphics::PixelFunctionLdsSetLayouts(context).empty : VK_NULL_HANDLE;
+    const auto globalLayout = shader.globalImages ? Graphics::BindlessSetLayout(context) : VK_NULL_HANDLE;
+    Graphics::Require(!shader.globalImages || globalLayout != VK_NULL_HANDLE, "global images require bindless descriptor support");
+    const std::array<VkDescriptorSetLayout, 5> setLayouts{setLayout, shader.workgroupMemoryDwords != 0 || scratchPool ? state->workgroupMemoryLayout : emptyLayout, scratchPool ? state->workgroupMemoryLayout : emptyLayout, emptyLayout, globalLayout};
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
     VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layoutInfo.setLayoutCount = scratchPool ? ShaderRecompiler::ScratchPoolDescriptorSet + 1 : shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
+    layoutInfo.setLayoutCount = shader.globalImages ? 5u : scratchPool ? ShaderRecompiler::ScratchPoolDescriptorSet + 1 : shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
     layoutInfo.pSetLayouts = setLayouts.data();
     layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
     layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;

@@ -5,9 +5,12 @@
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
+#include "Optimization/SrtWalker/SrtPlanBuilder.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
+#include "Recompiler.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -158,6 +161,7 @@ public:
         std::vector<const IrValue*> referenced;
         for (const auto& plan : m_tableColumns) {
             const auto& column = *m_sources[plan.source].tableColumn;
+            if (column.global) continue;  // the handle keeps its descriptor words: the shader loads them
             IrValue* offset = column.selected ? &m_builder.Constant(column.addend) : plan.offset;
             for (std::uint32_t argument = 0; argument < plan.handle->ArgumentCount(); argument++) {
                 const auto value = plan.parentPointer != nullptr && (argument == 1u || argument == 2u) ? plan.parentPointer->Argument(argument - 1u) : offset;
@@ -1109,11 +1113,54 @@ private:
         return found == m_tableColumns.end() ? nullptr : &*found;
     }
 
+    // APS5_GPU_SRT=4 (M3): every sampled image and sampler of a gpuSrt program not bound directly
+    // (DirectImageHandles) becomes a global column: one table each, looked up by its run-time words in
+    // the global image map instead of a per-draw table snapshot.
+    bool GlobalImages() {
+        static const bool globalCompute = std::getenv("APS5_GPU_SRT_GLOBAL_COMPUTE") != nullptr;
+        // APS5_GPU_SRT_GLOBAL_BISECT=mask:value (hex, diagnostic): only programs whose shader hash
+        // matches value under mask take global images (finds a program that samples wrong).
+        static const std::pair<std::uint64_t, std::uint64_t> bisect = [] {
+            const char* text = std::getenv("APS5_GPU_SRT_GLOBAL_BISECT");
+            if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+            char* end = nullptr;
+            const auto mask = std::strtoull(text, &end, 16);
+            const auto value = end != nullptr && *end == ':' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
+            return std::pair<std::uint64_t, std::uint64_t>{mask, value};
+        }();
+        if (!m_globalImages.has_value()) m_globalImages = m_program.Resources().gpuSrt && GpuSrtStages() >= 4u && !Detail::ProgramWritesImages(m_program) && (globalCompute || m_program.Resources().stage != IrShaderStage::Compute) && (m_program.Resources().shaderHash & bisect.first) == bisect.second;
+        return *m_globalImages;
+    }
+
+    bool TryMakeGlobalColumn(IrValue& handle, bool sampler, TableColumnPlan& plan) {
+        const auto expected = sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource;
+        const std::uint32_t width = sampler ? 4u : 8u;
+        if (handle.Opcode() != expected || handle.ArgumentCount() != width) return false;
+        DescriptorSource source;
+        source.dwordCount = width;
+        for (std::uint32_t dword = 0; dword < width; ++dword) source.dwords[dword] = handle.Argument(dword)->Resolve();
+        TableColumn column;
+        column.global = true;
+        column.sampler = sampler;
+        column.dwordCount = width;
+        source.tableColumn = column;
+        plan.handle = &handle;
+        plan.source = InternSource(source);
+        m_sources[plan.source].tableColumn->heapSource = plan.source;
+        plan.offset = nullptr;
+        return true;
+    }
+
     bool PlanTableColumn(IrValue& handle, bool sampler, bool r128) {
         if (FindTableColumn(handle) != nullptr) {
             return true;
         }
         TableColumnPlan plan;
+        if (GlobalImages()) {
+            if (!TryMakeGlobalColumn(handle, sampler, plan)) return false;
+            m_tableColumns.push_back(std::move(plan));
+            return true;
+        }
         if (!TryMakeTableColumn(handle, sampler, r128, plan)) {
             return false;
         }
@@ -1962,7 +2009,7 @@ private:
                 if (std::ranges::none_of(directImages, [&](const IrValue* handle) { return SameHandle(*handle, image); })) {
                     static_cast<void>(PlanTableColumn(image, false, memory.imageR128));
                 }
-                if (imageInfo.needsSampler && inst->ArgumentCount() > 1u && !DirectSampler(*inst->Argument(1)->Resolve())) {
+                if (imageInfo.needsSampler && inst->ArgumentCount() > 1u && (GlobalImages() || !DirectSampler(*inst->Argument(1)->Resolve()))) {
                     static_cast<void>(PlanTableColumn(*inst->Argument(1)->Resolve(), true, false));
                 }
             }
@@ -2149,6 +2196,7 @@ private:
     }
 
     void AssignTables() {
+        m_info.globalImages = std::ranges::any_of(m_sources, [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->global; });
         std::uint32_t next = 0;
         for (auto& image : m_info.images) {
             if (!TableSource(image.source)) {
@@ -2187,9 +2235,25 @@ private:
         std::uint32_t badDword = 0;
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
-        // APS5_GPU_SRT: only a V# loaded from memory is read by the shader itself; one built from user
-        // data or constants needs no capture read and stays a bound descriptor, as before.
-        const bool gpuRead = m_program.Resources().gpuSrt && !WrittenThrough(*handle) && LoadedFromMemory(descriptor);
+        // APS5_GPU_SRT: read-only V#s loaded from memory are read by the shader itself (so the result
+        // can be RuntimeResolved); written ones stay bound.
+        // A V# built from the shader's own code address (s_getpc: a constant table in the code) stays
+        // bound: the BDA table does not map shader code (eva_m3p: a fault per invocation, 1.8 s per
+        // dispatch). V#s not loaded from memory (user data, constants) stay bound too: reading them
+        // on the GPU stalled the save load in every GPU-SRT mode (bisect eva_u9..u13, 2026-11-13);
+        // APS5_GPU_SRT_GPU_USER_VSHARPS=1 reads them on the GPU.
+        static const bool boundUserVsharps = std::getenv("APS5_GPU_SRT_GPU_USER_VSHARPS") == nullptr;
+        // A program that stores to or updates any buffer keeps every V# bound: two handles may name the
+        // same memory, and a read through BDA would not see a store through a bound descriptor (a spin
+        // on a counter then never ends: the mode-3 GPU hang of eva_d1).
+        // APS5_GPU_SRT_WRITES=1: a program that writes buffers reads and writes every V# through BDA
+        // (one view of the memory, so its loops see their own stores; stores are noted per page for
+        // the driver, BdaAbi written pages) instead of keeping them all bound.
+        static const bool gpuWrites = std::getenv("APS5_GPU_SRT_WRITES") != nullptr;
+        // Debug aid: APS5_GPU_SRT_BOUND_IMAGE_PROGRAM_VSHARPS=1 keeps every V# of a program that uses
+        // images bound (bisect of the mode-3/4 save-load stall).
+        static const bool boundImageProgram = std::getenv("APS5_GPU_SRT_IMAGE_PROGRAM_GPU_READS") == nullptr;
+        const bool gpuRead = m_program.Resources().gpuSrt && !(boundImageProgram && !SrtWalker::GpuSrtEligibleWithoutImages(m_program)) && (gpuWrites || (!ProgramWritesBuffers() && !WrittenThrough(*handle))) && (!boundUserVsharps || LoadedFromMemory(descriptor)) && !UsesShaderBase(descriptor);
         if (!gpuRead && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
@@ -2205,10 +2269,43 @@ private:
         return true;
     }
 
+    bool ProgramWritesBuffers() {
+        if (m_programWrites.has_value()) return *m_programWrites;
+        bool writes = false;
+        for (const auto& block : m_program.Blocks()) {
+            for (const IrValue* inst : block->Instructions()) {
+                const auto buffer = BufferAccessOf(inst->Opcode());
+                const auto address = AddressOpcodeInfoOf(inst->Opcode()).access;
+                if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic) writes = true;
+            }
+        }
+        m_programWrites = writes;
+        return writes;
+    }
+
     static bool WrittenThrough(const IrValue& handle) {
         for (const IrValue* use : handle.Uses()) {
             const auto access = BufferAccessOf(use->Opcode());
             if (access == BufferAccess::Write || access == BufferAccess::Atomic) return true;
+        }
+        return false;
+    }
+
+    static bool UsesShaderBase(const DescriptorSource& descriptor) {
+        std::vector<const IrValue*> pending;
+        std::unordered_set<const IrValue*> seen;
+        for (std::uint32_t dword = 0; dword < descriptor.dwordCount && dword < descriptor.dwords.size(); ++dword) {
+            if (descriptor.dwords[dword] != nullptr) pending.push_back(descriptor.dwords[dword]->Resolve());
+        }
+        while (!pending.empty()) {
+            const IrValue* value = pending.back();
+            pending.pop_back();
+            if (value == nullptr || !seen.insert(value).second) continue;
+            if (value->Opcode() == IrOpcode::GetShaderBase) return true;
+            if (seen.size() > 4096u) return true;
+            for (std::size_t argument = 0; argument < value->ArgumentCount(); ++argument) {
+                if (value->Argument(argument) != nullptr) pending.push_back(value->Argument(argument)->Resolve());
+            }
         }
         return false;
     }
@@ -2562,6 +2659,8 @@ private:
     }
 
     IrProgram& m_program;
+    std::optional<bool> m_programWrites;
+    std::optional<bool> m_globalImages;
     ShaderInfo m_info;
     IrBuilder m_builder;
     std::vector<DescriptorSource> m_sources;

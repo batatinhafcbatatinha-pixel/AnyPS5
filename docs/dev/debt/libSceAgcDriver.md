@@ -450,3 +450,6 @@
 ### Guest memory read lifetime
 
 - [Guest memory reads](../../../core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp) - `CopyMapped` uses the native checked-copy API without host-read synchronization, so stale readable-page metadata cannot turn a failed speculative copy into a host fault. A successful copy does not pin the range or provide an atomic snapshot against concurrent writes or remaps. `CompareMapped` and other direct reads still require the caller to keep their mappings alive.
+
+- [Global sampled images](../../../core/libs/prx/libSceAgcDriver/Graphics/src/BindlessTable.cpp) (`APS5_GPU_SRT=4`): first-use misses return zero until a completed batch publishes their keys; no warm-up replay exists. The map has eight probes and bounded image/sampler slots; saturation leaves keys unresolved. Global image programs use monolithic graphics pipelines and scan live texture slots before each use. Draws without an active recorder throw. Device recreation, hardware correctness, and main/change Vulkan validation coverage remain unverified.
+- Global samplers throw for borders, shader-applied LOD bias, disabling degamma, unsupported non-seamless cubes and anisotropic ANISO_OVERRIDE: the global key does not carry the image/sampler pairing needed to validate or implement those cases.

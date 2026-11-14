@@ -824,6 +824,7 @@ public:
             const bool gpuFill = clearPattern.has_value() && clearFillNote != 0u && (queuedFill || newestHtileNote == 0u);
             for (std::size_t index = 0u; index < sampling.initial.size(); ++index) {
                 const auto& plane = sampling.initial[index];
+                if (index != 1u && !GuestMemory::UnchangedSince(plane.address, plane.bytes, plane.generation)) reportGuestOverwrite("clear", __builtin_return_address(0));
                 if (index != 1u) Require(GuestMemory::UnchangedSince(plane.address, plane.bytes, plane.generation), "guest writes over native multisample depth are not implemented");
             }
             Require(GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, clearGeneration), "CPU writes raced native multisample depth clear");
@@ -847,7 +848,22 @@ public:
             clearAspects = 0u;
             pendingClear = 0u;
         }
+        if (!GuestMemory::UnchangedSinceAll(sampling.initial)) reportGuestOverwrite("current", __builtin_return_address(0));
         Require(GuestMemory::UnchangedSinceAll(sampling.initial), "guest writes over native multisample depth are not implemented");
+    }
+
+    // Diagnostics before the refusal "guest writes over native multisample depth":
+    // which planes changed, where, and the caller of CheckCurrent.
+    void reportGuestOverwrite(const char* where, const void* caller) const {
+        std::fprintf(stderr, "[depth] native multisample depth 0x%llx %ux%u x%u (%s): guest memory changed; caller %p\n",
+                     static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, target.samples, where, caller);
+        for (std::size_t index = 0u; index < sampling.initial.size(); ++index) {
+            const auto& plane = sampling.initial[index];
+            std::fprintf(stderr, "[depth]   plane %zu (%s) 0x%llx+0x%zx generation %llu changed=%u\n", index,
+                         index == 0u ? "depth" : index == 1u ? "htile" : "stencil", static_cast<unsigned long long>(plane.address), plane.bytes,
+                         static_cast<unsigned long long>(plane.generation), GuestMemory::UnchangedSince(plane.address, plane.bytes, plane.generation) ? 0u : 1u);
+        }
+        std::fflush(stderr);
     }
 
     void CheckResource(const GuestTextureResource& resource) const {
@@ -3540,6 +3556,20 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     }
     for (const auto& candidate : surfaces()) {
         if (surface == nullptr && candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameLayoutWithin(candidate->target, target)) surface = candidate.get();
+    }
+    // A native multisample depth surface whose guest planes the title has written since (Grand
+    // Theft Auto V reuses that memory for other targets) and that holds no host results is
+    // retired like a surface covered by storage writes; a new one is made from the guest memory.
+    if (surface != nullptr && surface->target.samples != 1u && surface->samplingActive && !surface->hostWritten->load(std::memory_order_acquire)) {
+        for (const auto& range : surface->sampling.initial) GuestMemory::CollectWritesUncached(range.address, range.bytes);
+        if (!GuestMemory::UnchangedSinceAll(surface->sampling.initial)) {
+            retire(*surface);
+            std::unique_lock guardLock(depthGuardMutex());
+            surface->active->store(false, std::memory_order_release);
+            std::erase_if(depthGuards(), [&](const auto& range) { return range.active == surface->active; });
+            anyDepthGuard().store(!depthGuards().empty(), std::memory_order_release);
+            surface = nullptr;
+        }
     }
     const bool created = surface == nullptr;
     if (!created) surface->ProveOverwrite();

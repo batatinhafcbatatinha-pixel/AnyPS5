@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -384,7 +385,11 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
             ++cache.counts.uncached;
             return false;
         }
-        const bool keep = back->accounted == 0 || (!over && back->texture.use_count() > 1);
+        // Sampled by a shader through the global image set this present or the last (BindlessTable):
+        // a use the cache's own lookups never see.
+        const bool bindlessRecent = present != 0 && back->texture->BindlessUse() + 1u >= present;
+        if (bindlessRecent) back->present = present;
+        const bool keep = back->accounted == 0 || (!over && back->texture.use_count() > 1) || bindlessRecent;
         if (keep && cache.passed < cache.entries.size()) {
             cache.entries.splice(cache.entries.begin(), cache.entries, back);
             ++cache.passed;
@@ -4672,10 +4677,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             guestMemory.RecordStagingCopies(*recorder);
             // APS5_BUFFER_CACHE=1: address-based stages may read through the cache's page table
             // (BdaResources), whose resident pages are brought up to date before this use.
-            if (usesBda && BufferCacheEnabled()) {
+            if (usesBda && BufferCacheEnabled() && TableUsed()) {
                 MakeQueuedResident(context, *recorder);
                 SyncResident(context, *recorder);
             }
+            if (usesBda) FlushBindless(context, *recorder);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
             return finish(fast, false);
@@ -7120,6 +7126,7 @@ void ShaderResources::WriteBack() {
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     if (bda != nullptr && recorder.Device() == context.device) bda->NoteUse(recorder.OpenSerial());
+    RequestEarlySubmitIfHot(guestMemory.Writes());
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
@@ -7384,6 +7391,28 @@ std::optional<GridScaleExtents> ShaderResources::GridScaleFor(const ShaderRecomp
         }
     }
     return extents;
+}
+
+// M3: the guest memory a global image's texels come from (BindlessTable refreshes a slot when it
+// was written since its last lookup).
+std::pair<std::uint64_t, std::uint64_t> BindlessTextureRange(std::span<const std::uint32_t, 8> words, ShaderRecompiler::DescriptorImageShape shape) {
+    if (IsNullSampledTextureResource(words)) return {0, 0};
+    std::array<std::uint32_t, 8> narrowed{};
+    const auto resource = DecodeTextureResource(firstLayerWords(words, shape, narrowed, false));
+    return {resource.baseAddress, DescribeSurface(resource).guestBytes};
+}
+
+std::shared_ptr<Texture> BindlessSampledTexture(const Context& context, std::span<const std::uint32_t, 8> words, ShaderRecompiler::DescriptorImageShape shape, bool depthCompare) {
+    if (IsNullSampledTextureResource(words)) return nullptr;
+    std::array<std::uint32_t, 8> narrowed{};
+    const auto sampledWords = firstLayerWords(words, shape, narrowed, true);
+    const auto resource = DecodeTextureResource(sampledWords);
+    const auto guestBytes = DescribeSurface(resource).guestBytes;
+    CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
+    Require(context.imageViewMinLod || EffectiveMinLod(resource) == 0.0f, "a global image requires VK_EXT_image_view_min_lod");
+    const auto viewType = shape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    return cachedTexture(context, sampledWords, resource, ViewComponents(resource), guestBytes, depthCompare, viewType, layerRowsBinding(shape, resource, depthCompare));
 }
 
 }

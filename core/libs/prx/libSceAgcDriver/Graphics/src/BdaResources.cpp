@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -14,6 +15,8 @@
 #include <cstring>
 #include <limits>
 #include <list>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <iomanip>
 #include <span>
@@ -71,9 +74,23 @@ void classifyFirstEntry(TableCache& cache, std::uint64_t hash, const std::vector
     ++(begin < 0x10000000ull ? classes.firstDiffersLow : classes.firstDiffersHeap);
 }
 
-TableCache& Tables() {
-    static TableCache cache;
-    return cache;
+// One table cache per live VkDevice: with one shared cache, every build of the other device cleared
+// it (the driver holds two devices), so tables were rebuilt after each switch.
+std::mutex& tablesMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<VkDevice, std::unique_ptr<TableCache>>& allTables() {
+    static auto* tables = new std::map<VkDevice, std::unique_ptr<TableCache>>();
+    return *tables;
+}
+
+TableCache& Tables(VkDevice device) {
+    std::lock_guard lock(tablesMutex());
+    auto& slot = allTables()[device];
+    if (slot == nullptr) slot = std::make_unique<TableCache>();
+    return *slot;
 }
 
 bool tableCacheEnabled() {
@@ -313,13 +330,30 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
     return true;
 }
 
+namespace {
+
+std::size_t exactTableBytes(Buffer& table) {
+    ShaderRecompiler::BdaAbi::Header header{};
+    const auto bytes = table.Bytes();
+    Require(bytes.size() >= sizeof(header), "BDA table smaller than its header");
+    std::memcpy(&header, bytes.data(), sizeof(header));
+    const auto exact = sizeof(header) + static_cast<std::size_t>(header.count) * sizeof(ShaderRecompiler::BdaAbi::Range) + ((header.reserved & 1u) != 0u ? sizeof(std::uint64_t) : 0u);
+    Require(exact <= bytes.size(), "BDA table header exceeds its buffer");
+    return exact;
+}
+
+}
+
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
     std::uint64_t cacheRoot = 0;
-    if (BufferCacheEnabled() && GuestMemory::GpuMutex().HeldByThisThread()) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) {
-            cacheRoot = BufferCacheTable(context, *recorder);
-            MakeQueuedResident(context, *recorder);
-            SyncResident(context, *recorder);
+            if (BufferCacheEnabled() && TableUsed()) {
+                if (TableReadsCurrent(*recorder)) cacheRoot = BufferCacheTable(context, *recorder);
+                MakeQueuedResident(context, *recorder);
+                SyncResident(context, *recorder);
+            }
+            FlushBindless(context, *recorder);
         }
     }
     const auto cached = memory.CachedAddressTable();
@@ -329,7 +363,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     const auto serial = cached.has_value() ? cached->serial : 0;
     auto guardSerial = MultisampleTargetRangeGeneration();
     if (tableCacheEnabled() && serial != 0) {
-        auto& cache = Tables();
+        auto& cache = Tables(context.device);
         std::lock_guard lock(cache.mutex);
         if (cache.device != context.device) {
             cache.entries.clear();
@@ -340,7 +374,10 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             const auto key = std::pair{serial, guardSerial};
             if (std::find(it->spaceKeys.begin(), it->spaceKeys.end(), key) == it->spaceKeys.end()) continue;
             if (auto shared = it->buffer.lock(); shared != nullptr) {
-                tableBytes = shared->Bytes().size();
+                // The bound size is the table's own (header + ranges + the cache root when present),
+                // not the buffer's allocation, which a pool may round up: the shader checks the
+                // header's range count against the bound length (InvalidTable faults otherwise).
+                tableBytes = exactTableBytes(*shared);
                 tableGuardSerial = guardSerial;
                 ++cache.hits;
                 ++cache.classes.spaceTables;
@@ -359,7 +396,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
-    auto& cache = Tables();
+    auto& cache = Tables(context.device);
     std::uint64_t hash = 0;
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
@@ -397,6 +434,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                     it->spaceKeys.push_back(key);
                     if (it->spaceKeys.size() > tableCacheEntries()) it->spaceKeys.erase(it->spaceKeys.begin());
                 }
+                // tableBytes above lacks the cache root's 8 bytes the shared table carries.
+                tableBytes = exactTableBytes(*shared);
                 table = std::move(shared);
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
                 return;
@@ -431,12 +470,17 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
 }
 
 BdaResources::TableCacheStats BdaResources::TableCacheCounters() {
-    auto& cache = Tables();
-    std::lock_guard lock(cache.mutex);
-    auto stats = cache.classes;
-    stats.hits = cache.hits;
-    stats.misses = cache.misses;
-    stats.held = cache.entries.size();
+    // The busiest device's cache (the one that built the most tables).
+    TableCacheStats stats{};
+    std::lock_guard tablesLock(tablesMutex());
+    for (auto& [device, cache] : allTables()) {
+        std::lock_guard lock(cache->mutex);
+        if (cache->hits + cache->misses < stats.hits + stats.misses) continue;
+        stats = cache->classes;
+        stats.hits = cache->hits;
+        stats.misses = cache->misses;
+        stats.held = cache->entries.size();
+    }
     return stats;
 }
 
@@ -495,6 +539,7 @@ void BdaResources::CheckUse(const BdaResources* record) const {
 
 void BdaResources::checkFault(const BdaResources& record) const {
     if (record.faultChunk == nullptr) return;
+    QueueBindlessMisses(record.faultDevice, reinterpret_cast<std::uint32_t*>(record.faultBytes().data()));
     // Pages GPU-side SRT reads resolved through the ranges because the cache table did not hold them:
     // queued to become resident (BufferCache.hpp), and the record's region cleared.
     static_cast<void>(ShaderRecompiler::BdaAbi::ForEachAccessedPage(reinterpret_cast<std::uint32_t*>(record.faultBytes().data()), ShaderRecompiler::BdaAbi::CachePageShift, [](std::uint64_t page) { QueueResident(page, std::size_t{1} << ShaderRecompiler::BdaAbi::CachePageShift); }));

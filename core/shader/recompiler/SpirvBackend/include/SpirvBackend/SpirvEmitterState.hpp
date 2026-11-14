@@ -214,6 +214,17 @@ struct SpirvEmitterState {
         BdaAnchor range;
     };
     std::vector<BufferAnchor> bufferAnchors;
+    // APS5_GPU_SRT=4 (M3): global image map lookups made where a T#/S# handle is defined, one per
+    // (handle, kind), reused by every image instruction the handle feeds.
+    struct GlobalImageLookup {
+        const IrValue* handle = nullptr;
+        std::uint32_t kind = 0;
+        std::uint32_t found = 0;
+        std::uint32_t entry = 0;
+        std::uint32_t hash = 0;
+        std::array<std::uint32_t, 8> key{};
+    };
+    std::vector<GlobalImageLookup> globalImageLookups;
     std::uint32_t bdaAnchorFunction = 0;
     std::uint32_t bdaStopValue = 0;
     std::uint32_t bdaPcOverride = 0;

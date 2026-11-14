@@ -54,10 +54,14 @@ struct TableColumn {
     std::uint32_t foldedAddend = 0;
     std::uint32_t foldedCarry = 0;
     bool selected = false;
+    // APS5_GPU_SRT=4 (M3): the descriptor words stay run-time values the shader loads itself and looks
+    // up in the global image map (GlobalImageAbi.hpp); heapSource is the column's own source, no
+    // per-draw snapshot or map.
+    bool global = false;
     std::uint32_t selection = 0;
 
     bool operator==(const TableColumn& other) const {
-        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler && address == other.address && buffer == other.buffer && indirect == other.indirect && indirectOffset == other.indirectOffset && indirectImmediate == other.indirectImmediate && pointerHops == other.pointerHops && foldedAddend == other.foldedAddend && foldedCarry == other.foldedCarry && selected == other.selected && selection == other.selection;
+        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler && address == other.address && buffer == other.buffer && indirect == other.indirect && indirectOffset == other.indirectOffset && indirectImmediate == other.indirectImmediate && pointerHops == other.pointerHops && foldedAddend == other.foldedAddend && foldedCarry == other.foldedCarry && selected == other.selected && global == other.global && selection == other.selection;
     }
 };
 

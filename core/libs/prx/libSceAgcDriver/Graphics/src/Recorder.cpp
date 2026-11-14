@@ -1063,6 +1063,60 @@ void NoteHookSegments(bool capture, bool locked, bool kept, const std::array<std
     segments.counts = {};
 }
 
+}  // namespace (reopened below: the hot-write functions are part of the Graphics interface)
+
+namespace {
+struct HotWrites {
+    std::mutex mutex;
+    // 64 KiB-aligned ranges, most recent last.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::atomic<bool> requested{false};
+};
+HotWrites& hotWrites() {
+    static auto* hot = new HotWrites();
+    return *hot;
+}
+bool hotEarlySubmitEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_HOT_EARLY_SUBMIT") != nullptr;
+    return !disabled;
+}
+}
+
+void NoteHotWrite(std::uint64_t address, std::size_t bytes) {
+    if (!hotEarlySubmitEnabled() || bytes == 0) return;
+    constexpr std::uint64_t block = 64 * 1024;
+    const auto begin = address / block * block;
+    const auto end = (address + bytes + block - 1) / block * block;
+    auto& hot = hotWrites();
+    std::lock_guard lock(hot.mutex);
+    const auto found = std::find_if(hot.ranges.begin(), hot.ranges.end(), [&](const auto& range) { return range.first <= begin && end <= range.second; });
+    if (found != hot.ranges.end()) {
+        std::rotate(found, found + 1, hot.ranges.end());
+        return;
+    }
+    constexpr std::size_t Capacity = 32;
+    if (hot.ranges.size() >= Capacity) hot.ranges.erase(hot.ranges.begin());
+    hot.ranges.emplace_back(begin, end);
+}
+
+void RequestEarlySubmitIfHot(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
+    if (!hotEarlySubmitEnabled() || writes.empty()) return;
+    auto& hot = hotWrites();
+    std::lock_guard lock(hot.mutex);
+    for (const auto& [begin, end] : writes) {
+        if (std::any_of(hot.ranges.begin(), hot.ranges.end(), [&](const auto& range) { return begin < range.second && range.first < end; })) {
+            hot.requested.store(true, std::memory_order_release);
+            return;
+        }
+    }
+}
+
+bool TakeEarlySubmitRequest() {
+    return hotEarlySubmitEnabled() && hotWrites().requested.exchange(false, std::memory_order_acq_rel);
+}
+
+namespace {
+
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     static const bool segmented = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -1091,6 +1145,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         static_cast<void>(FlushResidentStaging(address, bytes, ResidentFlush::Access));
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
+            if (GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Capture) NoteHotWrite(address, bytes);
             const HookSyncScope attribution(*recorder, address, bytes);
             Recorder::CountSync(1);
             // The wait runs without the mutex when this acquisition is the outermost one (a stage-A

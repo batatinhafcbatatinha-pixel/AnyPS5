@@ -8,6 +8,9 @@
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
 #include "ImageTableAbi.hpp"
+#include "GlobalImageAbi.hpp"
+#include "BdaAbi.hpp"
+#include "Recompiler.hpp"
 #include <span>
 #include <initializer_list>
 #include <algorithm>
@@ -2343,8 +2346,280 @@ struct TableAccessResult {
     bool unsupported = false;
 };
 
+struct GlobalLookup {
+    std::uint32_t found = 0;
+    std::uint32_t entry = 0;
+    std::uint32_t hash = 0;
+    std::array<std::uint32_t, GlobalImageAbi::EntryKeyWords> key{};
+};
+
+// APS5_GPU_SRT=4 (M3): probes the global image map (GlobalImageAbi.hpp, bound as the table map) for
+// the descriptor words of handle (kind, the first `words` words, the rest 0). found: an entry with the
+// same kind and key; entry: its first word.
+GlobalLookup EmitGlobalLookup(SpirvValueEmitContext& ctx, const IrValue& handle, std::uint32_t words, std::uint32_t kind) {
+    auto& state = ctx.state;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    GlobalLookup lookup;
+    if (handle.ArgumentCount() < words) ctx.Fail(handle, "global image handle lacks its descriptor words");
+    for (std::uint32_t word = 0; word < GlobalImageAbi::EntryKeyWords; ++word) lookup.key[word] = word < words ? ctx.Def(handle.Argument(word)) : constant(0u);
+    auto hash = constant(2166136261u);
+    for (const auto word : lookup.key) hash = Binary(state, spv::OpIMul, u32, Binary(state, spv::OpBitwiseXor, u32, hash, word), constant(16777619u));
+    hash = Binary(state, spv::OpIMul, u32, Binary(state, spv::OpBitwiseXor, u32, hash, constant(kind)), constant(16777619u));
+    hash = Binary(state, spv::OpBitwiseXor, u32, hash, Binary(state, spv::OpShiftRightLogical, u32, hash, constant(15u)));
+    hash = Binary(state, spv::OpIMul, u32, hash, constant(0x2c1b3c6du));
+    hash = Binary(state, spv::OpBitwiseXor, u32, hash, Binary(state, spv::OpShiftRightLogical, u32, hash, constant(12u)));
+    lookup.hash = hash;
+    // The probe loop runs on the subgroup's first active lane and on lanes whose key differs from
+    // that lane's; lanes with the same key take its result (keys are nearly always uniform per draw,
+    // and every lane probing the map cost each sample up to 8 x 9 loads in eva_u30).
+    state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+    state.module.EmitCapability(spv::CapabilityGroupNonUniformBallot);
+    state.module.RequireVersion(0x00010300u);
+    const auto subgroup = constant(spv::ScopeSubgroup);
+    auto sameKey = ConstantBool(state, true);
+    for (const auto word : lookup.key) {
+        const auto first = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformBroadcastFirst, u32, first, subgroup, word);
+        sameKey = Binary(state, spv::OpLogicalAnd, boolean, sameKey, Binary(state, spv::OpIEqual, boolean, word, first));
+    }
+    const auto elected = state.module.AllocateId();
+    state.module.AddFunction(spv::OpGroupNonUniformElect, boolean, elected, subgroup);
+    const auto runs = Binary(state, spv::OpLogicalOr, boolean, elected, Unary(state, spv::OpLogicalNot, boolean, sameKey));
+    const auto skipLabel = state.currentLabel;
+    const auto runLabel = state.module.AllocateId();
+    const auto runMerge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, runMerge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, runs, runLabel, runMerge);
+    EmitLabel(state, runLabel);
+    const auto capacity = LoadTableMap(state, constant(GlobalImageAbi::HeaderCapacity));
+    const auto mask = Binary(state, spv::OpISub, u32, capacity, constant(1u));
+    const auto usable = Binary(state, spv::OpINotEqual, boolean, capacity, constant(0u));
+    // Loop: header phis (probe, done, found, entry), body probes one entry, continue -> header.
+    const auto header = state.module.AllocateId();
+    const auto body = state.module.AllocateId();
+    const auto continuation = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    const auto entryLabel = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, header);
+    const auto probe = state.module.AllocateId();
+    const auto done = state.module.AllocateId();
+    const auto found = state.module.AllocateId();
+    const auto entry = state.module.AllocateId();
+    const auto nextProbe = state.module.AllocateId();
+    const auto nextDone = state.module.AllocateId();
+    const auto nextFound = state.module.AllocateId();
+    const auto nextEntry = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, u32, probe, constant(0u), entryLabel, nextProbe, continuation);
+    state.module.AddFunction(spv::OpPhi, boolean, done, ConstantBool(state, false), entryLabel, nextDone, continuation);
+    state.module.AddFunction(spv::OpPhi, boolean, found, ConstantBool(state, false), entryLabel, nextFound, continuation);
+    state.module.AddFunction(spv::OpPhi, u32, entry, constant(GlobalImageAbi::HeaderWords), entryLabel, nextEntry, continuation);
+    const auto more = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpLogicalAnd, boolean, usable, Unary(state, spv::OpLogicalNot, boolean, done)), Binary(state, spv::OpULessThan, boolean, probe, constant(GlobalImageAbi::Probes)));
+    state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, more, body, merge);
+    EmitLabel(state, body);
+    const auto slot = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, hash, probe), mask);
+    const auto base = Binary(state, spv::OpIAdd, u32, constant(GlobalImageAbi::HeaderWords), Binary(state, spv::OpIMul, u32, slot, constant(GlobalImageAbi::EntryWords)));
+    const auto storedKind = TableMapAt(state, base, GlobalImageAbi::EntryKind);
+    auto same = Binary(state, spv::OpIEqual, boolean, storedKind, constant(kind));
+    for (std::uint32_t word = 0; word < GlobalImageAbi::EntryKeyWords; ++word) {
+        same = Binary(state, spv::OpLogicalAnd, boolean, same, Binary(state, spv::OpIEqual, boolean, TableMapAt(state, base, GlobalImageAbi::EntryKey + word), lookup.key[word]));
+    }
+    const auto empty = Binary(state, spv::OpIEqual, boolean, storedKind, constant(GlobalImageAbi::KindEmpty));
+    state.module.AddFunction(spv::OpLogicalOr, boolean, nextDone, same, empty);
+    state.module.AddFunction(spv::OpCopyObject, boolean, nextFound, same);
+    state.module.AddFunction(spv::OpCopyObject, u32, nextEntry, base);
+    state.module.AddFunction(spv::OpIAdd, u32, nextProbe, probe, constant(1u));
+    state.module.AddFunction(spv::OpBranch, continuation);
+    EmitLabel(state, continuation);
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, merge);
+    const auto ranEntry = Select(state, u32, found, entry, constant(GlobalImageAbi::HeaderWords));
+    const auto ranExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, runMerge);
+    EmitLabel(state, runMerge);
+    const auto ownFound = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, boolean, ownFound, found, ranExit, ConstantBool(state, false), skipLabel);
+    const auto ownEntry = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, u32, ownEntry, ranEntry, ranExit, constant(GlobalImageAbi::HeaderWords), skipLabel);
+    const auto sharedFound = state.module.AllocateId();
+    state.module.AddFunction(spv::OpGroupNonUniformBroadcastFirst, u32, sharedFound, subgroup, Select(state, u32, ownFound, constant(1u), constant(0u)));
+    const auto sharedEntry = state.module.AllocateId();
+    state.module.AddFunction(spv::OpGroupNonUniformBroadcastFirst, u32, sharedEntry, subgroup, ownEntry);
+    lookup.found = Select(state, boolean, sameKey, Binary(state, spv::OpINotEqual, boolean, sharedFound, constant(0u)), ownFound);
+    lookup.entry = Select(state, u32, sameKey, sharedEntry, ownEntry);
+    return lookup;
+}
+
+// Notes a missed key in the fault buffer (BdaAbi GlobalImageMisses): claim a slot keyed by the hash,
+// the claiming lane stores kind + key.
+void EmitGlobalMiss(SpirvEmitterState& state, std::uint32_t condition, const GlobalLookup& lookup, std::uint32_t kind) {
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    EmitIfCondition(state, condition, [&] {
+        const auto claim = Binary(state, spv::OpBitwiseOr, u32, lookup.hash, constant(1u));
+        const auto scope = constant(spv::ScopeDevice);
+        const auto relaxed = constant(spv::MemorySemanticsMaskNone);
+        std::vector<std::uint32_t> pendingMerges;
+        for (std::uint32_t probe = 0; probe < BdaAbi::GlobalImageMissProbes; ++probe) {
+            const auto slot = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, lookup.hash, constant(probe)), constant(BdaAbi::GlobalImageMisses - 1u));
+            const auto claimWord = Binary(state, spv::OpIAdd, u32, constant(BdaAbi::MissClaimsWord), slot);
+            // A plain atomic load first: once a lane noted the key, every other lane of every pixel
+            // stops here without a compare-exchange (one hot word under contention cost seconds of GPU
+            // time per frame in eva_m3c).
+            const auto seen = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicLoad, u32, seen, BdaWord(state, state.faultBufferVariable, claimWord), scope, relaxed);
+            const auto previous = EmitValueOrDefaultIfCondition(state, Binary(state, spv::OpIEqual, boolean, seen, constant(0u)), u32, seen, [&] {
+                const auto exchanged = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAtomicCompareExchange, u32, exchanged, BdaWord(state, state.faultBufferVariable, claimWord), scope, relaxed, relaxed, claim, constant(0u));
+                return exchanged;
+            });
+            const auto claimed = Binary(state, spv::OpIEqual, boolean, previous, constant(0u));
+            EmitIfCondition(state, claimed, [&] {
+                const auto counted = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAtomicIAdd, u32, counted, BdaWord(state, state.faultBufferVariable, constant(BdaAbi::MissCountWord)), scope, relaxed, constant(1u));
+                const auto record = Binary(state, spv::OpIAdd, u32, constant(BdaAbi::MissRecordsWord), Binary(state, spv::OpIMul, u32, slot, constant(BdaAbi::GlobalImageMissRecordWords)));
+                state.module.AddFunction(spv::OpAtomicStore, BdaWord(state, state.faultBufferVariable, record), scope, relaxed, constant(kind));
+                for (std::uint32_t word = 0; word < GlobalImageAbi::EntryKeyWords; ++word) {
+                    state.module.AddFunction(spv::OpAtomicStore, BdaWord(state, state.faultBufferVariable, Binary(state, spv::OpIAdd, u32, record, constant(1u + word))), scope, relaxed, lookup.key[word]);
+                }
+            });
+            if (probe + 1u < BdaAbi::GlobalImageMissProbes) {
+                const auto settled = Binary(state, spv::OpLogicalOr, boolean, claimed, Binary(state, spv::OpIEqual, boolean, previous, claim));
+                const auto next = state.module.AllocateId();
+                const auto merge = state.module.AllocateId();
+                state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+                state.module.AddFunction(spv::OpBranchConditional, settled, merge, next);
+                EmitLabel(state, next);
+                pendingMerges.push_back(merge);
+            }
+        }
+        for (auto merge = pendingMerges.rbegin(); merge != pendingMerges.rend(); ++merge) {
+            state.module.AddFunction(spv::OpBranch, *merge);
+            EmitLabel(state, *merge);
+        }
+    });
+}
+
+// The lookup of (handle, kind): the one made where the handle is defined (EmitGlobalHandleLookups),
+// else a new one here.
+GlobalLookup GlobalLookupFor(SpirvValueEmitContext& ctx, const IrValue& handle, std::uint32_t words, std::uint32_t kind) {
+    for (const auto& known : ctx.state.globalImageLookups) {
+        if (known.handle == &handle && known.kind == kind) return {known.found, known.entry, known.hash, known.key};
+    }
+    return EmitGlobalLookup(ctx, handle, words, kind);
+}
+
+// Marks a sampled global image slot used (BdaAbi::GlobalImageUsedWord): a plain load first, the
+// atomic OR only when the bit is clear (every pixel of a draw reads the same few slots).
+void EmitGlobalImageUsed(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t slot) {
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto inRange = Binary(state, spv::OpULessThan, boolean, slot, constant(GlobalImageAbi::MaxImageSlots));
+    EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, condition, inRange), [&] {
+        // One lane per subgroup and slot marks it: the first active lane, and any lane whose slot
+        // differs from the first lane's (a per-pixel load of the bitmap word cost every sample an L2
+        // access in eva_u30).
+        state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+        state.module.EmitCapability(spv::CapabilityGroupNonUniformBallot);
+        state.module.RequireVersion(0x00010300u);
+        const auto subgroup = constant(spv::ScopeSubgroup);
+        const auto elected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformElect, boolean, elected, subgroup);
+        const auto first = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformBroadcastFirst, u32, first, subgroup, slot);
+        const auto marks = Binary(state, spv::OpLogicalOr, boolean, elected, Binary(state, spv::OpINotEqual, boolean, slot, first));
+        EmitIfCondition(state, marks, [&] {
+        const auto word = Binary(state, spv::OpIAdd, u32, constant(BdaAbi::GlobalImageUsedWord), Binary(state, spv::OpShiftRightLogical, u32, slot, constant(5u)));
+        const auto bit = Binary(state, spv::OpShiftLeftLogical, u32, constant(1u), Binary(state, spv::OpBitwiseAnd, u32, slot, constant(31u)));
+        const auto scope = constant(spv::ScopeDevice);
+        const auto relaxed = constant(spv::MemorySemanticsMaskNone);
+        const auto seen = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAtomicLoad, u32, seen, BdaWord(state, state.faultBufferVariable, word), scope, relaxed);
+        EmitIfCondition(state, Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, seen, bit), constant(0u)), [&] {
+            const auto previous = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicOr, u32, previous, BdaWord(state, state.faultBufferVariable, word), scope, relaxed, bit);
+        });
+        });
+    });
+}
+
+// APS5_GPU_SRT_GLOBAL_COUNT: the subgroup's first active lane counts its lookup's outcome
+// (BdaAbi::GlobalImageCountWord + first + (hit ? 0 : 1)).
+void EmitGlobalCount(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t hit, std::uint32_t first) {
+    static const bool counted = std::getenv("APS5_GPU_SRT_GLOBAL_COUNT") != nullptr;
+    if (!counted) return;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+    state.module.RequireVersion(0x00010300u);
+    EmitIfCondition(state, condition, [&] {
+        const auto elected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformElect, boolean, elected, ConstantU32(state, spv::ScopeSubgroup));
+        EmitIfCondition(state, elected, [&] {
+            const auto word = Select(state, u32, hit, ConstantU32(state, BdaAbi::GlobalImageCountWord + first), ConstantU32(state, BdaAbi::GlobalImageCountWord + first + 1u));
+            const auto previous = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicIAdd, u32, previous, BdaWord(state, state.faultBufferVariable, word), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1u));
+        });
+    });
+}
+
+TableAccessResult EmitGlobalTableAccess(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& memory, const ImageResource& base, bool tableSampler) {
+    auto& state = ctx.state;
+    if (state.tableMapVariable == 0 || state.faultBufferVariable == 0) ctx.Fail(inst, "reads a global image without the global image map or the fault buffer");
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto both = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpLogicalAnd, boolean, left, right); };
+    const auto negate = [&](std::uint32_t value) { return Unary(state, spv::OpLogicalNot, boolean, value); };
+    const auto flagged = [&](std::uint32_t value) { return Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value, ConstantU32(state, ImageTableAbi::PoisonFlag)), ConstantU32(state, 0u)); };
+    const auto exec = ctx.Arg(inst, inst.ArgumentCount() - 1u);
+    TableAccessResult result;
+    result.valid = ConstantBool(state, true);
+    auto live = ConstantBool(state, true);
+    state.tableAccess = {};
+    if (base.table != NoTable) {
+        if (base.tableOperation == TableOperation::Unsupported || state.program.Info().runtimeImageModes.at(memory.resource).empty()) {
+            if (inst.Type() != IrType::Void) ctx.Define(inst, ZeroResult(ctx, inst));
+            result.unsupported = true;
+            return result;
+        }
+        const auto kind = ResourceMaterializer::GlobalImageKind(base);
+        const auto lookup = GlobalLookupFor(ctx, *inst.Argument(0)->Resolve(), 8u, kind);
+        EmitGlobalMiss(state, both(exec, negate(lookup.found)), lookup, kind);
+        const auto flags = Select(state, u32, lookup.found, TableMapAt(state, lookup.entry, GlobalImageAbi::EntryFlags), ConstantU32(state, ImageTableAbi::PoisonFlag));
+        const auto dword3 = TableMapAt(state, lookup.entry, GlobalImageAbi::EntryDword3);
+        const auto element = TableMapAt(state, lookup.entry, GlobalImageAbi::EntryElement);
+        result.valid = both(lookup.found, negate(flagged(flags)));
+        EmitGlobalImageUsed(state, both(exec, result.valid), element);
+        EmitGlobalCount(state, exec, result.valid, 0u);
+        result.flags = flags;
+        live = lookup.found;
+        state.tableAccess.element = element;
+        state.tableAccess.uniform = false;
+        DecorateTableNonUniform(state, state.tableAccess.element);
+        state.tableAccess.dword3 = dword3;
+    }
+    if (tableSampler) {
+        const auto lookup = GlobalLookupFor(ctx, *inst.Argument(1)->Resolve(), 4u, GlobalImageSamplerKind);
+        EmitGlobalMiss(state, both(both(exec, live), negate(lookup.found)), lookup, GlobalImageSamplerKind);
+        const auto flags = Select(state, u32, lookup.found, TableMapAt(state, lookup.entry, GlobalImageAbi::EntryFlags), ConstantU32(state, ImageTableAbi::PoisonFlag));
+        const auto element = TableMapAt(state, lookup.entry, GlobalImageAbi::EntrySamplerElement);
+        EmitGlobalCount(state, exec, both(lookup.found, negate(flagged(flags))), 2u);
+        result.valid = both(result.valid, both(lookup.found, negate(flagged(flags))));
+        state.tableAccess.samplerElement = element;
+        DecorateTableNonUniform(state, state.tableAccess.samplerElement);
+    }
+    state.tableAccess.active = true;
+    return result;
+}
+
 TableAccessResult EmitTableAccess(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& memory, const ImageResource& base, bool tableSampler) {
     auto& state = ctx.state;
+    if (state.program.Info().globalImages) return EmitGlobalTableAccess(ctx, inst, memory, base, tableSampler);
     if (state.tableMapVariable == 0 || state.faultBufferVariable == 0) ctx.Fail(inst, "reads an image table without its map or fault buffer");
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
@@ -2618,12 +2893,45 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     if (returnsValue) ctx.definitions.emplace(&inst, guardedId);
 }
 
-void EmitGetImageResource(SpirvValueEmitContext& context) {
-    EmitVoid(context);
+namespace {
+
+// APS5_GPU_SRT=4 (M3): looks the handle's words up once per kind of the images (or the sampler) it
+// feeds, where it is defined (dominating every use); the miss note stays at each use (EXEC-guarded).
+void EmitGlobalHandleLookups(SpirvValueEmitContext& context, const IrValue& inst, bool sampler) {
+    auto& state = context.state;
+    const auto& info = state.program.Info();
+    if (!info.globalImages) return;
+    const auto resource = inst.Flags<std::uint32_t>();
+    std::vector<std::uint32_t> kinds;
+    if (sampler) {
+        if (resource >= info.samplers.size() || info.samplers[resource].table == NoTable) return;
+        kinds.push_back(GlobalImageSamplerKind);
+    } else {
+        if (resource >= info.images.size() || info.images[resource].table == NoTable) return;
+        const auto source = info.images[resource].source;
+        for (std::uint32_t index = 0; index < info.images.size(); ++index) {
+            const auto& image = info.images[index];
+            if (image.source != source || image.table == NoTable || image.tableOperation == TableOperation::Unsupported || info.runtimeImageModes.at(index).empty()) continue;
+            const auto kind = ResourceMaterializer::GlobalImageKind(image);
+            if (std::ranges::find(kinds, kind) == kinds.end()) kinds.push_back(kind);
+        }
+    }
+    for (const auto kind : kinds) {
+        const auto lookup = EmitGlobalLookup(context, inst, sampler ? 4u : 8u, kind);
+        state.globalImageLookups.push_back({&inst, kind, lookup.found, lookup.entry, lookup.hash, lookup.key});
+    }
 }
 
-void EmitGetSamplerResource(SpirvValueEmitContext& context) {
+}
+
+void EmitGetImageResource(SpirvValueEmitContext& context, const IrValue& inst) {
     EmitVoid(context);
+    EmitGlobalHandleLookups(context, inst, false);
+}
+
+void EmitGetSamplerResource(SpirvValueEmitContext& context, const IrValue& inst) {
+    EmitVoid(context);
+    EmitGlobalHandleLookups(context, inst, true);
 }
 
 void EmitMakeImageAddress(SpirvValueEmitContext& context) {

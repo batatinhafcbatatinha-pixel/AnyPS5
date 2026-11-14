@@ -39,10 +39,24 @@ void SrtWalker::BuildPlan(IrProgram& program) const {
     program.Resources().srtPlanComplete = true;
 }
 
+bool SrtWalker::GpuSrtEligibleWithoutImages(const IrProgram& program) {
+    for (const auto& block : program.Blocks()) {
+        for (const IrValue* inst : block->Instructions()) {
+            const auto op = inst->Opcode();
+            if (op == IrOpcode::GetImageResource || op == IrOpcode::GetSamplerResource || op == IrOpcode::ImageBvhIntersectRay || ImageOpcodeInfoOf(op).access != ImageAccess::None) return false;
+        }
+    }
+    return true;
+}
+
 bool SrtWalker::GpuSrtEligible(const IrProgram& program) {
     const auto stages = GpuSrtStages();
     if (stages == 0u || (stages == 1u && program.Resources().stage != IrShaderStage::Compute)) return false;
-    if (stages == 3u) return true;
+    // Debug aid (bisect of the mode-3/4 save-load stall): APS5_GPU_SRT_NO_PIXEL=1 leaves pixel stages
+    // on the CPU walk.
+    static const bool noPixel = std::getenv("APS5_GPU_SRT_NO_PIXEL") != nullptr;
+    if (noPixel && program.Resources().stage == IrShaderStage::Pixel) return false;
+    if (stages >= 3u) return true;
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
             const auto op = inst->Opcode();

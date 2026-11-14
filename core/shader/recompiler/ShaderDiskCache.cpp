@@ -142,7 +142,7 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 25, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 26, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 50, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
@@ -153,7 +153,7 @@ static_assert(fieldCount<IrResourcePlan>() == 26, "IrResourcePlan changed: updat
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 32, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 4, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<TableColumn>() == 19, "TableColumn changed: update the plan encoder");
+static_assert(fieldCount<TableColumn>() == 20, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 5, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
@@ -579,6 +579,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.stencilReplaySafe);
     writer.Value(result.bdaWrites);
     writer.Value(result.gpuSrt);
+    writer.Value(result.globalImages);
     writer.Value(result.layerReplaySafe);
     writer.Value(result.gridScalable);
     writer.Value(result.stencilReferenceDword);
@@ -652,6 +653,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.stencilReplaySafe);
     reader.Value(result.bdaWrites);
     reader.Value(result.gpuSrt);
+    reader.Value(result.globalImages);
     reader.Value(result.layerReplaySafe);
     reader.Value(result.gridScalable);
     reader.Value(result.stencilReferenceDword);
@@ -882,6 +884,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.layerExported);
     writer.Value(info.smoothOffsetBarycentrics);
     writer.Value(info.gridScalable);
+    writer.Value(info.globalImages);
 }
 
 void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
@@ -1001,6 +1004,13 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.layerExported);
     reader.Value(info.smoothOffsetBarycentrics);
     reader.Value(info.gridScalable);
+    reader.Value(info.globalImages);
+    // PrepareImageModes ran before the flag was read: register the global image classes now.
+    if (info.globalImages) {
+        for (const auto& image : info.images) {
+            if (image.table != NoTable) ResourceMaterializer::RegisterGlobalImageClass(image);
+        }
+    }
 }
 
 void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
@@ -1195,6 +1205,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Value(column.foldedAddend);
         out.Value(column.foldedCarry);
         out.Value(column.selected);
+        out.Value(column.global);
         out.Value(column.selection);
         out.Values(std::span<const std::uint32_t>(source.requiredBlocks));
     });
@@ -1362,6 +1373,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(column.foldedAddend);
         in.Value(column.foldedCarry);
         in.Value(column.selected);
+        in.Value(column.global);
         in.Value(column.selection);
         source.tableColumn = table ? std::optional(std::move(column)) : std::nullopt;
         in.Values(source.requiredBlocks);

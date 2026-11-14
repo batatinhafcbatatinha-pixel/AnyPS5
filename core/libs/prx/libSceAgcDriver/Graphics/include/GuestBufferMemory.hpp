@@ -231,7 +231,9 @@ std::optional<ResidentSource> ResidentSourceFor(VkDevice device, VkBuffer import
 // bytes (no CPU write since the copy, as residentHit decides for a reused region; writers through
 // other paths drop the copy first): the GPU reads it there, behind a barrier after its recorded
 // writers, with no copy back to guest memory. Caller holds the GPU mutex. Counted in [bufcache].
-std::optional<ResidentSource> ResidentDrawSource(VkDevice device, std::uint64_t address, std::size_t bytes);
+// `import` is the host import the range is read through today: the copy must have been taken from
+// it (as residentHit requires), not from an import the range had before.
+std::optional<ResidentSource> ResidentDrawSource(VkDevice device, VkBuffer import, std::uint64_t address, std::size_t bytes);
 void CountResidentSourceFallback(std::uint64_t bytes);
 class ResidentRangeClaim {
 public:

@@ -253,6 +253,8 @@ function(add_shader_recompiler target runtimeTarget)
     endif()
     set(shaderCacheReviewedNames
             BdaAbi::ForEachAccessedPage
+            BdaAbi::ForEachGlobalImageMiss
+            BdaAbi::ForEachUsedGlobalImageSlot
             BdaAbi::RangesOrdered
             BuildBarycentricGeometryShader
             BuildBarycentricTessellationShaders
@@ -333,7 +335,13 @@ function(add_shader_recompiler target runtimeTarget)
             FindTableCalls
             LinkCalls
             LoadStamp
+            RuntimeResolved
             WriteFileAtomically
+            GlobalImageAbi::EntryWord
+            GlobalImageAbi::Hash
+            GlobalImageViewBinding
+            ResolveGlobalImageKey
+            VertexLayoutKey
     )
     set(shaderCacheManifest)
     foreach(section IN ITEMS sources guard submodules includes reviewed)

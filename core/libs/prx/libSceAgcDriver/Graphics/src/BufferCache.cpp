@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -76,13 +77,31 @@ struct Cache {
     std::unordered_map<std::uint64_t, std::shared_ptr<Buffer>> leaves;
     // Resident ranges (begin -> end, merged), re-synced by SyncResident.
     std::map<std::uint64_t, std::uint64_t> residentRanges;
+    // SyncResident runs once per open submission of the recorder (APS5_RESIDENT_SYNC_EVERY_USE=1:
+    // every use, as before): the walk of every resident range per draw was ~15% of the committer in
+    // eva_u1 (mode 4 makes many pages resident). Ranges made resident later sync when they are made.
+    std::uint64_t syncedSerial = 0;
+    // Queued pages MakeResident refused (no host import, untracked, over budget): not retried for
+    // RefusedRetry. Address-based shaders note every page the table misses, so a refused page came
+    // back every batch (eva_u2: ~40,000 refused requests per second, the mode-4 save-load stall).
+    std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> refused;
+    // Ranges dropped as rewritten about every use: not made resident again for RewrittenRetry.
+    std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> rewritten;
+    const void* syncedRecorder = nullptr;
     Stats stats;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
-Cache& cache() {
-    static auto* instance = new Cache();
-    return *instance;
+// One cache per live VkDevice: the driver holds two, and a single shared state reset on every device
+// switch (resetFor) freed the page table's root, leaves and chunks while recorded work of the other
+// device still read them by device address (the table-ON save-load stall, eva_t2..t6).
+Cache& cache(VkDevice device) {
+    static std::mutex mutex;
+    static auto* caches = new std::map<VkDevice, std::unique_ptr<Cache>>();
+    std::lock_guard lock(mutex);
+    auto& slot = (*caches)[device];
+    if (slot == nullptr) slot = std::make_unique<Cache>();
+    return *slot;
 }
 
 std::size_t budgetChunks() {
@@ -254,6 +273,45 @@ bool syncBlocks(Cache& state, const Context& context, Recorder& recorder, Chunk&
     return true;
 }
 
+// Clears the table entries of a chunk's pages in [from, to) (queue order: work recorded after this
+// call reads through the ranges again).
+void unmapChunk(Cache& state, const Context& context, Recorder& recorder, Chunk& chunk, std::uint64_t chunkBase, std::uint64_t from, std::uint64_t to) {
+    const auto firstPage = static_cast<std::size_t>((from - chunkBase) / TablePageBytes);
+    const auto lastPage = std::min<std::size_t>(static_cast<std::size_t>((to - chunkBase + TablePageBytes - 1) / TablePageBytes), chunk.mapped.size());
+    if (firstPage >= lastPage || std::none_of(chunk.mapped.begin() + firstPage, chunk.mapped.begin() + lastPage, [](bool mapped) { return mapped; })) return;
+    const auto rootIndex = chunkBase >> BufferCacheTableLeafBits;
+    const auto leaf = state.leaves.find(rootIndex);
+    if (leaf == state.leaves.end() || leaf->second == nullptr) return;
+    const auto commands = recorder.Commands();
+    const std::array<std::uint64_t, ChunkBytes / TablePageBytes> zeros{};
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    const auto leafOffset = (((chunkBase & (LeafSpan - 1)) / TablePageBytes) + firstPage) * sizeof(std::uint64_t);
+    context.Function<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer")(commands, leaf->second->Handle(), leafOffset, (lastPage - firstPage) * sizeof(std::uint64_t), zeros.data());
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    std::fill(chunk.mapped.begin() + firstPage, chunk.mapped.begin() + lastPage, false);
+}
+
+// Removes [from, to) from the merged resident ranges (splitting a range that covers more).
+void dropResidentRange(Cache& state, std::uint64_t from, std::uint64_t to) {
+    auto& ranges = state.residentRanges;
+    auto it = ranges.upper_bound(from);
+    if (it != ranges.begin()) --it;
+    while (it != ranges.end() && it->first < to) {
+        const auto begin = it->first;
+        const auto end = it->second;
+        if (end <= from) {
+            ++it;
+            continue;
+        }
+        it = ranges.erase(it);
+        if (begin < from) ranges.emplace(begin, from);
+        if (end > to) {
+            ranges.emplace(to, end);
+            break;
+        }
+    }
+}
+
 // The table's root (creating it zeroed on first use): a device-local buffer of BufferCacheTableRoots
 // device addresses of leaves.
 Buffer* tableRoot(Cache& state, const Context& context, Recorder& recorder) {
@@ -315,14 +373,24 @@ bool BufferCacheEnabled() {
 
 std::optional<CachedBufferRange> ObtainCachedBuffer(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, bool* behindGpuWrite, bool mayRefuse, bool refuseRewritten) {
     if (!BufferCacheEnabled() || bytes == 0 || bytes > SpanMaxBytes || address > std::numeric_limits<std::uint64_t>::max() - bytes) return std::nullopt;
-    auto& state = cache();
+    auto& state = cache(context.device);
     const auto end = address + bytes;
     const bool crossing = (end - 1) / ChunkBytes != address / ChunkBytes;
     // Mode 2: data GPU work wrote into a resident staging copy (compute-built index lists, skinned
     // vertices) is read there, as KytyPS5 reads GPU-written buffers from their cache buffer: no copy
     // back to guest memory and up again. The caller's barrier orders the read after the writers.
-    if (BufferCacheMode() >= 2) {
-        if (auto resident = ResidentDrawSource(context.device, address, bytes)) {
+    // The refusals of an in-place read hold here too: a queued label or store, or a copied writer's
+    // write-back, over the range must land first (the old path below takes care of them).
+    const auto writtenLater = [&] {
+        if (recorder.PendingLabelIn(address, bytes) || recorder.QueuedStoreOverlaps(address, bytes)) return true;
+        const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+        if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return true;
+        const auto drawWriters = DrawCopiedWriters();
+        return std::any_of(drawWriters->begin(), drawWriters->end(), overlaps);
+    };
+    const HostImport* currentImport = BufferCacheMode() >= 2 && !writtenLater() ? HostImportFor(context, address, bytes) : nullptr;
+    if (currentImport != nullptr) {
+        if (auto resident = ResidentDrawSource(context.device, currentImport->buffer, address, bytes)) {
             recorder.Keep(resident->keep, 0);
             recorder.NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
             std::lock_guard lock(state.mutex);
@@ -362,7 +430,7 @@ std::optional<CachedBufferRange> ObtainCachedBuffer(const Context& context, Reco
 }
 
 VkDeviceAddress BufferCacheTable(const Context& context, Recorder& recorder) {
-    auto& state = cache();
+    auto& state = cache(context.device);
     std::lock_guard lock(state.mutex);
     resetFor(state, context.device);
     auto* root = tableRoot(state, context, recorder);
@@ -385,7 +453,7 @@ void noteResidentRange(Cache& state, std::uint64_t begin, std::uint64_t end) {
 
 bool MakeResident(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes) {
     if (!BufferCacheEnabled() || bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return false;
-    auto& state = cache();
+    auto& state = cache(context.device);
     const auto end = address + bytes;
     bool whole = true;
     for (auto chunkBase = address / ChunkBytes * ChunkBytes; chunkBase < end; chunkBase += ChunkBytes) {
@@ -407,7 +475,16 @@ bool MakeResident(const Context& context, Recorder& recorder, std::uint64_t addr
         const auto generation = import != nullptr ? GuestMemory::CollectWrites(from, static_cast<std::size_t>(to - from)) : 0;
         resetFor(state, context.device);
         auto* chunk = import != nullptr && generation != 0 ? chunkFor(state, context, chunkBase) : nullptr;
-        if (chunk == nullptr || !syncBlocks(state, context, recorder, *chunk, chunkBase, from, to, *import, generation, behind, false) || !mapChunk(state, context, recorder, *chunk, chunkBase, from, to)) {
+        // A range rewritten about every use (GPU-written data in host memory) is not kept resident: its
+        // pages are unmapped (reads take the live ranges) instead of copied again at every sync
+        // (eva_u3: ~4.6 GB of uploads per 10 s).
+        const auto rewrittenBefore = state.stats.refusedRewritten;
+        if (chunk == nullptr || !syncBlocks(state, context, recorder, *chunk, chunkBase, from, to, *import, generation, behind, false, true) || !mapChunk(state, context, recorder, *chunk, chunkBase, from, to)) {
+            if (chunk != nullptr && state.stats.refusedRewritten != rewrittenBefore) {
+                unmapChunk(state, context, recorder, *chunk, chunkBase, from, to);
+                dropResidentRange(state, from, to);
+                state.rewritten[from] = std::chrono::steady_clock::now();
+            }
             ++state.stats.residentRefused;
             whole = false;
         } else {
@@ -447,23 +524,64 @@ void MakeQueuedResident(const Context& context, Recorder& recorder) {
     }
     std::sort(ranges.begin(), ranges.end());
     ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
-    for (const auto& [address, bytes] : ranges) static_cast<void>(MakeResident(context, recorder, address, bytes));
+    constexpr auto RefusedRetry = std::chrono::seconds(2);
+    auto& state = cache(context.device);
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& [address, bytes] : ranges) {
+        {
+            std::lock_guard lock(state.mutex);
+            if (const auto found = state.refused.find(address); found != state.refused.end() && now - found->second < RefusedRetry) continue;
+            if (const auto found = state.rewritten.find(address); found != state.rewritten.end() && now - found->second < std::chrono::seconds(10)) continue;
+        }
+        if (MakeResident(context, recorder, address, bytes)) continue;
+        std::lock_guard lock(state.mutex);
+        if (state.refused.size() >= 65536u) state.refused.clear();
+        if (state.rewritten.size() >= 65536u) state.rewritten.clear();
+        state.refused[address] = now;
+    }
 }
 
 void SyncResident(const Context& context, Recorder& recorder) {
     if (!BufferCacheEnabled()) return;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     {
-        auto& state = cache();
+        auto& state = cache(context.device);
         std::lock_guard lock(state.mutex);
         if (state.device != context.device) return;
+        static const bool everyUse = std::getenv("APS5_RESIDENT_SYNC_EVERY_USE") != nullptr;
+        if (!everyUse && state.syncedRecorder == &recorder && state.syncedSerial == recorder.OpenSerial()) return;
+        state.syncedRecorder = &recorder;
+        state.syncedSerial = recorder.OpenSerial();
         ranges.assign(state.residentRanges.begin(), state.residentRanges.end());
     }
     for (const auto& [begin, end] : ranges) static_cast<void>(MakeResident(context, recorder, begin, static_cast<std::size_t>(end - begin)));
 }
 
+namespace {
+std::atomic<std::uint64_t> unsafeWriteSerial{0};
+}
+
+void NoteTableUnsafeWrites(std::uint64_t serial) {
+    auto current = unsafeWriteSerial.load(std::memory_order_relaxed);
+    while (current < serial && !unsafeWriteSerial.compare_exchange_weak(current, serial, std::memory_order_relaxed)) {}
+}
+
+bool TableUsed() {
+    // The shader probes the table only without APS5_GPU_SRT_NO_TABLE (SpirvBdaLookup.cpp): without it
+    // there is no root to publish, nothing to keep resident and no accessed pages to make resident.
+    static const bool used = std::getenv("APS5_GPU_SRT_NO_TABLE") == nullptr;
+    return used;
+}
+
+bool TableReadsCurrent(const Recorder& recorder) {
+    // The writes are marked when their batch's fault records are read, after completion: one more
+    // completed submission of margin.
+    const auto serial = unsafeWriteSerial.load(std::memory_order_relaxed);
+    return serial == 0 || recorder.CompletedThrough() > serial;
+}
+
 void ClearBufferCache(VkDevice device) {
-    auto& state = cache();
+    auto& state = cache(device);
     std::lock_guard lock(state.mutex);
     if (state.device == device) {
         state.chunks.clear();

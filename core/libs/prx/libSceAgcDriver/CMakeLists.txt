@@ -480,6 +480,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferCache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindlessTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/SampleOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/StagedMerge.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BarrierBatch.cpp

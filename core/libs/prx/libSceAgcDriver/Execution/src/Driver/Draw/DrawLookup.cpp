@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Recompiler.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -19,7 +20,7 @@ namespace {
 // served with changed forwarded words patched into a copy of the result
 // (APS5_TRACE_DRAW_DATA_REUSE=1 prints the counts every 10 s).
 struct DataReuseCounts {
-    std::uint64_t userWords = 0, memory = 0, plain = 0, patched = 0;
+    std::uint64_t userWords = 0, memory = 0, plain = 0, patched = 0, runtime = 0;
 };
 
 void NoteDataReuse(const DataReuseCounts& counts) {
@@ -33,10 +34,11 @@ void NoteDataReuse(const DataReuseCounts& counts) {
     totals.memory += counts.memory;
     totals.plain += counts.plain;
     totals.patched += counts.patched;
+    totals.runtime += counts.runtime;
     const auto now = std::chrono::steady_clock::now();
     if (now - reported < std::chrono::seconds(10)) return;
     reported = now;
-    std::fprintf(stderr, "[draw-data-reuse] (10 s) shape-entry stage variants: refused for a changed user word %llu, captured memory differs %llu, served %llu, served with forwarded user words patched %llu\n", static_cast<unsigned long long>(totals.userWords), static_cast<unsigned long long>(totals.memory), static_cast<unsigned long long>(totals.plain), static_cast<unsigned long long>(totals.patched));
+    std::fprintf(stderr, "[draw-data-reuse] (10 s) shape-entry stage variants: refused for a changed user word %llu, captured memory differs %llu, served %llu, served with forwarded user words patched %llu, runtime-resolved served %llu\n", static_cast<unsigned long long>(totals.userWords), static_cast<unsigned long long>(totals.memory), static_cast<unsigned long long>(totals.plain), static_cast<unsigned long long>(totals.patched), static_cast<unsigned long long>(totals.runtime));
     totals = {};
 }
 
@@ -65,7 +67,95 @@ std::int64_t Driver::forwardedSlot(const DispatchVariant& variant, std::size_t w
     return found - slots.begin();
 }
 
-std::shared_ptr<DispatchVariant> Driver::forwardedCopy(const DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> forwarded) {
+namespace {
+
+// M4 (REWRITE-STATE.md, item 3): a stage whose resources the GPU resolves at run time
+// (ShaderRecompiler::RuntimeResolved: GPU-side SRT walk, no CPU-resolved bindings) depends on its user
+// data words only through the push-constant slots they are forwarded to, so a draw that differs from
+// the variant only in such words reuses it with those slots patched, without capture or materialize.
+// A changed word in no slot is unused by the shader; the vertex fetch words (the CPU decodes the vertex
+// buffer table through them) must stay equal. Returns false when the variant cannot serve.
+// A vertex stage whose current vertex stage info (decoded for this draw) has the variant's layout
+// (ShaderRecompiler::VertexLayoutKey: equal but for buffer bases and record counts) compiles to the same
+// stage: its changed fetch and vertex words are accepted and the draw binds the current info
+// (`layoutEqual`, forwardedCopy).
+bool vertexLayoutEqual(const DispatchVariant& variant, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* current) {
+    static const bool disabled = std::getenv("APS5_NO_VERTEX_LAYOUT_HITS") != nullptr;
+    if (disabled || variant.vertexInfo == nullptr || current == nullptr || !current->has_value()) return false;
+    return ShaderRecompiler::VertexLayoutKey(**current) == ShaderRecompiler::VertexLayoutKey(*variant.vertexInfo);
+}
+
+bool runtimeForwarded(const DispatchVariant& variant, std::span<const std::uint32_t> now, std::span<const std::uint32_t> was, std::vector<std::pair<std::uint32_t, std::uint32_t>>& forwarded, bool layoutEqual = false) {
+    const auto& slots = variant.compiled->shaderDataUserWords;
+    for (std::size_t w = 0; w < now.size(); ++w) {
+        if (now[w] == was[w]) continue;
+        if (variant.vertexInfo != nullptr && !layoutEqual) {
+            for (const auto reg : {static_cast<std::uint32_t>(variant.vertexInfo->fetchAttribReg), static_cast<std::uint32_t>(variant.vertexInfo->fetchBufferReg)}) {
+                if (w == reg || w == static_cast<std::size_t>(reg) + 1u) return false;
+            }
+        }
+        bool inSlot = false;
+        for (std::size_t slot = 0; slot < slots.size(); ++slot) {
+            if (slots[slot] != static_cast<std::uint32_t>(w)) continue;
+            forwarded.emplace_back(static_cast<std::uint32_t>(slot), now[w]);
+            inSlot = true;
+        }
+        // A vertex stage's info is decoded from its user words too (embedded vertex buffer
+        // descriptors): there a changed word the shader does not read as push data refuses.
+        if (!inSlot && variant.vertexInfo != nullptr && !layoutEqual) return false;
+    }
+    return true;
+}
+
+bool runtimeResolvedHits() {
+    static const bool disabled = std::getenv("APS5_NO_RUNTIME_RESOLVED_HITS") != nullptr;
+    return !disabled;
+}
+
+struct RuntimeVariants {
+    std::mutex mutex;
+    struct Kept {
+        std::shared_ptr<DispatchVariant> variant;
+        std::vector<std::uint32_t> userData;
+    };
+    std::unordered_map<std::uint64_t, Kept> byProgram;
+};
+
+RuntimeVariants& runtimeVariants() {
+    static auto* kept = new RuntimeVariants();
+    return *kept;
+}
+
+std::uint64_t runtimeKey(const DrawProgram& program, std::uint32_t role) {
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    for (const auto value : {static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(program.snapshot.get())), static_cast<std::uint64_t>(program.codeOffset), static_cast<std::uint64_t>(program.binary.stage), static_cast<std::uint64_t>(role), static_cast<std::uint64_t>(program.userData.size())}) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+    }
+    return key;
+}
+
+}
+
+void Driver::rememberRuntimeVariant(const DrawProgram& program, std::uint32_t role, std::shared_ptr<DispatchVariant> variant) {
+    if (!runtimeResolvedHits() || variant == nullptr || variant->compiled == nullptr || program.binary.stage == ShaderRecompiler::ShaderStage::Mesh || !ShaderRecompiler::RuntimeResolved(*variant->compiled)) return;
+    auto& kept = runtimeVariants();
+    std::lock_guard lock(kept.mutex);
+    if (kept.byProgram.size() >= 8192) kept.byProgram.clear();
+    kept.byProgram[runtimeKey(program, role)] = {std::move(variant), program.userData};
+}
+
+std::shared_ptr<DispatchVariant> Driver::runtimeVariantFor(const DrawProgram& program, std::uint32_t role, std::vector<std::uint32_t>& userData) {
+    if (!runtimeResolvedHits()) return nullptr;
+    auto& kept = runtimeVariants();
+    std::lock_guard lock(kept.mutex);
+    const auto found = kept.byProgram.find(runtimeKey(program, role));
+    if (found == kept.byProgram.end() || found->second.variant->shader != program.snapshot) return nullptr;
+    userData = found->second.userData;
+    return found->second.variant;
+}
+
+std::shared_ptr<DispatchVariant> Driver::forwardedCopy(const DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> forwarded, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>* vertexInfo) {
     auto result = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
     for (const auto& [slot, value] : forwarded) patchForwardedWord(*result, slot, value);
     auto copy = std::make_shared<DispatchVariant>();
@@ -89,7 +179,7 @@ std::shared_ptr<DispatchVariant> Driver::forwardedCopy(const DispatchVariant& va
     copy->calleeWords = variant.calleeWords;
     copy->calleeReads = variant.calleeReads;
     copy->userDataMask = variant.userDataMask;
-    copy->vertexInfo = variant.vertexInfo;
+    copy->vertexInfo = vertexInfo != nullptr && vertexInfo->has_value() ? std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(**vertexInfo) : variant.vertexInfo;
     return copy;
 }
 
@@ -353,6 +443,29 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) continue;
                     bool usedEqual = true;
                     forwarded.clear();
+                    const bool runtime = runtimeResolvedHits() && variant->compiled != nullptr && programs[i].binary.stage != ShaderRecompiler::ShaderStage::Mesh && ShaderRecompiler::RuntimeResolved(*variant->compiled);
+                    if (runtime) {
+                        const bool layoutEqual = vertexLayoutEqual(*variant, &vertexInfos[i]);
+                        if (!runtimeForwarded(*variant, now, was, forwarded, layoutEqual)) {
+                            ++reuse.userWords;
+                            continue;
+                        }
+                        if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
+                        std::vector<ShaderRecompiler::MemoryRegion> regions;
+                        appendEntryRegions(*variant, regions);
+                        // Nothing CPU-resolved to prove; only the vertex decode's reads (if any) are,
+                        // and not when the current vertex info was decoded for this draw.
+                        if (!variant->runs.empty() && !layoutEqual) {
+                            auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                            if (result != EntryOutcome::Equal) {
+                                ++reuse.memory;
+                                continue;
+                            }
+                        }
+                        ++reuse.runtime;
+                        candidates.emplace_back(forwarded.empty() && !layoutEqual ? variant : forwardedCopy(*variant, forwarded, layoutEqual ? &vertexInfos[i] : nullptr), std::move(regions));
+                        continue;
+                    }
                     for (std::size_t w = 0; w < now.size() && usedEqual; ++w) {
                         if (now[w] == was[w] || (w < 64u && ((variant->userDataMask >> w) & 1u) == 0)) continue;
                         const auto slot = forwardedSlot(*variant, w);
@@ -380,6 +493,43 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     ++reuse.patched;
                     candidates.emplace_back(forwardedCopy(*variant, forwarded), std::move(regions));
                 }
+            }
+        }
+        // M4 without a shape entry: a stage with no candidate yet takes the last runtime-resolved
+        // variant of its program, its changed user words patched in (runtimeForwarded).
+        if (entry == nullptr && runtimeResolvedHits()) {
+            std::uint64_t imagesFlushed = 0, runsSynced = 0;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> forwarded;
+            std::vector<std::uint32_t> was;
+            DataReuseCounts reuse;
+            const struct ReuseNote {
+                DataReuseCounts& counts;
+                ~ReuseNote() { NoteDataReuse(counts); }
+            } reuseNote{reuse};
+            const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
+            std::optional<SampledReadScope> sampling;
+            for (std::size_t i = 0; i < programs.size(); ++i) {
+                if (roles[i] == Role::GeometryBack || !dataCandidates[i].empty() || programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh) continue;
+                const auto variant = runtimeVariantFor(programs[i], static_cast<std::uint32_t>(roles[i]), was);
+                if (variant == nullptr || was.size() != programs[i].userData.size()) continue;
+                if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) continue;
+                forwarded.clear();
+                const bool layoutEqual = vertexLayoutEqual(*variant, &vertexInfos[i]);
+                if (!runtimeForwarded(*variant, programs[i].userData, was, forwarded, layoutEqual)) {
+                    ++reuse.userWords;
+                    continue;
+                }
+                std::vector<ShaderRecompiler::MemoryRegion> regions;
+                appendEntryRegions(*variant, regions);
+                if (!variant->runs.empty() && !layoutEqual) {
+                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                    if (result != EntryOutcome::Equal) {
+                        ++reuse.memory;
+                        continue;
+                    }
+                }
+                ++reuse.runtime;
+                dataCandidates[i].emplace_back(forwarded.empty() && !layoutEqual ? variant : forwardedCopy(*variant, forwarded, layoutEqual ? &vertexInfos[i] : nullptr), std::move(regions));
             }
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);

@@ -21,6 +21,14 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/SonyCrt.hpp"
 
+#if defined(_WIN32)
+// Declared like <windows.h> declares them (HMODULE is HINSTANCE__*), for the
+// APS5_APR_WATCH diagnostics below, without the macros of that header.
+struct HINSTANCE__;
+extern "C" __declspec(dllimport) int __stdcall GetModuleHandleExA(unsigned long flags, const char* name, HINSTANCE__** module);
+extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(HINSTANCE__* module, char* name, unsigned long size);
+#endif
+
 namespace {
 
 int CompareUnits(char16_t left, char16_t right) {
@@ -530,6 +538,53 @@ TFloat ParseFloat(const char* text, char** end, TFloat (*parse)(const char*, cha
     return value;
 }
 
+// Diagnostics: APS5_APR_WATCH=address[:length] (hexadecimal) logs the calls of
+// memset, memcpy and memmove that write into that range, with their caller.
+struct WatchedRange {
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+};
+
+const WatchedRange& AprWatchedRange() {
+    static const WatchedRange range = [] {
+        WatchedRange result;
+        const char* text = std::getenv("APS5_APR_WATCH");
+        if (text == nullptr) return result;
+        char* tail = nullptr;
+        const auto address = std::strtoull(text, &tail, 16);
+        std::uint64_t length = 0x100;
+        if (tail != nullptr && *tail == ':') length = std::strtoull(tail + 1, nullptr, 16);
+        result.begin = static_cast<std::uintptr_t>(address);
+        result.end = static_cast<std::uintptr_t>(address + length);
+        return result;
+    }();
+    return range;
+}
+
+#if defined(_WIN32)
+// Whether the caller lies in the guest module of a title's own libSceAmpr.
+bool CallerInGuestAmpr(const void* caller) {
+    HINSTANCE__* module = nullptr;
+    // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
+    if (!GetModuleHandleExA(0x4u | 0x2u, static_cast<const char*>(caller), &module) || module == nullptr) return false;
+    char name[512]{};
+    const auto length = GetModuleFileNameA(module, name, sizeof(name) - 1);
+    return length != 0 && std::strstr(name, "libSceAmpr") != nullptr && std::strstr(name, ".guest.prx") != nullptr;
+}
+#else
+bool CallerInGuestAmpr(const void*) { return false; }
+#endif
+
+void TraceWatchedWrite(const char* what, const void* destination, std::size_t count, int value, const void* source, const void* caller) {
+    const auto& range = AprWatchedRange();
+    if (range.begin == 0 || count == 0) return;
+    const auto begin = reinterpret_cast<std::uintptr_t>(destination);
+    if ((begin >= range.end || begin + count <= range.begin) && !CallerInGuestAmpr(caller)) return;
+    std::fprintf(stderr, "[apr-watch] %s dst=%p n=%zu value=0x%x src=%p caller=%p\n", what, destination, count,
+                 static_cast<unsigned>(value) & 0xffu, source, caller);
+    std::fflush(stderr);
+}
+
 bool HasHexadecimalPrefix(const char* text, const char* parsedEnd) {
     while (std::isspace(static_cast<unsigned char>(*text))) ++text;
     if (*text == '+' || *text == '-') ++text;
@@ -548,6 +603,7 @@ const char* NanSubjectEnd_nid_no_patch(const char* text) {
 
 void* APS5_VABI memset_nid_postfix(void* s, int c, size_t n) {
     // APS5_LOG_OUT("s=%p c=%d n=%zu", s, c, n);
+    TraceWatchedWrite("memset", s, n, c, nullptr, __builtin_return_address(0));
     return std::memset(s, c, n);
 }
 
@@ -566,10 +622,12 @@ void APS5_VABI bcopy_nid_postfix(const void* source, void* destination, size_t c
 }
 
 void* APS5_VABI memcpy_nid_postfix(void* dest, const void* src, size_t n) {
+    TraceWatchedWrite("memcpy", dest, n, 0, src, __builtin_return_address(0));
     return std::memcpy(dest, src, n);
 }
 
 void* APS5_VABI memmove_nid_postfix(void* dest, const void* src, size_t n) {
+    TraceWatchedWrite("memmove", dest, n, 0, src, __builtin_return_address(0));
     return std::memmove(dest, src, n);
 }
 
