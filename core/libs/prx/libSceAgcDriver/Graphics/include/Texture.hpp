@@ -160,6 +160,14 @@ public:
     PerUseCopy CopyKind() const { return perUseCopy; }
     bool RefreshedPerUse() const { return perUseCopy == PerUseCopy::RemadePerUse; }
     void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
+    void SetReuseLookup(std::function<std::shared_ptr<Texture>()> lookup) { reuseLookup = std::move(lookup); }
+    bool HasReuseLookup() const { return static_cast<bool>(reuseLookup); }
+    bool ReuseLookupHolds() const;
+    struct ReuseLookupCounts {
+        std::uint64_t held;
+        std::uint64_t changed;
+    };
+    static ReuseLookupCounts TakeReuseLookupCounts();
     bool Released() const { return released.load(std::memory_order_acquire); }
     // M3: the present (Recorder::Presents) at which a shader last sampled this texture through the
     // global image set (BindlessTable, from the used-slot bitmap); the texture cache's eviction treats
@@ -203,6 +211,7 @@ private:
     std::unique_ptr<CommandBatch> upload;
     PerUseCopy perUseCopy = PerUseCopy::None;
     std::atomic<std::uint64_t> bindlessUse{0};
+    std::function<std::shared_ptr<Texture>()> reuseLookup;
     std::atomic<bool> released{false};
     bool copiedOnce = false;
     bool srgbExpand = false;
@@ -543,6 +552,7 @@ public:
     void NoteHostWritten() { if (hostImage != VK_NULL_HANDLE) twinStale = true; }
     void EndTwinWrite();
     const GuestTextureResource& Descriptor() const { return descriptor; }
+    std::size_t GuestCopyCapacity() const { return original.capacity(); }
     std::uint32_t ImageLayers() const { return geometry.imageLayers; }
     std::uint32_t ImageDepth() const { return geometry.imageDepth; }
     VkFormat ImageFormat() const { return imageFormat; }
@@ -584,6 +594,7 @@ public:
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
+    bool AnyLayerPending() const;
 
 private:
     std::atomic<std::uint64_t> provedEpoch{0};
@@ -634,7 +645,7 @@ private:
     void storeTrappedOverlaps(const char* reason);
     bool unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const;
     bool cpuLeftUnchanged(std::uint32_t layer, std::uint64_t from, std::uint64_t to, bool edge) const;
-    void saveBeforeUnwatch();
+    void saveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
     void forgetKeptAtUnwatch(std::uint32_t unit);
     bool keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) const;
     bool keptForCpu(std::uint32_t unit) const;
@@ -650,6 +661,7 @@ private:
     void applyStoredSave(std::uint64_t ticket, const std::vector<std::uint32_t>& units);
     void cancelStoredSave(std::uint32_t unit);
     void cancelStoredSaves();
+    void releaseUnheldOriginal();
     // Lets the batches holding the saves of the units `layers` selects (every unit for none) complete.
     void awaitStoredSave(const std::vector<bool>* layers);
     bool guestBytesSettled() const;

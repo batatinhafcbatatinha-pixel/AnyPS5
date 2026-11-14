@@ -88,6 +88,8 @@ This repository is a fork of [boykopovar/AnyPS5](https://github.com/boykopovar/A
 project's README ([translations](docs/user/)), [usage](docs/user/USAGE.md), [input mapping](docs/user/INPUT_MAPPING.md),
 [architecture](docs/dev/ARCHITECTURE.md) and [progress](https://boykopovar.github.io/AnyPS5/progress.html).
 
+[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![RDNA2 reference shader forms decoded](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![gfx1013 reference shader forms decoded](https://boykopovar.github.io/AnyPS5/badge-shaders-gfx1013.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![implemented in 7 days](https://boykopovar.github.io/AnyPS5/badge-week.svg)](https://boykopovar.github.io/AnyPS5/history.html)
+
 AnyPS5 is intended for interoperability, research, preservation and compatibility. It does not include, distribute or
 require copyrighted software, firmware, cryptographic keys or proprietary libraries. It is not affiliated with,
 authorized or endorsed by Sony Interactive Entertainment; "PlayStation" and "PS5" are trademarks of Sony Interactive
