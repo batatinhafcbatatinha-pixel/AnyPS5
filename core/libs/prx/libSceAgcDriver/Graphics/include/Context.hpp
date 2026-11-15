@@ -27,6 +27,7 @@ namespace AgcDriver::Graphics {
 class TextureDetiler;
 class GpuColorTransfer;
 class BufferPool;
+VkDeviceSize ShrinkDevicePoolRetention(BufferPool& pool);
 class TextureCache;
 class RenderCache;
 class DrawQueue;
@@ -434,6 +435,8 @@ struct Context {
         if (report.Fits(bytes)) return type;
         const auto host = HostMemoryType(mask);
         if (!host) return type;
+        // Memory the buffer pool only retains for reuse is given up before cached textures are.
+        if (bufferPool != nullptr && ShrinkDevicePoolRetention(*bufferPool) != 0 && ReportedHeap(heap).Fits(bytes)) return type;
         if (cacheReclaim != nullptr) {
             const auto wanted = bytes + (report.usage > report.budget ? report.usage - report.budget : 0u);
             const auto released = cacheReclaim(wanted, true);

@@ -2840,7 +2840,25 @@ void DepthSurface::PublishToGuest() {
     const std::size_t stencilPlane = publication.size() - 1u;
     Require(sampling.refusal.empty(), sampling.refusal);
     RequireStencilProven();
-    Require(!clearPending && clearGeneration == 0u && stencilClearGeneration == 0u && pendingClear == 0u, "native multisample depth publication with an unapplied clear is not implemented");
+    // A clear the guest has asked for but the host image has not received yet is applied first, so
+    // that the published samples are the ones the guest would read: a recorded HTILE or stencil
+    // plane fill is settled and proven by CheckCurrent, and a clear noted for the next attachment
+    // is recorded now. Only a clear whose dispatch is not recorded yet cannot be applied here.
+    Require(!clearPending, "native multisample depth publication while its HTILE clear dispatch is not recorded is not implemented");
+    if (clearGeneration != 0u || stencilClearGeneration != 0u) {
+        if (clearGeneration != 0u && clearCompletionQueued) {
+            const auto& metadata = sampling.initial[1];
+            auto* pending = RecorderFor(context);
+            if (pending != nullptr && pending->PendingWriteOverlaps(metadata.address, metadata.bytes)) pending->SyncThrough(metadata.address, metadata.bytes);
+        }
+        CheckCurrent();
+    }
+    if (pendingClear != 0u) {
+        const auto aspects = pendingClear & (VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u));
+        pendingClear = 0u;
+        if (aspects != 0u) RecordClear(aspects);
+    }
+    Require(clearGeneration == 0u && stencilClearGeneration == 0u, "native multisample depth publication could not apply its recorded clear");
     Require(sampleable && context.detiler != nullptr, "sample-preserving guest publication of native multisample depth requires sampled readback support");
     const auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
     std::array<std::vector<GuestMemory::UnchangedQuery>, 3> live;
