@@ -451,8 +451,17 @@ bool ProgramWritesMemory(const ShaderSnapshot& snapshot, std::size_t codeOffset)
         if (cached != Unknown) return cached == Writes;
     }
     if (codeOffset > snapshot.code.size()) return true;
+    if (codeOffset != 0) {
+        std::lock_guard lock(snapshot.offsetAnalysis->mutex);
+        if (const auto known = snapshot.offsetAnalysis->memoryWrites.find(codeOffset); known != snapshot.offsetAnalysis->memoryWrites.end()) return known->second == Writes;
+    }
     const bool writes = decodedWritesMemory(std::span(snapshot.code).subspan(codeOffset));
-    if (codeOffset == 0) snapshot.memoryWrites->store(writes ? Writes : Reads, std::memory_order_release);
+    if (codeOffset == 0) {
+        snapshot.memoryWrites->store(writes ? Writes : Reads, std::memory_order_release);
+    } else {
+        std::lock_guard lock(snapshot.offsetAnalysis->mutex);
+        snapshot.offsetAnalysis->memoryWrites[codeOffset] = writes ? Writes : Reads;
+    }
     return writes;
 }
 
@@ -466,6 +475,13 @@ std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t c
         const auto use = snapshot->positionVectorUse->load(std::memory_order_acquire);
         if (use != Unknown) return use == Used ? bits : 0;
     }
+    // A program inside the snapshot decodes the same instructions on every draw: remembered by offset
+    // (the span is the snapshot's own code from that offset on, as at offset 0).
+    const bool cachedByOffset = snapshot != nullptr && codeOffset != 0 && codeOffset <= snapshot->code.size() && code.data() == snapshot->code.data() + codeOffset && code.size() == snapshot->code.size() - codeOffset;
+    if (cachedByOffset) {
+        std::lock_guard lock(snapshot->offsetAnalysis->mutex);
+        if (const auto known = snapshot->offsetAnalysis->positionVectorUse.find(codeOffset); known != snapshot->offsetAnalysis->positionVectorUse.end()) return known->second == Used ? bits : 0;
+    }
     bool used = true;
     try {
         const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
@@ -476,6 +492,10 @@ std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t c
         if (std::strstr(error.what(), "opcode is not implemented") == nullptr) throw;
     }
     if (cached) snapshot->positionVectorUse->store(used ? Used : Unused, std::memory_order_release);
+    if (cachedByOffset) {
+        std::lock_guard lock(snapshot->offsetAnalysis->mutex);
+        snapshot->offsetAnalysis->positionVectorUse[codeOffset] = used ? Used : Unused;
+    }
     return used ? bits : 0;
 }
 
