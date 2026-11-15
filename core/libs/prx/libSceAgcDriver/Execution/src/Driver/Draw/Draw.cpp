@@ -37,6 +37,8 @@
 
 namespace AgcDriver::DriverDetail {
 
+void NoteDecodeSplit(std::size_t part, std::uint64_t nanoseconds);
+
 namespace {
 
 bool TraceShaderCorrelation() {
@@ -495,6 +497,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (dataEntry != nullptr && !DecodeProgramsCurrent(*dataEntry->decode, *submission.shaders)) dataEntry = nullptr;
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
+    auto splitLast = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto split = [&](std::size_t part) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        NoteDecodeSplit(part, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - splitLast).count()));
+        splitLast = now;
+    };
     if (dataEntry != nullptr) {
         auto refreshed = std::make_shared<DrawDecode>(*dataEntry->decode);
         for (auto& program : refreshed->programs) {
@@ -518,8 +527,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& patch : userPatches) patched->programs.at(patch.program).userData.at(patch.index) = patch.value;
         decode = std::move(patched);
     }
+    split(0);
     try {
+        const bool full = decode == nullptr;
         resolveDrawDecode(queue, submission, localDevice->graphicsContext(), decode, registerKey, drawKey, profile);
+        split(full ? 1 : 2);
     } catch (...) {
         TraceDrawAttemptFailure(traceToken, "decode", "exception", submission.serial, submission.queue, packetOffset, ExceptionReason(std::current_exception()));
         throw;
@@ -573,6 +585,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto line = FormatDrawProgramTrace(submission.serial, submission.queue, identities);
         std::fprintf(stderr, "%s\n", line.c_str());
     }
+    split(3);
     phaseTiming.Phase(DrawRowDecode);
 
     const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
@@ -714,7 +727,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     if (registerKey) {
-
+        if (profile) splitLast = std::chrono::steady_clock::now();
+        struct SplitVertexInfos {
+            const decltype(split)& note;
+            ~SplitVertexInfos() { note(4); }
+        } splitVertexInfos{split};
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (matched[i] != nullptr && drawHit && !verifyDrawRecipe()) {
                 if (matched[i]->vertexInfo != nullptr) vertexInfos[i] = *matched[i]->vertexInfo;

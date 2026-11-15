@@ -743,7 +743,22 @@ std::uint64_t forcedCacheBudget() {
 std::uint64_t storageBudget(const Context& context, std::uint64_t required = 0, std::optional<std::chrono::steady_clock::time_point>* calculatedAt = nullptr) {
     if (calculatedAt != nullptr) calculatedAt->reset();
     const auto forced = forcedCacheBudget();
-    if (forced != 0) return forced;
+    if (forced != 0) {
+        // APS5_TRACE_MEMORY_BUDGET reports the device's memory use with a forced budget too.
+        if (MemoryAccounting::Enabled() && context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE) {
+            static std::atomic<std::int64_t> last{0};
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto before = last.load(std::memory_order_relaxed);
+            if (now - before >= 10 && last.compare_exchange_strong(before, now)) {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+                VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+                properties.pNext = &reported;
+                context.memoryProperties2(context.physical, &properties);
+                MemoryAccounting::Report(context, reported, CalculateStorageTextureBudget(context.memory, &reported, SampledTextureMemory(), storageCacheBytes()));
+            }
+        }
+        return forced;
+    }
     if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudget(context.memory);
     static struct {
         AgcDriver::Mutex mutex;
@@ -6488,6 +6503,27 @@ void ShaderResources::resolveImageTables() {
         ReusedTable fresh;
         fresh.bound.assign(binding.count, {});
         bool reusable = state.epoch != 0;
+        // APS5_TRACE_STORAGE_TABLE: what the written elements of an image table are (format, size), for the first tables seen.
+        static const bool traceStorageTable = std::getenv("APS5_TRACE_STORAGE_TABLE") != nullptr;
+        std::map<std::uint64_t, std::pair<std::uint32_t, std::uint64_t>> storageTableFormats;
+        struct StorageTableTrace {
+            const std::map<std::uint64_t, std::pair<std::uint32_t, std::uint64_t>>& rows;
+            std::uint32_t count;
+            std::set<std::uint64_t> bases;
+            std::vector<std::array<std::uint32_t, 8>> examples;
+            ~StorageTableTrace() {
+                static std::atomic<std::uint32_t> printed{0};
+                if (rows.empty() || printed.fetch_add(1, std::memory_order_relaxed) >= 6) return;
+                std::uint64_t images = 0, bytes = 0;
+                for (const auto& [key, row] : rows) { images += row.first; bytes += row.second; }
+                std::fprintf(stderr, "[storage-table] %llu written elements of %u (%llu MiB of guest bytes, %zu distinct base addresses 0x%llx..0x%llx) in %zu format/size classes:", static_cast<unsigned long long>(images), count, static_cast<unsigned long long>(bytes >> 20u), bases.size(), static_cast<unsigned long long>(bases.empty() ? 0 : *bases.begin()), static_cast<unsigned long long>(bases.empty() ? 0 : *bases.rbegin()), rows.size());
+                for (const auto& words : examples) std::fprintf(stderr, " [%08x %08x %08x %08x %08x %08x %08x %08x]", words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+                std::vector<std::pair<std::uint64_t, std::pair<std::uint32_t, std::uint64_t>>> sorted(rows.begin(), rows.end());
+                std::sort(sorted.begin(), sorted.end(), [](const auto& x, const auto& y) { return x.second.second > y.second.second; });
+                for (std::size_t i = 0; i < sorted.size() && i < 24; ++i) std::fprintf(stderr, " format %u %ux%u x%u (%llu MiB)", static_cast<unsigned>(sorted[i].first >> 32u), static_cast<unsigned>((sorted[i].first >> 16u) & 0xffffu), static_cast<unsigned>(sorted[i].first & 0xffffu), sorted[i].second.first, static_cast<unsigned long long>(sorted[i].second.second >> 20u));
+                std::fprintf(stderr, "\n");
+            }
+        } storageTableTrace{storageTableFormats, binding.count, {}, {}};
         if (binding.count > 1) table.representatives = variantRepresentatives(context.device, binding, table.elementBase, context.imageTableCapacity);
         const auto& representatives = table.representatives;
         std::vector<bool> representativeNeeded(representatives.size(), false);
@@ -6556,6 +6592,13 @@ void ShaderResources::resolveImageTables() {
                 storageAtomic64.push_back(element < binding.imageAtomic64.size() && binding.imageAtomic64[element]);
                 describedRanges.push_back({"storage", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress, true});
                 bindings[storageBinding].imageAllocations[absolute] = storageTextures.size() - 1u;
+                if (traceStorageTable) {
+                    auto& row = storageTableFormats[(static_cast<std::uint64_t>(resource.format) << 32u) | (static_cast<std::uint64_t>(resource.width) << 16u) | resource.height];
+                    ++row.first;
+                    row.second += guestBytes;
+                    storageTableTrace.bases.insert(resource.baseAddress);
+                    if (storageTableTrace.examples.size() < 4) storageTableTrace.examples.push_back({words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]});
+                }
                 continue;
             }
             if (item == nullptr) {

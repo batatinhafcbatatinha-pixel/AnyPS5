@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include <unordered_map>
 #include <algorithm>
 #include <array>
 #include <optional>
@@ -299,6 +300,13 @@ struct ShaderSnapshot {
     std::shared_ptr<std::atomic<std::uint8_t>> workgroupUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> memoryWrites = std::make_shared<std::atomic<std::uint8_t>>(0u);
+    // The same two answers for programs that start inside the snapshot (code offset != 0), by offset.
+    struct OffsetAnalysis {
+        std::mutex mutex;
+        std::unordered_map<std::size_t, std::uint8_t> positionVectorUse;
+        std::unordered_map<std::size_t, std::uint8_t> memoryWrites;
+    };
+    std::shared_ptr<OffsetAnalysis> offsetAnalysis = std::make_shared<OffsetAnalysis>();
     std::shared_ptr<std::atomic<bool>> rawGraphicsNoted = std::make_shared<std::atomic<bool>>(false);
     std::optional<std::uint32_t> userDataTailRegister;
 };

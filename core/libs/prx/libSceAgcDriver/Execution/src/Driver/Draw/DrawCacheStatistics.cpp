@@ -1,9 +1,22 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
+#include <array>
+#include <atomic>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+// APS5_PROFILE_DRAW: where the "decode" phase of a draw goes (time and count per part).
+std::array<std::atomic<std::uint64_t>, 5> decodeSplitNs;
+std::array<std::atomic<std::uint64_t>, 5> decodeSplitCount;
+}
+
+void NoteDecodeSplit(std::size_t part, std::uint64_t nanoseconds) {
+    decodeSplitNs[part].fetch_add(nanoseconds, std::memory_order_relaxed);
+    decodeSplitCount[part].fetch_add(1, std::memory_order_relaxed);
+}
 
 bool Driver::traceDrawCache() {
     static const bool trace = std::getenv("APS5_TRACE_DRAW_CACHE") != nullptr;
@@ -38,6 +51,14 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
         text += line;
     }
     if (profile) text += profileDrawCacheLines(counters);
+    if (profile) {
+        static constexpr const char* names[5] = {"data-entry refresh", "full decode", "decode kept", "program setup", "vertex infos"};
+        char line[512];
+        int at = std::snprintf(line, sizeof(line), "[draw-cache] decode phase split (10 s):");
+        for (std::size_t i = 0; i < 5; ++i) at += std::snprintf(line + at, sizeof(line) - static_cast<std::size_t>(at), " %s %llu x %.1f ms;", names[i], count(decodeSplitCount[i].exchange(0)), static_cast<double>(decodeSplitNs[i].exchange(0)) / 1e6);
+        text += line;
+        text += "\n";
+    }
     AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
     counters = DrawEntryCounters{};
 }
