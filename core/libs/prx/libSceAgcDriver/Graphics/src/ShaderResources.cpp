@@ -740,8 +740,53 @@ std::uint64_t forcedCacheBudget() {
     return forced;
 }
 
+// APS5_TEXTURE_CACHE_SHARED=1: the sampled and the storage cache share one budget taken from the
+// device heap as the driver reports it: the heap's budget less what everything else uses and a
+// reserve of 1/32 of it (256 MiB at least). Each cache may grow into what the other leaves free,
+// so a title whose textures are mostly of one kind is not held to half of the memory. Read once
+// a second.
+std::optional<std::uint64_t> sharedCacheBudget(const Context& context, bool storage) {
+    static const bool enabled = std::getenv("APS5_TEXTURE_CACHE_SHARED") != nullptr;
+    if (!enabled || context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return std::nullopt;
+    const auto heap = largestDeviceLocalHeap(context.memory);
+    if (!heap) return std::nullopt;
+    static struct {
+        AgcDriver::Mutex mutex;
+        VkPhysicalDevice device{VK_NULL_HANDLE};
+        std::chrono::steady_clock::time_point read{};
+        std::uint64_t total{0};
+        std::uint64_t reported{0};
+    } cached;
+    const auto sampledBytes = SampledTextureMemory();
+    const auto storageBytes = storageCacheBytes();
+    std::lock_guard lock(cached.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (cached.device != context.physical || now - cached.read >= std::chrono::seconds(1)) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        properties.pNext = &reported;
+        context.memoryProperties2(context.physical, &properties);
+        const auto heapBudget = reported.heapBudget[*heap];
+        if (heapBudget == 0) return std::nullopt;
+        const auto usage = reported.heapUsage[*heap];
+        const auto textures = sampledBytes + storageBytes;
+        const auto others = usage - std::min<std::uint64_t>(usage, textures) + std::max<std::uint64_t>(256ull << 20u, heapBudget / 32u);
+        cached.total = std::max<std::uint64_t>(1024ull << 20u, heapBudget > others ? heapBudget - others : 0u);
+        cached.device = context.physical;
+        cached.read = now;
+        const auto change = cached.total > cached.reported ? cached.total - cached.reported : cached.reported - cached.total;
+        if (change > cached.reported / 8u) {
+            cached.reported = cached.total;
+            std::fprintf(stderr, "[gpu] shared texture cache budget %llu MiB (device heap %u: budget %llu MiB, usage %llu MiB; sampled %llu MiB, storage %llu MiB)\n", static_cast<unsigned long long>(cached.total >> 20u), *heap, static_cast<unsigned long long>(heapBudget >> 20u), static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(sampledBytes >> 20u), static_cast<unsigned long long>(storageBytes >> 20u));
+        }
+    }
+    const auto other = storage ? sampledBytes : storageBytes;
+    return std::max<std::uint64_t>(512ull << 20u, cached.total > other ? cached.total - other : 0u);
+}
+
 std::uint64_t storageBudget(const Context& context, std::uint64_t required = 0, std::optional<std::chrono::steady_clock::time_point>* calculatedAt = nullptr) {
     if (calculatedAt != nullptr) calculatedAt->reset();
+    if (const auto shared = sharedCacheBudget(context, true)) return *shared;
     const auto forced = forcedCacheBudget();
     if (forced != 0) {
         // APS5_TRACE_MEMORY_BUDGET reports the device's memory use with a forced budget too.
@@ -809,6 +854,7 @@ std::size_t storageEntries() {
 }
 
 std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
+    if (const auto shared = sharedCacheBudget(context, false)) return *shared;
     if (const auto forced = forcedCacheBudget(); forced != 0) return forced;
     if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudget(context.memory);
     const auto now = std::chrono::steady_clock::now();

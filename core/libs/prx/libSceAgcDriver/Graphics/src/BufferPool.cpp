@@ -491,6 +491,34 @@ bool BufferPool::evictOldestImage(std::vector<BufferAllocation>& evicted) {
     return true;
 }
 
+VkDeviceSize BufferPool::ShrinkDeviceRetention() {
+    constexpr VkDeviceSize floor = VkDeviceSize{96} << 20u;
+    std::vector<BufferAllocation> evicted;
+    VkDeviceSize before = 0;
+    VkDeviceSize after = 0;
+    {
+        std::lock_guard lock(mutex);
+        if (deviceTier.budget == 0 || deviceTier.retainedBytes == 0) return 0;
+        before = deviceTier.budget;
+        if (deviceTier.budget > floor) deviceTier.budget = std::max(floor, deviceTier.budget / 2u);
+        if (imageBudget != 0) imageBudget = ImageBudget(deviceTier.budget);
+        after = deviceTier.budget;
+        // Under pressure the whole retained set goes, not only the part above the new budget: the
+        // allocation that did not fit is usually larger than the difference.
+        evicted.reserve(deviceTier.slots);
+        while (deviceTier.slots != 0) evictOldest(deviceTier, evicted);
+    }
+    VkDeviceSize released = 0;
+    for (const auto& allocation : evicted) released += destroy(allocation, true);
+    released += trimImageBlocks();
+    std::fprintf(stderr, "[bufferpool] device heap pressure: %llu MiB of retained device memory freed, retention budget %llu -> %llu MiB\n", static_cast<unsigned long long>(released >> 20u), static_cast<unsigned long long>(before >> 20u), static_cast<unsigned long long>(after >> 20u));
+    return released;
+}
+
+VkDeviceSize ShrinkDevicePoolRetention(BufferPool& pool) {
+    return pool.ShrinkDeviceRetention();
+}
+
 VkDeviceSize BufferPool::ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::steady_clock::time_point now) {
     if (bytes == 0) return 0;
     const auto heaps = std::min<std::uint32_t>(memoryProperties.memoryHeapCount, VK_MAX_MEMORY_HEAPS);

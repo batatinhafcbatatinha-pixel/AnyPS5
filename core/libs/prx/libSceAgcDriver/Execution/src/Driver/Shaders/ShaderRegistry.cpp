@@ -482,6 +482,13 @@ std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t c
         std::lock_guard lock(snapshot->offsetAnalysis->mutex);
         if (const auto known = snapshot->offsetAnalysis->positionVectorUse.find(codeOffset); known != snapshot->offsetAnalysis->positionVectorUse.end()) return known->second == Used ? bits : 0;
     }
+    // Diagnostics (APS5_PROFILE_DRAW): decodes no cache covers, with the reason, at powers of two.
+    static const bool profileDecodes = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profileDecodes) {
+        static std::atomic<std::uint64_t> uncached{0};
+        const auto count = uncached.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count >= 256u && (count & (count - 1)) == 0) std::fprintf(stderr, "[position-export] %llu decodes without a cached answer; this one: snapshot %d, code offset %zu, %zu words, span inside the snapshot %d\n", static_cast<unsigned long long>(count), snapshot != nullptr ? 1 : 0, codeOffset, code.size(), snapshot != nullptr && codeOffset <= snapshot->code.size() && code.data() == snapshot->code.data() + codeOffset ? 1 : 0);
+    }
     bool used = true;
     try {
         const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
