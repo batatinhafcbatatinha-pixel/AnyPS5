@@ -286,6 +286,12 @@ public:
     bool PendingWriteSettled(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t LastWriteNote(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t NewestWriteNote(std::uint64_t address, std::size_t bytes) const;
+    // The newest write note handed out so far, and whether a pending write noted after `note`
+    // overlaps the range. Notes grow within a batch, so only the writes newer than `note` are looked
+    // at: a caller that remembers an answer about the pending writes over a range asks this instead
+    // of walking all of them again.
+    std::uint64_t WriteNoteCount() const { return writeNoteCount; }
+    bool WriteNotedSince(std::uint64_t address, std::size_t bytes, std::uint64_t note) const;
     std::uint64_t NewestStoreNote(std::uint64_t address, std::size_t bytes) const;
     struct PendingWrite {
         std::uint64_t begin;
@@ -410,6 +416,18 @@ public:
     // batch's completion action no wait is made at all: every batch still in flight was recorded
     // after the completing one, and its store is that batch's in-order write (see Recorder.cpp).
     void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false);
+    // APS5_TRACE_WAIT_PRODUCERS: the program whose recorded work notes writes on this thread (a
+    // dispatch's code address; a draw's last stage variant with bit 63 set), and a SyncThrough for a
+    // capture read that first waits for the batches ahead of the one holding the write and charges
+    // both parts to the (consumer, producer) pair, printed every 10 s.
+    static bool TraceWaitProducers();
+    static void SetTraceProducer(std::uint64_t producer);
+    static std::uint64_t TraceProducer();
+    // APS5_TRACE_PRODUCER=hex: the traced producer program, and one frame's order of its dispatches
+    // ('P') and of capture waits ('w'), printed every 10 s.
+    static std::uint64_t TracedProducerProgram();
+    static void NoteProducerSequence(char event);
+    void TracedSyncThrough(std::uint64_t address, std::size_t bytes, std::uint64_t consumer, int branch = 1);
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
@@ -748,6 +766,8 @@ private:
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
         std::vector<std::int64_t> writeWords;
+        // APS5_TRACE_WAIT_PRODUCERS: [begin, end, producer] of each noted write.
+        std::vector<std::array<std::uint64_t, 3>> producers;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;

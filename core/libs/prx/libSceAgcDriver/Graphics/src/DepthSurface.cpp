@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <string>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -46,8 +48,20 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+// Declared as <windows.h> declares them, for the [depth] diagnostics, without that header's macros.
+struct HINSTANCE__;
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long framesToSkip, unsigned long framesToCapture, void** backTrace, unsigned long* backTraceHash);
+extern "C" __declspec(dllimport) int __stdcall GetModuleHandleExA(unsigned long flags, const char* name, HINSTANCE__** module);
+#endif
+
 namespace AgcDriver::Graphics {
 namespace {
+
+// An address inside this module, for the [depth] diagnostics.
+[[gnu::noinline]] void DepthSurfaceTraceAnchor() {}
+// The caller of DepthSurface::ApplyFastClear while it checks the surface, for the [depth] diagnostics.
+thread_local const void* applyFastClearCaller = nullptr;
 
 std::uint64_t depthWrites = 0;
 std::uint64_t mirrorEpoch = 0;
@@ -866,6 +880,22 @@ public:
                          index == 0u ? "depth" : index == 1u ? "htile" : "stencil", static_cast<unsigned long long>(plane.address), plane.bytes,
                          static_cast<unsigned long long>(plane.generation), GuestMemory::UnchangedSince(plane.address, plane.bytes, plane.generation) ? 0u : 1u);
         }
+        std::fprintf(stderr, "[depth]   hostWritten=%u hostEverWritten=%u samplingActive=%u retired=%u ApplyFastClear caller %p\n", hostWritten->load(std::memory_order_acquire) ? 1u : 0u,
+                     hostEverWritten->load(std::memory_order_acquire) ? 1u : 0u, samplingActive ? 1u : 0u, retired ? 1u : 0u, applyFastClearCaller);
+#if defined(_WIN32)
+        void* frames[16]{};
+        const auto count = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
+        HINSTANCE__* self = nullptr;
+        GetModuleHandleExA(0x4u | 0x2u, reinterpret_cast<const char*>(&DepthSurfaceTraceAnchor), &self);
+        std::fprintf(stderr, "[depth]   stack (agc = libSceAgcDriver base %p):", static_cast<void*>(self));
+        for (unsigned short index = 0; index < count; ++index) {
+            HINSTANCE__* module = nullptr;
+            const bool known = GetModuleHandleExA(0x4u | 0x2u, static_cast<const char*>(frames[index]), &module) && module == self && self != nullptr;
+            if (known) std::fprintf(stderr, " agc+0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frames[index]) - reinterpret_cast<std::uintptr_t>(self)));
+            else std::fprintf(stderr, " %p", frames[index]);
+        }
+        std::fprintf(stderr, "\n");
+#endif
         std::fflush(stderr);
     }
 
@@ -903,7 +933,9 @@ public:
 
     void ApplyFastClear() {
         if (samplingActive) {
+            applyFastClearCaller = __builtin_return_address(0);
             CheckCurrent();
+            applyFastClearCaller = nullptr;
             Require(pendingClear == 0u, "native multisample depth fast-clear transition is not implemented");
         }
         const auto aspects = pendingClear & (VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u));
@@ -1125,6 +1157,8 @@ public:
     }
 
     void PublishToGuest();
+    // Whether PublishToGuest has no captured planes to merge with (their capture failed or none was taken).
+    bool PublicationUnavailable() const { return publicationFailure != nullptr || publication.empty(); }
 
     std::uint64_t written = ++depthWrites;
     std::shared_ptr<std::atomic<bool>> hostWritten = std::make_shared<std::atomic<bool>>(false);
@@ -3147,15 +3181,67 @@ void forgetCopiesInside(std::uint64_t address, std::size_t bytes) {
     std::erase_if(copyDestinations(), [&](const auto& range) { return address <= range.first && range.second <= address + bytes; });
 }
 
+// The answer "writes over this HTILE are pending and what they leave is no clear" of
+// storeBackClearedHtile, remembered per HTILE address: it holds while the same recorder has noted no
+// write over the metadata after the answer and the CPU has not written the metadata. A depth target
+// is attached by every draw of its pass; without this each of them walked every pending write of
+// the open and in-flight batches again (~48 us per draw in title A), so the check asks
+// Recorder::WriteNotedSince, which looks only at the notes newer than the answer.
+struct PendingHtileAnswer {
+    std::size_t bytes = 0;
+    bool stencil = false;
+    std::uint64_t recorder = 0;
+    std::uint64_t note = 0;
+    std::uint64_t generation = 0;
+};
+
+std::map<std::uint64_t, PendingHtileAnswer>& pendingHtileAnswers() {
+    static auto* answers = new std::map<std::uint64_t, PendingHtileAnswer>();
+    return *answers;
+}
+
+std::set<std::uint64_t>& speculatedHtiles() {
+    static auto* speculated = new std::set<std::uint64_t>();
+    return *speculated;
+}
+
+// Diagnostics (APS5_PROFILE_DRAW, printed with the [depth-attach] line): the steps of the HTILE
+// store-back check in nanoseconds and how often it reads the whole metadata.
+struct HtileStoreBackCounts {
+    static inline std::array<std::atomic<std::uint64_t>, 4> ns{};
+    static inline std::atomic<std::uint64_t> scans{0}, scannedBytes{0}, pendingPaths{0}, untrackedCalls{0}, pendingKept{0}, speculated{0}, lateClears{0}, pendingReads{0}, pendingReadClears{0};
+    static bool Profiled() {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        return profile;
+    }
+    std::chrono::steady_clock::time_point last = Profiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void Mark(std::size_t part) {
+        if (!Profiled()) return;
+        const auto now = std::chrono::steady_clock::now();
+        ns[part].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        last = now;
+    }
+};
+
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
     if (target.htileAddress == 0) return 0;
+    HtileStoreBackCounts counts;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
     if (copiedOver(target.htileAddress, bytes)) return 0;
+    counts.Mark(0);
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
+    counts.Mark(1);
     auto* recorder = RecorderFor(context);
     const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, bytes);
     const auto untracked = !pending && collected == 0 ? untrackedHtileStamp(recorder, target.htileAddress, bytes) : std::nullopt;
+    counts.Mark(2);
+    if (pending) HtileStoreBackCounts::pendingPaths.fetch_add(1, std::memory_order_relaxed);
+    if (collected == 0) HtileStoreBackCounts::untrackedCalls.fetch_add(1, std::memory_order_relaxed);
+    struct Rest {
+        HtileStoreBackCounts& counts;
+        ~Rest() { counts.Mark(3); }
+    } rest{counts};
     if (!pending) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
@@ -3166,6 +3252,16 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         }
     }
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
+    static const bool pendingMemo = std::getenv("APS5_NO_PENDING_HTILE_MEMO") == nullptr;
+    const auto pendingNote = pending && pendingFills && pendingMemo && collected != 0 ? recorder->WriteNoteCount() : 0u;
+    if (pendingNote != 0) {
+        std::lock_guard lock(htileReadsMutex());
+        const auto found = pendingHtileAnswers().find(target.htileAddress);
+        if (found != pendingHtileAnswers().end() && found->second.bytes == bytes && found->second.stencil == target.htileStencil && found->second.recorder == recorder->Id() && !recorder->WriteNotedSince(target.htileAddress, bytes, found->second.note) && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second.generation)) {
+            HtileStoreBackCounts::pendingKept.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+    }
     if (pending && pendingFills) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
         if (const auto landed = htileAfterPendingFills(*recorder, target.htileAddress, bytes)) {
@@ -3173,6 +3269,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             if (cleared == 0) {
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = collected;
+                if (pendingNote != 0) pendingHtileAnswers()[target.htileAddress] = {bytes, target.htileStencil, recorder->Id(), pendingNote, collected};
                 return 0;
             }
             if (storeHtileOnGpu(context, *recorder, target.htileAddress, bytes, expandedHtileWord(*landed, target.htileStencil, cleared))) {
@@ -3188,11 +3285,39 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             return known->first;
         }
     }
+    // APS5_HTILE_PENDING_UNKNOWN_NO_CLEAR=1 (a title's tuning, off by default): a pending GPU write of
+    // unknown content over the metadata (a shader computed it; the fills the driver recognises are
+    // handled above) is taken as "no fast clear" without reading the metadata, which would wait for
+    // the GPU. The read made once the write has landed still finds a clear; it is counted as late.
+    static const bool unknownIsNoClear = std::getenv("APS5_HTILE_PENDING_UNKNOWN_NO_CLEAR") != nullptr;
+    if (pending && unknownIsNoClear) {
+        HtileStoreBackCounts::speculated.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lock(htileReadsMutex());
+        speculatedHtiles().insert(target.htileAddress);
+        return 0;
+    }
+    // Diagnostics (APS5_PROFILE_DRAW): the whole-metadata reads and the pending writes they wait for.
+    if (const auto scan = HtileStoreBackCounts::scans.fetch_add(1, std::memory_order_relaxed) + 1; HtileStoreBackCounts::Profiled() && (scan <= 6u || (scan & (scan - 1)) == 0)) {
+        std::fprintf(stderr, "[htile-read] whole read %llu: depth 0x%llx %ux%u samples %u htile 0x%llx+0x%zx stencil %d pending %d collected %llu\n", static_cast<unsigned long long>(scan), static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, target.samples, static_cast<unsigned long long>(target.htileAddress), bytes, target.htileStencil ? 1 : 0, pending ? 1 : 0, static_cast<unsigned long long>(collected));
+        if (pending) {
+            const auto writes = recorder->PendingWritesOver(target.htileAddress, bytes);
+            for (std::size_t index = 0; index < writes.size() && index < 6u; ++index) std::fprintf(stderr, "[htile-read]   pending write 0x%llx..0x%llx note %llu value %lld word %lld (%zu writes)\n", static_cast<unsigned long long>(writes[index].begin), static_cast<unsigned long long>(writes[index].end), static_cast<unsigned long long>(writes[index].note), static_cast<long long>(writes[index].value), static_cast<long long>(writes[index].word), writes.size());
+        }
+    }
+    HtileStoreBackCounts::scannedBytes.fetch_add(bytes, std::memory_order_relaxed);
     std::vector<std::uint32_t> words(bytes / 4u);
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
     auto generation = collected;
+    if (pending) {
+        HtileStoreBackCounts::pendingReads.fetch_add(1, std::memory_order_relaxed);
+        if (cleared != 0) HtileStoreBackCounts::pendingReadClears.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+        std::lock_guard lock(htileReadsMutex());
+        if (speculatedHtiles().erase(target.htileAddress) != 0 && cleared != 0) HtileStoreBackCounts::lateClears.fetch_add(1, std::memory_order_relaxed);
+    }
     if (cleared != 0) {
         for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
         GuestMemory::Write(target.htileAddress, std::as_bytes(std::span(words)), 4);
@@ -3491,6 +3616,13 @@ void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t 
     if (!written.empty()) {
         Require(allowPublication && !HoldsMultisampleTargetsLock(), "sample-preserving guest publication of native multisample depth is not implemented while a multisampled colour target is being acquired");
         if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::ReadCaptured);
+        // Diagnostics (APS5_PROFILE_DRAW): which read forces a publication (first 8, then powers of two).
+        static const bool profilePublications = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profilePublications) {
+            static std::atomic<std::uint64_t> publications{0};
+            const auto count = publications.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 8u || (count & (count - 1)) == 0) std::fprintf(stderr, "[depth-publish] %llu publications forced by a read; this one: range 0x%llx+0x%zx, %zu surfaces, htile clear argument %d, caller %p\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(address), bytes, written.size(), htileClear.has_value() ? 1 : 0, __builtin_return_address(0));
+        }
         publishWrittenDepth(written);
     }
     std::unique_lock lock(depthGuardMutex());
@@ -3619,17 +3751,57 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     return DepthSurfaceViewWithStencilWriteIntent(context, target, depthWritten, stencilTested, true);
 }
 
+// Diagnostics (APS5_PROFILE_DRAW): where the per-draw depth attachment spends its time, every 10 s.
+struct DepthAttachSplit {
+    static constexpr std::size_t Parts = 9;
+    static inline std::array<std::atomic<std::uint64_t>, Parts> ns{};
+    static inline std::atomic<std::uint64_t> calls{0};
+    static inline std::atomic<std::int64_t> reported{0};
+    const bool enabled;
+    std::chrono::steady_clock::time_point last;
+    DepthAttachSplit() : enabled(Profiled()), last(enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    static bool Profiled() {
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        return profile;
+    }
+    void Mark(std::size_t part) {
+        if (!enabled) return;
+        const auto now = std::chrono::steady_clock::now();
+        ns[part].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        last = now;
+    }
+    ~DepthAttachSplit() {
+        if (!enabled) return;
+        Mark(Parts - 1u);
+        calls.fetch_add(1, std::memory_order_relaxed);
+        const auto second = std::chrono::duration_cast<std::chrono::seconds>(last.time_since_epoch()).count();
+        auto before = reported.load(std::memory_order_relaxed);
+        if (second - before < 10 || !reported.compare_exchange_strong(before, second)) return;
+        static constexpr std::array<const char*, Parts> names{"surfaces lock", "find surface", "guest rewrite check", "create+prove", "planes+mirror sync", "resident checks+claims", "htile store-back", "gpu lock+settle", "fast clear+rest"};
+        std::string text;
+        for (std::size_t part = 0; part < Parts; ++part) text += std::string(" ") + names[part] + " " + std::to_string(ns[part].exchange(0, std::memory_order_relaxed) / 1000000u) + " ms;";
+        std::fprintf(stderr, "[depth-attach] %llu attachments (10 s):%s\n", static_cast<unsigned long long>(calls.exchange(0, std::memory_order_relaxed)), text.c_str());
+        const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+        std::fprintf(stderr, "[depth-attach] htile store-back (10 s): accessible+copied %llu ms, collect %llu ms, pending+stamp %llu ms, rest %llu ms; %llu whole reads (%llu KiB), %llu with pending writes (%llu answered from the memo), %llu untracked; reads behind a pending write of unknown content %llu (%llu found a clear), skipped as no clear %llu (%llu clears found late)\n", take(HtileStoreBackCounts::ns[0]) / 1000000u, take(HtileStoreBackCounts::ns[1]) / 1000000u, take(HtileStoreBackCounts::ns[2]) / 1000000u, take(HtileStoreBackCounts::ns[3]) / 1000000u, take(HtileStoreBackCounts::scans), take(HtileStoreBackCounts::scannedBytes) >> 10u, take(HtileStoreBackCounts::pendingPaths), take(HtileStoreBackCounts::pendingKept), take(HtileStoreBackCounts::untrackedCalls), take(HtileStoreBackCounts::pendingReads), take(HtileStoreBackCounts::pendingReadClears), take(HtileStoreBackCounts::speculated), take(HtileStoreBackCounts::lateClears));
+    }
+};
+
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil) {
+    DepthAttachSplit split;
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
     if (target.depthPartiallyResident) Require(resident(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u)) && (target.htileAddress == 0u || resident(target.htileAddress, HtileMetadataBytes(target.extent))), "partially resident depth (DB_Z_INFO) with pages that are not mapped is unsupported");
     if (target.stencilPartiallyResident) Require(resident(target.stencilAddress, planeBytes(1u)), "partially resident stencil (DB_STENCIL_INFO) with pages that are not mapped is unsupported");
     ClaimMultisampleTargetMemory(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u));
     if (target.stencilAddress != 0u) ClaimMultisampleTargetMemory(target.stencilAddress, planeBytes(1u));
     if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
+    split.Mark(5);
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    split.Mark(6);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
+    split.Mark(7);
     std::unique_lock lock(surfacesMutex());
+    split.Mark(0);
     const bool cleared = takeClearedHtile(target);
     DepthSurface* surface = nullptr;
     for (const auto& candidate : surfaces()) {
@@ -3642,11 +3814,30 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         if (surface == nullptr && candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameLayoutWithin(candidate->target, target)) surface = candidate.get();
     }
     // A native multisample depth surface whose guest planes the title has written since (Grand
-    // Theft Auto V reuses that memory for other targets) and that holds no host results is
-    // retired like a surface covered by storage writes; a new one is made from the guest memory.
-    if (surface != nullptr && surface->target.samples != 1u && surface->samplingActive && !surface->hostWritten->load(std::memory_order_acquire)) {
+    // Theft Auto V rewrites the whole depth plane of a 256x256 2x target with the CPU between two
+    // uses) is published first when it holds host results: PublishToGuest keeps the guest's bytes
+    // where the guest wrote and the host's elsewhere. It is then retired like a surface covered by
+    // storage writes, and a new one is made from the guest memory.
+    split.Mark(1);
+    if (surface != nullptr && surface->target.samples != 1u && surface->samplingActive) {
         for (const auto& range : surface->sampling.initial) GuestMemory::CollectWritesUncached(range.address, range.bytes);
         if (!GuestMemory::UnchangedSinceAll(surface->sampling.initial)) {
+            if (surface->hostWritten->load(std::memory_order_acquire)) {
+                // When the guest wrote the planes before the host results were captured, the host
+                // drew over stale planes and nothing can be merged: the guest memory, written last,
+                // is kept and the host results are dropped.
+                if (surface->PublicationUnavailable()) {
+                    static std::atomic<unsigned> dropped{0};
+                    if (dropped.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+                        std::fprintf(stderr, "[depth] native multisample depth 0x%llx: guest rewrote its planes before the host results were captured; keeping the guest memory\n",
+                                     static_cast<unsigned long long>(surface->target.address));
+                        std::fflush(stderr);
+                    }
+                    surface->hostWritten->store(false, std::memory_order_release);
+                } else {
+                    surface->PublishToGuest();
+                }
+            }
             retire(*surface);
             std::unique_lock guardLock(depthGuardMutex());
             surface->active->store(false, std::memory_order_release);
@@ -3655,6 +3846,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
             surface = nullptr;
         }
     }
+    split.Mark(2);
     const bool created = surface == nullptr;
     if (!created) surface->ProveOverwrite();
     GuestAllocations::Lease creationLease;
@@ -3696,6 +3888,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         }
         surface = surfaces().back().get();
     }
+    split.Mark(3);
     surface->retired = false;
     const auto owner = depthOwners().find({context.device, target.address});
     const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
@@ -3714,6 +3907,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
     if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
     surface->TakeStencilStorage();
+    split.Mark(4);
     surface->ApplyFastClear();
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;

@@ -65,7 +65,7 @@ void CountVkDraw(VkDrawKind kind) {
 
 
 bool DrawFaultTokens() {
-    static const bool enabled = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr;
+    static const bool enabled = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr && std::getenv("APS5_GPU_CHECKPOINTS_NO_MARKERS") == nullptr;
     return enabled;
 }
 
@@ -1510,6 +1510,57 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 }
 
+// APS5_CEIL_NO_INPUT_FLUSH (ceiling experiment only, wrong results expected): draw-input reads
+// (vertex, index) do not wait for recorded GPU writes over their ranges.
+// APS5_TRACE_INPUT_SYNC: per call site, the flushes and those that took over 50 us (waited for the GPU
+// or a lock) with their total time, printed every 10 s. Sites: 0 skipped kept copy, 1 vertex/index
+// copy, 2 zero-padded vertex copy, 3 in-place probe, 4-6 index range reads (in file order); 7 and 8
+// are sites 0 and 1 for index copies (0 and 1 then count vertex copies only).
+struct DrawInputFlushConfig {
+    bool ceiling;
+    bool trace;
+};
+
+const DrawInputFlushConfig& DrawInputFlush() {
+    static const DrawInputFlushConfig config{std::getenv("APS5_CEIL_NO_INPUT_FLUSH") != nullptr, std::getenv("APS5_TRACE_INPUT_SYNC") != nullptr};
+    return config;
+}
+
+void flushDrawInputWrites(std::uint64_t address, std::size_t bytes, std::uint32_t site) {
+    const auto& config = DrawInputFlush();
+    if (config.ceiling) return;
+    if (!config.trace) {
+        GuestMemory::FlushGpuWrites(address, bytes);
+        return;
+    }
+    constexpr std::uint32_t Sites = 9;
+    static std::array<std::atomic<std::uint64_t>, Sites> calls{}, slow{}, slowNanoseconds{};
+    static std::atomic<std::int64_t> reported{0};
+    const auto start = std::chrono::steady_clock::now();
+    GuestMemory::FlushGpuWrites(address, bytes);
+    const auto now = std::chrono::steady_clock::now();
+    const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+    site = std::min(site, Sites - 1u);
+    calls[site].fetch_add(1, std::memory_order_relaxed);
+    if (nanoseconds > 50000) {
+        slow[site].fetch_add(1, std::memory_order_relaxed);
+        slowNanoseconds[site].fetch_add(static_cast<std::uint64_t>(nanoseconds), std::memory_order_relaxed);
+    }
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    auto last = reported.load(std::memory_order_relaxed);
+    if (last == 0) {
+        reported.compare_exchange_strong(last, seconds);
+    } else if (seconds - last >= 10 && reported.compare_exchange_strong(last, seconds)) {
+        std::string line = "[input-sync] (10 s) site calls/slow/ms:";
+        for (std::uint32_t index = 0; index < Sites; ++index) {
+            char part[96];
+            std::snprintf(part, sizeof(part), " %u: %llu/%llu/%.1f", index, static_cast<unsigned long long>(calls[index].exchange(0)), static_cast<unsigned long long>(slow[index].exchange(0)), static_cast<double>(slowNanoseconds[index].exchange(0)) / 1e6);
+            line += part;
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+}
+
 namespace {
 
 // A draw input range whose kept copies keep going unreused (the title rewrites it every frame) is
@@ -1563,6 +1614,7 @@ bool GpuWrittenDrawInput(const Context& context, std::uint64_t begin, std::size_
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t from) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     Require(from == 0 || (use == Recorder::SnapshotUse::Vertex && from < bytes), "only a vertex input starts past its address");
+    const GuestMemory::ReadSiteScope readSite(use == Recorder::SnapshotUse::Vertex ? GuestMemory::ReadSite::VertexBuffer : GuestMemory::ReadSite::IndexBuffer);
     static const bool profileCopies = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profileCopies && recorder != nullptr) {
         // APS5_PROFILE_DRAW: the copies that must first wait for GPU work over their range, by use.
@@ -1575,12 +1627,12 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     auto* backoff = recorder != nullptr && bytes != 0 ? drawInputBackoff(address, bytes, use) : nullptr;
     if (backoff != nullptr && backoff->skip != 0) {
         --backoff->skip;
-        GuestMemory::FlushGpuWrites(address, bytes);
+        flushDrawInputWrites(address, bytes, use == Recorder::SnapshotUse::Vertex ? 0u : 7u);
         backoff = nullptr;
         recorder = nullptr;
     }
     if (recorder != nullptr && bytes != 0) {
-        GuestMemory::FlushGpuWrites(address, bytes);
+        flushDrawInputWrites(address, bytes, use == Recorder::SnapshotUse::Vertex ? 1u : 8u);
 #ifdef _WIN32
         const bool owned = !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs);
 #else
@@ -1619,7 +1671,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
         const std::size_t prefix = !ranges.empty() && ranges.front().first == address ? static_cast<std::size_t>(ranges.front().second - address) : 0;
         if (validBytes - prefix < stride) readable = prefix;
     }
-    if (readable != 0) GuestMemory::FlushGpuWrites(address, readable);
+    if (readable != 0) flushDrawInputWrites(address, readable, 2u);
     DrawInputCopy copy;
     auto* recorder = context.recorder;
     const bool keep = recorder != nullptr && readable != 0 && readable <= std::numeric_limits<std::uint32_t>::max();
@@ -1656,7 +1708,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     if (recorder == nullptr || bytes == 0 || (!context.drawInputsInPlace && !force)) return nullptr;
     bool behind = false;
     if (behindGpuWrite == nullptr) {
-        GuestMemory::FlushGpuWrites(address, bytes);
+        flushDrawInputWrites(address, bytes, 3u);
         if (recorder->PendingWriteOverlaps(address, bytes)) return nullptr;
     } else {
         StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
@@ -1953,7 +2005,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             }
         };
         if (draw.indexed) {
-            GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+            flushDrawInputWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes), 4u);
             GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
             const auto readIndex = [&](std::uint32_t idx) -> std::uint32_t {
                 if (draw.indexSize == 2) {
@@ -1985,7 +2037,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
-        GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+        flushDrawInputWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes), 5u);
         auto compacted = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
         const auto bytes = compacted->Bytes().first(static_cast<std::size_t>(indexBytes));
         GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
@@ -2019,10 +2071,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // still writes (GPU-built index lists) is bound in place behind a barrier: reading it on the
         // CPU for the copy and its highest index would first submit the open batch and wait for the
         // GPU. Without the highest index the vertex ranges are bound whole (prepareDrawInputs below).
-        // Opt-in (APS5_GPU_WRITTEN_INDEX_IN_PLACE=1): every gameplay run with it on in title B lost
-        // the device ('instruction pointer invalid') within minutes; off, the range is synced and
-        // copied as before.
-        static const bool gpuWrittenIndexInPlace = std::getenv("APS5_GPU_WRITTEN_INDEX_IN_PLACE") != nullptr;
+        // Opt-in (APS5_GPU_WRITTEN_INDEX_IN_PLACE=1); off, the range is synced and copied. In title B it removes
+        // the committer's GPU waits for GPU-written index ranges (+4-5% presents in-run, A/B), but one of three
+        // runs with it on from launch never finished the save load (cause unknown), so it is not the default.
+        const bool gpuWrittenIndexInPlace = RuntimeSwitches::Set(RuntimeSwitch::GpuWrittenIndexInPlace);
         // APS5_BUFFER_CACHE=2 (KytyPS5's draw inputs): the index range is bound from the buffer cache
         // without reading it; its highest index stays unknown, so the vertex buffers are bound whole
         // from the cache below. GPU-written indices are copied in after their writers, in queue order.
@@ -2089,7 +2141,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (const auto zeroFrom = state.stages.mesh || shaders.front().program->vertexAttributes.empty() ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
-                GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                flushDrawInputWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes), 6u);
                 auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
                 const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
                 GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
@@ -2532,7 +2584,7 @@ bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, co
     if (inputs.expandedIndexCount != 0u) {
         context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, VK_INDEX_TYPE_UINT32);
         CountVkDraw(VkDrawKind::Indexed);
-        context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, inputs.expandedIndexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
+        context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, inputs.expandedIndexCount, (ExperimentMode() == 8 ? 0u : draw.instanceCount), 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         emitted = true;
         return true;
     }
@@ -2540,7 +2592,7 @@ bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, co
     if (args == nullptr) {
         if (draw.indexed) {
             CountVkDraw(VkDrawKind::Indexed);
-            context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, pieceFirstIndex ? draw.indexCount : inputs.indexCount.value_or(draw.indexCount), draw.instanceCount, pieceFirstIndex.value_or(0u), static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
+            context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, pieceFirstIndex ? draw.indexCount : inputs.indexCount.value_or(draw.indexCount), (ExperimentMode() == 8 ? 0u : draw.instanceCount), pieceFirstIndex.value_or(0u), static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
             recorded(subdraw++);
             emitted = true;
         } else {
@@ -3604,7 +3656,26 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     RenderScaleTick();
     const bool multisampledDraw = std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.samples > 1u; }) || (state.depth && state.depth->samples != 1u);
     const bool wholeDrawScales = RenderScaleEnabled() && !multisampledDraw && std::ranges::all_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice == 0 && ScaleCandidate(SurfaceForTarget(color), 0); }) && (!state.depth || DepthSurfaceHostExtent(context, *state.depth).has_value() || ScaleCandidateExtent(state.depth->address, DepthSliceBytes(state.depth->extent, 4u), state.depth->extent, true));
-    const ScaleRequestScope scaleScope(!RenderScaleEnabled() ? ScaleRequest::Keep : wholeDrawScales ? ScaleRequest::Allow : ScaleRequest::Refuse, multisampledDraw ? "multisampled" : "mixed targets");
+    if (RenderScaleEnabled() && !wholeDrawScales) {
+    // Diagnostics: the targets of the draws that take a scaled surface back to the guest size (first 12).
+        static std::atomic<unsigned> mixedReports{0};
+        const bool depthCandidate = state.depth && ScaleCandidateExtent(state.depth->address, DepthSliceBytes(state.depth->extent, 4u), state.depth->extent, true);
+        const bool anyCandidate = depthCandidate || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice == 0 && ScaleCandidate(SurfaceForTarget(color), 0); });
+        if (anyCandidate && mixedReports.fetch_add(1, std::memory_order_relaxed) < 16u) {
+            for (const auto& color : state.colors) {
+                const auto surface = SurfaceForTarget(color);
+                std::fprintf(stderr, "[render-scale] mixed draw (multisampled %d): colour 0x%llx %ux%u format %u tile %d mips %u samples %u cmask 0x%llx last slice %u candidate %d\n", multisampledDraw ? 1 : 0, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, surface.format, static_cast<int>(surface.tileMode), surface.mipCount, color.samples, static_cast<unsigned long long>(surface.fmaskCmaskAddress), color.arrayLastSlice, color.arrayLastSlice == 0 && ScaleCandidate(surface, 0) ? 1 : 0);
+            }
+            if (state.depth) std::fprintf(stderr, "[render-scale] mixed draw: depth 0x%llx %ux%u samples %u scaled %d candidate %d\n", static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, state.depth->samples, DepthSurfaceHostExtent(context, *state.depth).has_value() ? 1 : 0, ScaleCandidateExtent(state.depth->address, DepthSliceBytes(state.depth->extent, 4u), state.depth->extent, true) ? 1 : 0);
+            else std::fprintf(stderr, "[render-scale] mixed draw: no depth\n");
+        }
+    }
+    // A draw none of whose targets can scale (yet) leaves them alone instead of refusing them for
+    // good: a title that clears its scene targets by draws without depth before the first scene draw
+    // (title A's 2560x1440 G-buffer) reaches them before their size is known as a
+    // render-target family, and a refusal then would keep every later scene draw at the guest size.
+    const bool scalableTarget = RenderScaleEnabled() && !wholeDrawScales && !multisampledDraw && (std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice == 0 && ScaleCandidate(SurfaceForTarget(color), 0); }) || (state.depth && (DepthSurfaceHostExtent(context, *state.depth).has_value() || ScaleCandidateExtent(state.depth->address, DepthSliceBytes(state.depth->extent, 4u), state.depth->extent, true))));
+    const ScaleRequestScope scaleScope(!RenderScaleEnabled() ? ScaleRequest::Keep : wholeDrawScales ? ScaleRequest::Allow : multisampledDraw || scalableTarget ? ScaleRequest::Refuse : ScaleRequest::Keep, multisampledDraw ? "multisampled" : "mixed targets");
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -3736,6 +3807,25 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         targetViews.push_back(DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)));
     }
     const bool depthScaled = RenderScaleEnabled() && state.depth && DepthSurfaceHostExtent(context, *state.depth).has_value();
+    // A draw that scales as a whole may still find one of its targets at the guest size: an image
+    // with results pending on the GPU is not replaced by the lookup. Its results are published and
+    // the lookup repeated, so the target joins the others instead of taking them all back to the
+    // guest size for good (title A's first G-buffer draw after the size becomes known).
+    if (wholeDrawScales) {
+        for (std::size_t index = 0; index < targets.size(); ++index) {
+            auto& binding = targets[index];
+            if (binding.resident == nullptr || binding.resident->Scaled() || binding.color.arrayLastSlice != 0) continue;
+            const auto& color = binding.color;
+            const ColorTargetLayout layout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+            const bool dirty = binding.resident->Dirty();
+            StorageTexture::FlushPending(color.address, layout.Bytes(), nullptr, "render scale promotion");
+            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] { return CachedStorageSurface(context, SurfaceForTarget(color)); });
+            Require(binding.resident != nullptr, "a render target was lost while joining its scaled draw");
+            targetViews[index] = binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice);
+            static std::atomic<unsigned> promotions{0};
+            if (promotions.fetch_add(1, std::memory_order_relaxed) < 24u) std::fprintf(stderr, "[render-scale] target 0x%llx %ux%u was at the guest size in a scaled draw (pending results %d): %s\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, dirty ? 1 : 0, binding.resident->Scaled() ? "scaled now" : "still at the guest size");
+        }
+    }
     if (RenderScaleEnabled() && (depthScaled || std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident != nullptr && binding.resident->Scaled(); })) && ((state.depth && !depthScaled) || std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident == nullptr || !binding.resident->Scaled(); }))) {
         const ScaleRequestScope refuse(ScaleRequest::Refuse, "mixed targets");
         if (depthScaled) targetViews.back() = DemoteDepthSurface(context, *state.depth);
