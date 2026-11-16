@@ -100,6 +100,9 @@
 [submodule "tools/port-installer"]
 	path = tools/port-installer
 	url = https://github.com/batatinhafcbatatinha-pixel/port-installer.git
+[submodule "3rdparty/libwpe"]
+	path = 3rdparty/libwpe
+	url = https://github.com/WebPlatformForEmbedded/libwpe.git
 [submodule "3rdparty/icu"]
 	path = 3rdparty/icu
 	url = https://github.com/unicode-org/icu.git

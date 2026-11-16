@@ -61,6 +61,9 @@ public:
     static void SetWaitedMsProvider(WaitedMsProvider provider);
     explicit ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite = nullptr, PendingWriteObserver observe = nullptr, HookWaitCounter hookWaits = nullptr, PendingWriteQuery pendingSpan = nullptr);
     ~ShaderMemory();
+    static constexpr std::size_t KeepBytes = 256;
+    bool KeepTable(std::uint64_t address);
+    static std::uint64_t TablesKept();
     ShaderMemory(const ShaderMemory&) = delete;
     ShaderMemory& operator=(const ShaderMemory&) = delete;
     // Returns what the capture resolved (plan, snapshot, specialization) for
@@ -92,7 +95,7 @@ public:
         std::uint64_t calls, blocks, refused, words;
     };
     static VouchCounts Vouches();
-    static bool Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp);
+    static bool Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp, bool uncached = false);
     static std::uint64_t descriptorScope(void* context, std::size_t bytes);
 
 private:
@@ -133,6 +136,7 @@ private:
         WordMask raw;
         WordMask read;
         WordMask recent;
+        WordMask kept;
         bool wordwise = false;
         bool lazy = false;
         std::uint64_t backing = 0;
@@ -155,6 +159,7 @@ private:
     bool invalidateRawPages();
     bool pagesCurrent();
     static bool snapshotCurrent(void* context, std::span<const ShaderRecompiler::RegisteredImageView> views);
+    bool invalidateChangedRawPages();
     Page& page(std::uint64_t base);
     void preparePage(Page& page, std::uint64_t base);
     [[nodiscard]] std::size_t pageAtOrAfter(std::uint64_t base) const;
@@ -169,6 +174,7 @@ private:
     // the caller keeps them alive for as long as the capture is used.
     std::vector<std::pair<std::uint64_t, std::span<const std::byte>>> initial;
     std::vector<std::pair<std::uint64_t, Page*>> pages;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> keptRanges;
     std::uint64_t lastBase = ~std::uint64_t{0};
     Page* lastPage = nullptr;
     std::vector<Supplied> supplied;
@@ -217,7 +223,7 @@ struct VouchedRegions {
     std::uint64_t low = 0;
     std::uint64_t high = 0;
 };
-std::size_t VouchSharedRegions(std::span<const SharedWords> shared, std::size_t regions, ShaderMemory::PendingWriteQuery pending, std::vector<VouchedRegions>& vouched);
+std::size_t VouchSharedRegions(std::span<const SharedWords> shared, std::size_t regions, ShaderMemory::PendingWriteQuery pending, std::vector<VouchedRegions>& vouched, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> restampable = {}, bool (*restamp)(const ShaderRecompiler::SrtGuestWords&, ShaderMemory::PendingWriteQuery) = nullptr);
 
 }
 
