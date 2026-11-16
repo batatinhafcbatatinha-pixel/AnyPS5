@@ -100,7 +100,19 @@ void DisplayWindow::create(std::uint32_t sourceWidth, std::uint32_t sourceHeight
     require(usable.w > 0 && usable.h > 0, "usable display extent must be positive");
     const auto boundsWidth = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.w) * DisplayWindowInitialSizePercent / 100);
     const auto boundsHeight = static_cast<std::uint32_t>(static_cast<std::uint64_t>(usable.h) * DisplayWindowInitialSizePercent / 100);
-    const auto initialSize = AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight, boundsWidth, boundsHeight, true);
+    auto initialSize = AgcDriver::ComputeContainSize_nid_postfix(sourceWidth, sourceHeight, boundsWidth, boundsHeight, true);
+    // ANYPS5_WINDOW_SIZE=<width>x<height>: the initial client size of the window (the size of the
+    // presented image), kept inside the usable display. Anything else leaves the default.
+    if (const char* text = std::getenv("ANYPS5_WINDOW_SIZE"); text != nullptr && *text != 0) {
+        unsigned width = 0;
+        unsigned height = 0;
+        if (std::sscanf(text, "%ux%u", &width, &height) == 2 && width >= DisplayWindowMinimumWidth && height >= DisplayWindowMinimumHeight && width <= static_cast<unsigned>(usable.w) && height <= static_cast<unsigned>(usable.h)) {
+            initialSize.width = width;
+            initialSize.height = height;
+        } else {
+            std::fprintf(stderr, "[videoout] ANYPS5_WINDOW_SIZE=%s is not a <width>x<height> that fits the display; using the default window size\n", text);
+        }
+    }
     require(initialSize.width >= DisplayWindowMinimumWidth && initialSize.height >= DisplayWindowMinimumHeight, "initial window extent is smaller than the minimum");
     const char* fullscreenSetting = std::getenv("ANYPS5_FULLSCREEN");
     bool unrecognizedFullscreen = false;

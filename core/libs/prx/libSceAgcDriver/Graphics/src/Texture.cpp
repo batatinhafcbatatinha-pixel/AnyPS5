@@ -1881,7 +1881,7 @@ bool ScaleGranted(std::uint64_t address, bool depth) {
     static const bool noDepth = EnvSet("ANYPS5_RENDER_SCALE_NO_DEPTH");
     static const bool noColor = EnvSet("ANYPS5_RENDER_SCALE_NO_COLOR");
     static const std::optional<std::uint64_t> only = []() -> std::optional<std::uint64_t> {
-        const char* text = std::getenv("ANYPS5_RENDER_SCALE_O\nY");
+        const char* text = std::getenv("ANYPS5_RENDER_SCALE_ONLY");
         if (text == nullptr || *text == 0) return std::nullopt;
         return std::strtoull(text, nullptr, 16);
     }();
@@ -2113,7 +2113,13 @@ void StorageTexture::SyncHost() {
 void StorageTexture::syncTwin() {
     if (hostImage == VK_NULL_HANDLE || !twinStale || !hostLaid) return;
     resample(false);
-    if (flushReason != nullptr && (std::strcmp(flushReason, "imported buffer region") == 0 || std::strcmp(flushReason, "copied buffer region") == 0) && ++bufferStores == 4) RefuseScale(descriptor.baseAddress, "buffer view");
+    // A surface whose memory shaders also read as a buffer is resampled to its guest-size twin for
+    // every such read; after four of them it is normally taken out of scaling. That costs a whole
+    // scene its scale when the surface shares a depth target with it (Grand Theft Auto V: one
+    // 2560x1440 target read as a buffer once a frame is drawn with the G-buffer's depth), so
+    // ANYPS5_RENDER_SCALE_KEEP_BUFFER_VIEWS=1 keeps such a surface scaled and pays the resample.
+    static const bool keepBufferViews = [] { const char* text = std::getenv("ANYPS5_RENDER_SCALE_KEEP_BUFFER_VIEWS"); return text != nullptr && *text != 0 && *text != '0'; }();
+    if (!keepBufferViews && flushReason != nullptr && (std::strcmp(flushReason, "imported buffer region") == 0 || std::strcmp(flushReason, "copied buffer region") == 0) && ++bufferStores == 4) RefuseScale(descriptor.baseAddress, "buffer view");
 }
 
 StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, VkExtent2D requestedHost) : context(context), detiler(detiler), descriptor(descriptor) {

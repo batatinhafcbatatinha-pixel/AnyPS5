@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -23,6 +24,7 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MainQueueUse.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
@@ -46,6 +48,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <mutex>
 #include <new>
 #include <string>
@@ -1122,12 +1125,18 @@ bool TakeEarlySubmitRequest() {
 
 namespace {
 
+std::array<std::atomic<std::uint64_t>, 16> skippedHookSyncs{};
+
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     static const bool segmented = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<std::chrono::steady_clock::time_point, 5> marks{};
     bool lockedHere = false;
     if (segmented) marks[0] = std::chrono::steady_clock::now();
+    // EXPERIMENT (Eva8, ceiling only): see RuntimeSwitch::SkipHookSync.
+    const auto skipSite = GuestMemory::CurrentReadSite();
+    static const unsigned skipSites = [] { const char* text = std::getenv("APS5_SKIP_HOOK_SYNC_SITES"); return text != nullptr ? static_cast<unsigned>(std::strtoul(text, nullptr, 0)) : 7u; }();
+    const bool skipSync = ((skipSite == GuestMemory::ReadSite::Capture && (skipSites & 1u) != 0u) || (skipSite == GuestMemory::ReadSite::IndexBuffer && (skipSites & 2u) != 0u) || (skipSite == GuestMemory::ReadSite::VertexBuffer && (skipSites & 4u) != 0u)) && completionDepth() == 0 && RuntimeSwitches::Set(RuntimeSwitch::SkipHookSync);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
     // write of the open batch, and the check below syncs on it like any recorded store). Not from
@@ -1155,7 +1164,9 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             Recorder::CountSync(1);
             // The wait runs without the mutex when this acquisition is the outermost one (a stage-A
             // read, a game thread); the recorder is not dereferenced after the call.
-            recorder->SyncThrough(address, bytes, true);
+            if (skipSync) skippedHookSyncs[static_cast<std::size_t>(skipSite) & 15u].fetch_add(1, std::memory_order_relaxed);
+            else if (Recorder::TraceWaitProducers() && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Capture) recorder->TracedSyncThrough(address, bytes, ShaderMemory::TraceProgram());
+            else recorder->SyncThrough(address, bytes, true);
         }
     }
     if (segmented) marks[1] = std::chrono::steady_clock::now();
@@ -1194,7 +1205,9 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr) {
             const RecordedStoreSyncScope attribution(*recorder, address, bytes, classification, stored, HookSyncProfiled() ? RecordedStoreKey() : HookSyncKey{});
             Recorder::CountSync(2);
-            if (HookFullSync() || completionDepth() != 0) recorder->Sync();
+            if (skipSync) skippedHookSyncs[static_cast<std::size_t>(skipSite) & 15u].fetch_add(1, std::memory_order_relaxed);
+            else if (HookFullSync() || completionDepth() != 0) recorder->Sync();
+            else if (Recorder::TraceWaitProducers() && site == GuestMemory::ReadSite::Capture) recorder->TracedSyncThrough(address, bytes, ShaderMemory::TraceProgram(), 2);
             else recorder->SyncThrough(address, bytes, true);
         }
     }
@@ -1208,8 +1221,85 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 }
 
 static bool CheckpointMarkersEnabled() {
-    static const bool enabled = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr;
+    static const bool enabled = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr && std::getenv("APS5_GPU_CHECKPOINTS_NO_MARKERS") == nullptr;
     return enabled;
+}
+
+// Per-submit address-space snapshot; APS5_GPU_CHECKPOINTS_NO_SNAPSHOT skips it, APS5_SUBMIT_SNAPSHOT=1 takes it
+// without the extension and the markers (device-loss split, Eva6).
+// APS5_SUBMIT_SNAPSHOT=lock / =touch split its effects (boss): 'lock' only loads and drops the published
+// address space (the AtomicSharedPtr lock, no copy); 'touch' only allocates and fills a vector of the same size into
+// a 64-slot ring (no lock, no address-space read). Any other value (1) takes the full snapshot.
+enum class SubmitSnapshotMode { Full, Lock, Touch };
+
+static SubmitSnapshotMode SubmitSnapshotModeSetting() {
+    static const SubmitSnapshotMode mode = [] {
+        const char* text = std::getenv("APS5_SUBMIT_SNAPSHOT");
+        if (text == nullptr) return SubmitSnapshotMode::Full;
+        if (std::strcmp(text, "lock") == 0) return SubmitSnapshotMode::Lock;
+        if (std::strcmp(text, "touch") == 0) return SubmitSnapshotMode::Touch;
+        return SubmitSnapshotMode::Full;
+    }();
+    return mode;
+}
+
+static bool CheckpointSnapshotsEnabled() {
+    static const bool enabled = (CheckpointMarkersEnabled() || std::getenv("APS5_SUBMIT_SNAPSHOT") != nullptr) && std::getenv("APS5_GPU_CHECKPOINTS_NO_SNAPSHOT") == nullptr;
+    return enabled;
+}
+
+static std::size_t SubmitSnapshotStandIn(SubmitSnapshotMode mode) {
+    if (mode == SubmitSnapshotMode::Lock) {
+        GuestBufferMemory::TouchAddressSpace();
+        return 0;
+    }
+    constexpr std::size_t Ranges = 1760;
+    constexpr std::size_t Slots = 64;
+    static std::mutex ringMutex;
+    static std::array<std::shared_ptr<std::vector<std::byte>>, Slots> ring;
+    static std::size_t next = 0;
+    auto block = std::make_shared<std::vector<std::byte>>(Ranges * sizeof(ShaderRecompiler::BdaAbi::Range));
+    std::memset(block->data(), 0x5a, block->size());
+    std::lock_guard lock(ringMutex);
+    ring[next++ % Slots] = std::move(block);
+    return Ranges;
+}
+
+// APS5_SUBMIT_DELAY_US=N: busy-waits N us at every main-queue submit, where the snapshot would run (timing stand-in).
+static std::uint64_t SubmitDelayMicroseconds() {
+    static const std::uint64_t delay = [] {
+        const char* text = std::getenv("APS5_SUBMIT_DELAY_US");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    return delay;
+}
+
+struct SubmitSnapshotTiming {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> nanos{0};
+    std::atomic<std::uint64_t> ranges{0};
+    std::atomic<std::int64_t> printed{0};
+};
+
+static SubmitSnapshotTiming& SubmitSnapshotTimes() {
+    static SubmitSnapshotTiming timing;
+    return timing;
+}
+
+static void NoteSubmitSnapshotTime(std::chrono::steady_clock::time_point began, std::size_t ranges) {
+    auto& timing = SubmitSnapshotTimes();
+    const auto now = std::chrono::steady_clock::now();
+    timing.count.fetch_add(1, std::memory_order_relaxed);
+    timing.nanos.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - began).count()), std::memory_order_relaxed);
+    timing.ranges.fetch_add(ranges, std::memory_order_relaxed);
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    auto last = timing.printed.load(std::memory_order_relaxed);
+    if (seconds - last >= 10 && timing.printed.compare_exchange_strong(last, seconds, std::memory_order_relaxed)) {
+        const auto count = timing.count.exchange(0, std::memory_order_relaxed);
+        const auto nanos = timing.nanos.exchange(0, std::memory_order_relaxed);
+        const auto rangeSum = timing.ranges.exchange(0, std::memory_order_relaxed);
+        if (count != 0) std::fprintf(stderr, "[submit-snapshot] (10 s) %llu main-queue submits, %.1f us each, %.0f ranges each\n", static_cast<unsigned long long>(count), static_cast<double>(nanos) / 1e3 / static_cast<double>(count), static_cast<double>(rangeSum) / static_cast<double>(count));
+    }
 }
 
 struct CheckpointMarkerDevice {
@@ -3866,6 +3956,194 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
+namespace {
+std::uint64_t& traceProducer() {
+    thread_local std::uint64_t producer = 0;
+    return producer;
+}
+}
+
+bool Recorder::TraceWaitProducers() {
+    static const bool enabled = std::getenv("APS5_TRACE_WAIT_PRODUCERS") != nullptr;
+    return enabled;
+}
+
+void Recorder::SetTraceProducer(std::uint64_t producer) {
+    static const bool traced = TraceWaitProducers() || TracedProducerProgram() != 0;
+    if (traced) traceProducer() = producer;
+}
+
+std::uint64_t Recorder::TraceProducer() {
+    return traceProducer();
+}
+
+std::uint64_t Recorder::TracedProducerProgram() {
+    static const std::uint64_t program = [] {
+        const char* text = std::getenv("APS5_TRACE_PRODUCER");
+        return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+    }();
+    return program;
+}
+
+void Recorder::NoteProducerSequence(char event) {
+    if (TracedProducerProgram() == 0) return;
+    static std::mutex mutex;
+    static std::string frame;
+    static std::uint64_t framePresent = 0;
+    static auto reported = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    const auto present = Presents();
+    if (present != framePresent) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - reported >= std::chrono::seconds(10) && !frame.empty()) {
+            reported = now;
+            std::fprintf(stderr, "[producer-order] present %llu: %s\n", static_cast<unsigned long long>(framePresent), frame.c_str());
+        }
+        frame.clear();
+        framePresent = present;
+    }
+    if (frame.size() < 4000) frame.push_back(event);
+}
+
+void Recorder::TracedSyncThrough(std::uint64_t address, std::size_t bytes, std::uint64_t consumer, int branch) {
+    const auto end = address + bytes;
+    // Where the last recorded writer of the bytes is (a note tagged by a recording thread; the flush
+    // hook's own readback stores are untagged): 0 open batch, 1 submitted and unfinished, 2 done.
+    int writer = 2;
+    const auto taggedOverlap = [&](const Batch& batch) {
+        return std::any_of(batch.producers.begin(), batch.producers.end(), [&](const auto& note) { return note[2] != 0 && address < note[1] && note[0] < end; });
+    };
+    if (open != nullptr && taggedOverlap(*open)) writer = 0;
+    else {
+        for (const auto& batch : inFlight) {
+            if (taggedOverlap(*batch) && fenceStatus(batch->fence) != VK_SUCCESS) {
+                writer = 1;
+                break;
+            }
+        }
+    }
+    const auto openNotes = open != nullptr ? open->writes.size() : 0u;
+    std::array<std::uint64_t, 2> tracedNote{};
+    const auto producerIn = [&](const Batch& batch) -> std::optional<std::uint64_t> {
+        for (auto it = batch.producers.rbegin(); it != batch.producers.rend(); ++it) {
+            if (address < (*it)[1] && (*it)[0] < end) {
+                tracedNote = {(*it)[0], (*it)[1]};
+                return (*it)[2];
+            }
+        }
+        return std::nullopt;
+    };
+    // The target: the open batch, else the newest in-flight batch writing the range.
+    std::optional<std::uint64_t> producer;
+    std::size_t target = inFlight.size();
+    if (open != nullptr) producer = producerIn(*open);
+    if (!producer) {
+        for (std::size_t index = inFlight.size(); index-- > 0;) {
+            if (auto found = producerIn(*inFlight[index])) {
+                producer = found;
+                target = index;
+                break;
+            }
+        }
+    }
+    // Batches ahead of the target still running, waited for first (queue order makes the target
+    // wait for them anyway): their time is the 'ahead' part, the rest the target's own.
+    std::vector<VkFence> ahead;
+    for (std::size_t index = 0; index < target && index < inFlight.size(); ++index) {
+        if (fenceStatus(inFlight[index]->fence) != VK_SUCCESS) ahead.push_back(inFlight[index]->fence);
+    }
+    std::vector<std::byte> tracedBefore;
+    if (bytes <= 4096 && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) tracedBefore.assign(reinterpret_cast<const std::byte*>(address), reinterpret_cast<const std::byte*>(address) + bytes);
+    const auto start = std::chrono::steady_clock::now();
+    if (!ahead.empty()) static_cast<void>(function(waitForFences, "vkWaitForFences")(context.device, static_cast<std::uint32_t>(ahead.size()), ahead.data(), VK_TRUE, 10'000'000'000ull));
+    const auto middle = std::chrono::steady_clock::now();
+    const bool targetOpen = target == inFlight.size() && open != nullptr;
+    if (targetOpen) Submit();
+    const auto submitted = std::chrono::steady_clock::now();
+    SyncThrough(address, bytes, true);
+    const auto finish = std::chrono::steady_clock::now();
+    {
+        // EXPERIMENT (Eva8): which bytes a capture waits for and the write note they fall in.
+        static std::atomic<std::uint64_t> traced{0};
+        std::size_t changed = 0, firstChanged = 0, lastChanged = 0;
+        if (!tracedBefore.empty() && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) {
+            const auto* after = reinterpret_cast<const std::byte*>(address);
+            for (std::size_t i = 0; i < bytes; ++i) {
+                if (after[i] == tracedBefore[i]) continue;
+                if (changed++ == 0) firstChanged = i;
+                lastChanged = i;
+            }
+        }
+        if (bytes == 32 && !tracedBefore.empty() && traced.load(std::memory_order_relaxed) % 7 == 0) {
+            std::array<std::uint32_t, 8> b{}, c{};
+            std::memcpy(b.data(), tracedBefore.data(), 32);
+            std::memcpy(c.data(), reinterpret_cast<const void*>(address), 32);
+            std::fprintf(stderr, "[wait-words] present %llu 0x%llx before %08x %08x %08x %08x %08x %08x %08x %08x after %08x %08x %08x %08x %08x %08x %08x %08x\n", static_cast<unsigned long long>(Presents()), static_cast<unsigned long long>(address), b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+        }
+        if (const auto n = traced.fetch_add(1, std::memory_order_relaxed); n % 23 == 0 && n < 23 * 600) std::fprintf(stderr, "[wait-address] consumer 0x%llx producer 0x%llx access 0x%llx+%zu note 0x%llx-0x%llx branch %d %.1f ms changed %zu bytes (offsets %zu..%zu)\n", static_cast<unsigned long long>(consumer), static_cast<unsigned long long>(producer.value_or(0)), static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(tracedNote[0]), static_cast<unsigned long long>(tracedNote[1]), branch, std::chrono::duration<double, std::milli>(finish - start).count(), changed, firstChanged, lastChanged);
+    }
+    NoteProducerSequence('w');
+    static std::atomic<std::uint64_t> submitNanoseconds{0}, waitNanoseconds{0}, openWaits{0};
+    {
+        // [wait-writers]: waits by branch (1 recorded write, 2 hook store/publish) and writer state.
+        static std::mutex classMutex;
+        static std::array<std::array<std::uint64_t, 3>, 3> counts{};
+        static std::array<std::array<double, 3>, 3> waitedMs{};
+        static std::uint64_t openNotesSum = 0, openNotesWaits = 0;
+        static auto classReported = finish;
+        std::lock_guard classLock(classMutex);
+        const auto row = static_cast<std::size_t>(std::clamp(branch, 1, 2));
+        ++counts[row][static_cast<std::size_t>(writer)];
+        waitedMs[row][static_cast<std::size_t>(writer)] += std::chrono::duration<double, std::milli>(finish - start).count();
+        if (targetOpen) {
+            openNotesSum += openNotes;
+            ++openNotesWaits;
+        }
+        if (finish - classReported >= std::chrono::seconds(10)) {
+            classReported = finish;
+            for (std::size_t r = 1; r <= 2; ++r) {
+                std::fprintf(stderr, "[wait-writers] (10 s) branch %zu: writer in open batch %llu/%.1f ms, writer in flight %llu/%.1f ms, writer done %llu/%.1f ms\n", r, static_cast<unsigned long long>(counts[r][0]), waitedMs[r][0], static_cast<unsigned long long>(counts[r][1]), waitedMs[r][1], static_cast<unsigned long long>(counts[r][2]), waitedMs[r][2]);
+            }
+            std::fprintf(stderr, "[wait-writers] (10 s) open target waits %llu, open batch write notes %.1f on average\n", static_cast<unsigned long long>(openNotesWaits), openNotesWaits != 0 ? static_cast<double>(openNotesSum) / static_cast<double>(openNotesWaits) : 0.0);
+            counts = {};
+            waitedMs = {};
+            openNotesSum = openNotesWaits = 0;
+        }
+    }
+    if (targetOpen) {
+        openWaits.fetch_add(1, std::memory_order_relaxed);
+        submitNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(submitted - middle).count()), std::memory_order_relaxed);
+        waitNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finish - submitted).count()), std::memory_order_relaxed);
+    }
+    struct Totals {
+        std::uint64_t count = 0, batchesAhead = 0, open = 0;
+        double aheadMs = 0, ownMs = 0;
+    };
+    static std::mutex mutex;
+    static std::map<std::pair<std::uint64_t, std::uint64_t>, Totals> pairs;
+    static auto reported = finish;
+    std::lock_guard lock(mutex);
+    auto& totals = pairs[{consumer, producer.value_or(~std::uint64_t{0})}];
+    ++totals.count;
+    totals.batchesAhead += ahead.size();
+    totals.open += target == inFlight.size() && open != nullptr ? 1u : 0u;
+    totals.aheadMs += std::chrono::duration<double, std::milli>(middle - start).count();
+    totals.ownMs += std::chrono::duration<double, std::milli>(finish - middle).count();
+    if (finish - reported < std::chrono::seconds(10)) return;
+    reported = finish;
+    {
+        const auto waits = openWaits.exchange(0);
+        std::fprintf(stderr, "[wait-producers] (10 s) %llu waits on an open target: submit %.1f ms, then waiting %.1f ms\n", static_cast<unsigned long long>(waits), static_cast<double>(submitNanoseconds.exchange(0)) / 1e6, static_cast<double>(waitNanoseconds.exchange(0)) / 1e6);
+    }
+    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, Totals>> sorted(pairs.begin(), pairs.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second.aheadMs + left.second.ownMs > right.second.aheadMs + right.second.ownMs; });
+    for (std::size_t index = 0; index < sorted.size() && index < 12; ++index) {
+        const auto& [key, value] = sorted[index];
+        std::fprintf(stderr, "[wait-producers] (10 s) consumer 0x%llx producer 0x%llx: %llu waits, %.1f ms ahead (%.1f batches ahead each), %.1f ms own, %llu with the target still open\n", static_cast<unsigned long long>(key.first), static_cast<unsigned long long>(key.second), static_cast<unsigned long long>(value.count), value.aheadMs, value.count != 0 ? static_cast<double>(value.batchesAhead) / static_cast<double>(value.count) : 0.0, value.ownMs, static_cast<unsigned long long>(value.open));
+    }
+    pairs.clear();
+}
+
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
@@ -3877,6 +4155,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     open->writeWords.push_back(word);
+    if (TraceWaitProducers()) open->producers.push_back({address, end, traceProducer()});
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
@@ -3907,6 +4186,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
     batch.writeWords.push_back(-1);
+    if (TraceWaitProducers()) batch.producers.push_back({address, address + bytes, traceProducer()});
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
     if (!SnapshotCovers(address, address + bytes)) {
@@ -4122,12 +4402,33 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     return newestNote(address, bytes, true);
 }
 
+bool Recorder::WriteNotedSince(std::uint64_t address, std::size_t bytes, std::uint64_t note) const {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    const auto scan = [&](const Batch& batch) {
+        if (batch.writeNotes.size() != batch.writes.size()) return !batch.writes.empty();
+        for (std::size_t i = batch.writes.size(); i-- != 0;) {
+            if (batch.writeNotes[i] <= note) break;
+            if (address < batch.writes[i].second && batch.writes[i].first < end) return true;
+        }
+        return false;
+    };
+    if (open != nullptr && scan(*open)) return true;
+    for (const auto& batch : inFlight) {
+        if (scan(*batch)) return true;
+    }
+    return false;
+}
+
 std::uint64_t Recorder::NewestStoreNote(std::uint64_t address, std::size_t bytes) const {
     return newestNote(address, bytes, false);
 }
 
 std::uint64_t Recorder::newestNote(std::uint64_t address, std::size_t bytes, bool reach) const {
     if (bytes == 0) return 0;
+    // As in PendingWriteOverlaps: the published snapshot answers "nothing pending over the range"
+    // without walking every write of the open and in-flight batches.
+    if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return 0;
     const auto end = address + bytes;
     std::uint64_t newest = 0;
     const auto scan = [&](const Batch& batch) {
@@ -4143,6 +4444,7 @@ std::uint64_t Recorder::newestNote(std::uint64_t address, std::size_t bytes, boo
 std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t address, std::size_t bytes) const {
     std::vector<PendingWrite> found;
     if (bytes == 0) return found;
+    if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return found;
     const auto end = address + bytes;
     const auto scan = [&](const Batch& batch) {
         for (std::size_t i = 0; i < batch.writes.size(); ++i) {
@@ -4613,12 +4915,23 @@ void Recorder::Submit() {
     submission.pCommandBuffers = &batch->commands;
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
-    if (CheckpointMarkersEnabled() && batch->queue == 0 && batch->predictedSerial != 0) {
+    if (CheckpointSnapshotsEnabled() && batch->queue == 0 && batch->predictedSerial != 0) {
         Require(batch->predictedSerial == serial, "Recorder::Submit submit serial mismatch");
+        const auto began = std::chrono::steady_clock::now();
+        std::size_t rangeCount = 0;
         try {
-            if (const auto snapshot = GuestBufferMemory::TrySnapshotAddressSpace(); snapshot.has_value()) AgcDriver::SubmissionSnapshots::DeviceSnapshots().NoteSubmit(serial, snapshot->first, snapshot->second, AgcDriver::SubmitBracket{serial, CompletedThrough(), batch->firstToken, batch->lastToken});
+            if (const auto mode = SubmitSnapshotModeSetting(); mode != SubmitSnapshotMode::Full) {
+                rangeCount = SubmitSnapshotStandIn(mode);
+            } else if (const auto snapshot = GuestBufferMemory::TrySnapshotAddressSpace(); snapshot.has_value()) {
+                rangeCount = snapshot->second->size();
+                AgcDriver::SubmissionSnapshots::DeviceSnapshots().NoteSubmit(serial, snapshot->first, snapshot->second, AgcDriver::SubmitBracket{serial, CompletedThrough(), batch->firstToken, batch->lastToken});
+            }
         } catch (...) {
         }
+        NoteSubmitSnapshotTime(began, rangeCount);
+    } else if (const auto delay = SubmitDelayMicroseconds(); delay != 0 && batch->queue == 0) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(delay);
+        while (std::chrono::steady_clock::now() < until) std::this_thread::yield();
     }
     std::string tokensStr = "[";
     for (std::size_t i = 0; i < batch->drawTraceTokens.size(); ++i) {
@@ -4648,7 +4961,11 @@ void Recorder::Submit() {
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
     batch->submitStarted.store(true, std::memory_order_release);
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    VkResult result;
+    {
+        MainQueueUse mainQueueUse("Recorder::Submit");
+        result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    }
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
@@ -4720,6 +5037,18 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
     wait.pValues = &serial;
+    // APS5_SPIN_FENCE_US=N (experiment): poll (zero timeout) for up to N microseconds before the
+    // blocking wait, as for the fence in finish().
+    static const long spinMicroseconds = [] {
+        const char* text = std::getenv("APS5_SPIN_FENCE_US");
+        return text != nullptr ? std::strtol(text, nullptr, 10) : 0L;
+    }();
+    if (spinMicroseconds > 0) {
+        const auto spinUntil = std::chrono::steady_clock::now() + std::chrono::microseconds(spinMicroseconds);
+        while (std::chrono::steady_clock::now() < spinUntil) {
+            if (waitSemaphores(device, &wait, 0) == VK_SUCCESS) return VK_SUCCESS;
+        }
+    }
     auto result = waitSemaphores(device, &wait, 5'000'000'000ull);
     for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
@@ -5137,6 +5466,18 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
+        // APS5_SPIN_FENCE_US=N (experiment): poll the fence for up to N microseconds before the
+        // blocking wait (a blocked thread's wake-up after a short GPU job costs a large part of the
+        // ~0.33 ms per capture wait measured in eva_prod1).
+        static const long spinMicroseconds = [] {
+            const char* text = std::getenv("APS5_SPIN_FENCE_US");
+            return text != nullptr ? std::strtol(text, nullptr, 10) : 0L;
+        }();
+        if (spinMicroseconds > 0) {
+            const auto spinUntil = std::chrono::steady_clock::now() + std::chrono::microseconds(spinMicroseconds);
+            while (fenceStatus(batch->fence) == VK_NOT_READY && std::chrono::steady_clock::now() < spinUntil) {
+            }
+        }
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
