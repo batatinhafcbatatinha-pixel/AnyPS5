@@ -8,6 +8,34 @@ reimplemented). This fork adds the launcher the other recompilers use, so a game
 **your own decrypted dump** with a few clicks. No game content (dump, executable, data or converted code) is in this
 repository.
 
+## title A: 40.7 fps at 720p with the new GPU engine
+
+> *title A runs at 40.7 fps** in the test scene at 1280x720 with the new GPU
+> engine, against **8.1 fps** with the old one, on the same PC: **RTX 3050 laptop GPU (8 GB) + Ryzen 5 3600**.
+> Right picture, 300+ s runs without a crash.
+
+| GPU engine | Test scene of the prologue, 720p | Picture |
+| --- | --- | --- |
+| **New (default)**: VRAM-resident, based on KytyPS5's renderer | **40.7 fps** | right |
+| Old (host-imported guest memory) | 8.1 fps | broken |
+
+The new engine keeps the game's data in video memory: the guest pages the GPU uses are write-protected, only the
+pages the CPU changed are uploaded, GPU writes are read back only when the CPU touches them, and each shader is
+compiled once. The game's own code still runs natively (relinked, no emulation); only the GPU driver
+(`libSceAgcDriver`) changed. Its renderer, command processor and shader recompiler come from
+[KytyPS5](https://github.com/batatinhafcbatatinha-pixel/KytyPS5) (GPL-2.0, credits and the list of files in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). It is the default; `APS5_GPU_BACKEND=legacy` selects the old
+engine, which is obsolete and currently broken (it stops at boot in title A).
+
+**720p in title A:**
+
+1. In the game, choose **Performance** in the graphics settings (the patch replaces the sizes of that mode).
+2. Put [`render-720p-output-720p.json`](https://github.com/batatinhafcbatatinha-pixel/recomp-patches/tree/main/ps5/TITLE_ID)
+   from recomp-patches into the port's `patches` folder: `.local/ports/TITLE_ID/patches/`.
+3. **PLAY**. The patch holds addresses and values only (no game code). Its writes are "held": the game computes those
+   sizes after start, and AnyPS5 writes the patch's values again whenever the game writes its own (the log says
+   `[patch] held value at ... replaced`). Remove the file to go back.
+
 ## How to play a game
 
 Windows 10/11 x64 with a Vulkan GPU and a CPU with AVX2. About 1 GB free per game and a few minutes for the first
@@ -37,6 +65,7 @@ Every PS5 game takes the same generic path; there are no per-game profiles. Test
 | --- | --- | --- |
 | title C | TITLE_ID | title menu at 60 fps; PC settings checked in game |
 | title B | TITLE_ID | reaches gameplay at about 2 fps |
+| title A | TITLE_ID | prologue gameplay, 40.7 fps at 720p (new GPU engine, see above) |
 
 ## Differences from upstream
 
