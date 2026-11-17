@@ -32,6 +32,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -228,6 +229,22 @@ bool Core::HandleFault(void* exception_pointers) noexcept {
 	                                : Libs::Graphics::PageFaultAccess::Read;
 	if (renderer->HandleFault(access, address)) {
 		return true;
+	}
+	{
+		// A reduced page the renderer does not consider mapped: give the guest its protection
+		// back rather than crash, and report it.
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			Log::WriteToConsoleAndLog(fmt::format("[fault] tracker page 0x{:x} ({}) refused by the renderer (mapped {}); protection restored\n",
+			                                      address, kind == 1 ? "write" : "read", renderer->IsMapped(address, 1) ? 1 : 0));
+		}
+		std::lock_guard lock(ProtectionMutex());
+		const auto page = address & ~(PageBytes - 1);
+		if (const auto found = Originals().find(page); found != Originals().end()) {
+			(void)Protect(page, PageBytes, found->second);
+			Originals().erase(found);
+			return true;
+		}
 	}
 	if (const auto length = IR::SrtWalkerLoadLength(context->Rip); length != 0) {
 		skip_load(length, 0);

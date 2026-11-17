@@ -376,11 +376,15 @@ def apply_patches(port):
         shutil.copy2(original, str(original)[:-5])
         original.unlink()
     folder = port / 'patches'
+    held = []
     for file in sorted(folder.glob('*.json')) if folder.is_dir() else []:
         try:
             patch = json.loads(file.read_text(encoding='utf-8'))
             plan = []
             for write in patch['writes']:
+                if 'offset' in write:  # a value in the loaded main module: held at run time (APS5_HOLD_WRITES)
+                    held.append(memory_write(port, write))
+                    continue
                 find, new = patch_bytes(write, 'find'), patch_bytes(write, 'write')
                 name = write['module'].lower() + '.guest.prx'
                 modules = [p for p in app0.rglob('*.guest.prx') if p.name.lower() == name and not is_link(p)]
@@ -400,6 +404,36 @@ def apply_patches(port):
             log(f'Patch applied: {patch.get("name", file.stem)}')
         except (ValueError, KeyError, OSError) as error:
             log(f'Patch NOT applied ({file.name}): {error}')
+    return ','.join(held)
+
+
+# GoldHEN/KytyPS5 memory offsets count from the main module's load address, at which the first
+# loadable segment (ELF vaddr 0) lies 0x10010000 above (PS5 cheat convention, checked on TITLE_ID
+# with a pattern anchor). The relinker places ELF vaddr v at app.exe's section .elf0 + v.
+GOLDHEN_MAIN_BASE = 0x10010000
+
+
+def image_section_rva(exe, name):
+    data = exe.read_bytes()
+    pe = struct.unpack_from('<I', data, 0x3c)[0]
+    count, optional = struct.unpack_from('<H', data, pe + 6)[0], struct.unpack_from('<H', data, pe + 20)[0]
+    table = pe + 24 + optional
+    for index in range(count):
+        section, _, rva = struct.unpack_from('<8sII', data, table + 40 * index)
+        if section.rstrip(bytes(1)).decode(errors='replace') == name:
+            return rva
+    raise ValueError(f'{exe.name} has no section {name}')
+
+
+def memory_write(port, write):
+    """'<rva>:<off>:<on>' of an "offset" write (always held: the value is replaced whenever found)."""
+    if write['module'].lower() not in ('eboot.bin', 'eboot.bin.guest.prx'):
+        raise ValueError(f'{write["module"]}: memory writes are supported in eboot.bin only')
+    off, on = patch_bytes(write, 'find'), patch_bytes(write, 'write')
+    if len(off) != len(on):
+        raise ValueError('find and write sizes differ')
+    rva = image_section_rva(port / 'build' / 'out' / 'app.exe', '.elf0') + int(write['offset'], 16) - GOLDHEN_MAIN_BASE
+    return f'{rva:x}:{off.hex()}:{on.hex()}'
 
 
 def play(port):
@@ -407,10 +441,12 @@ def play(port):
     exe = out / 'app.exe'
     if not exe.is_file():
         raise SystemExit('Not built yet: install the game in the launcher first.')
-    apply_patches(port)
+    held = apply_patches(port)
     game = (port / 'game_files').resolve() if (port / 'game_files').exists() else None
     env = dict(os.environ)
     env.update(settings_env(port, game))
+    if held:
+        env['APS5_HOLD_WRITES'] = held
     log_file = out / 'game-log.txt'
     with open(log_file, 'w', encoding='utf-8', errors='replace') as f:
         code = subprocess.run([str(exe)], cwd=out, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
