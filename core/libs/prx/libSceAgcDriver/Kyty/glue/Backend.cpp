@@ -229,6 +229,8 @@ bool ReserveFlip(std::uint32_t handle, std::int32_t index, std::uint32_t mode, s
 		}
 		output = found->second;
 	}
+	// Back-pressure: the GPU thread stays at most a flip queue ahead of the presenter.
+	output->WaitForFlipRoom();
 	auto reserved = output->Reserve(FlipInfo {handle, index, mode, argument});
 	if (reserved == nullptr) {
 		Fail("video output returned a null flip reservation");

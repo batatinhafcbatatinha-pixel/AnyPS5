@@ -27,6 +27,7 @@
 #include "loader/systemContent.h"
 
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 
 #include <windows.h>
 
@@ -481,12 +482,13 @@ bool SystemContentParamSfoGetString(const char* name, std::string* value) {
 	if (std::strcmp(name, "TITLE_ID") != 0) {
 		return false;
 	}
-	const char* title = std::getenv("APS5_TITLE_ID");
-	if (title == nullptr || *title == '\0') {
-		return false;
+	if (const char* title = std::getenv("APS5_TITLE_ID"); title != nullptr && *title != '\0') {
+		*value = title;
+		return true;
 	}
-	*value = title;
-	return true;
+	const auto title = GetAppTitleId_nid_postfix();
+	*value           = std::string(title.value, strnlen(title.value, sizeof(title.value)));
+	return !value->empty();
 }
 
 } // namespace Libs::Loader
