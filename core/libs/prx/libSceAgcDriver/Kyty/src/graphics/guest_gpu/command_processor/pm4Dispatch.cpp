@@ -21,6 +21,9 @@ constexpr auto MakeShaderDispatchTable() {
 			table[base + slot] = HwShIgnoreUserAccumulator;
 		}
 	}
+	// AnyPS5: COMPUTE_STATIC_THREAD_MGMT_SE0/SE1 (compute memset) only restrict CU placement.
+	table[0x216] = HwShIgnoreUserAccumulator;
+	table[0x217] = HwShIgnoreUserAccumulator;
 	table[Pm4::COMPUTE_PGM_LO]          = HwShSetCsRegisters;
 	table[Pm4::COMPUTE_PGM_HI]          = HwShSetCsRegisters;
 	table[Pm4::COMPUTE_PGM_RSRC1]       = HwShSetCsRegisters;
@@ -81,6 +84,9 @@ constexpr auto MakeOpcodeDispatchTable() {
 	table[Pm4::IT_SET_UCONFIG_REG_INDIRECT]  = CpOpIndirectUcRegs;
 	table[Pm4::IT_GET_LOD_STATS]             = CpOpGetLodStats;
 	table[Pm4::IT_WAIT_REG_MEM_64]           = CpOpWaitRegMem64;
+	// AnyPS5 libSceAgc packets KytyPS5's library does not write.
+	table[0x45] = CpOpCondWrite;  // COND_WRITE
+	table[0x91] = CpOpSkipPacket; // SET_INDEX_INDIRECT_ARGS
 
 	return table;
 }
