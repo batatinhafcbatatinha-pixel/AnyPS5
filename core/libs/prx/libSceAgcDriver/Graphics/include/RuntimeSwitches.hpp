@@ -25,6 +25,7 @@ enum class RuntimeSwitch : std::size_t {
     TableSnapshot,
     NoTargetMemo,
     NoTargetMemoOverlapCache,
+    GpuWrittenIndexInPlace,
     Count,
 };
 
@@ -71,6 +72,9 @@ private:
     double phaseStart = 0;
     std::optional<double> firstSeconds;
 };
+
+// Experiment selector of the legacy driver (draw-path ceilings); 0 = off. APS5_EXPERIMENT_MODE=<n>.
+int ExperimentMode();
 
 bool AbConfigured();
 std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds);
