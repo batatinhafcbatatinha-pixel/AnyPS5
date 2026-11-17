@@ -24,6 +24,7 @@ void AttachWindow(const PresentationWindow& window);
 void Present(const PresentationWindow& window, const DisplayBuffer* buffer, const DisplayBuffer* plane,
              bool opaque, void (*gpuReady)(void*), void* context);
 void ReleaseWindow(void* window);
+void RegisterShader(const void* header);
 void SuspendPoint();
 void WaitIdle();
 void Shutdown();

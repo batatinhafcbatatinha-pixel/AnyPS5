@@ -45,7 +45,7 @@ void Shutdown() {
 }
 
 void RegisterShader(const Shader* shader) {
-    if (VramBackend::Enabled()) return;
+    if (VramBackend::Enabled()) return VramBackend::RegisterShader(shader);
     if (auto* const recorder = FrameRecorder::Active()) recorder->RegisterShader(shader);
     DriverDetail::Driver::Get().RegisterShader(shader);
 }

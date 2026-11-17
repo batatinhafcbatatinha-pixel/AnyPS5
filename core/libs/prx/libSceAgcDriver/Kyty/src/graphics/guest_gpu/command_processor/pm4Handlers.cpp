@@ -1200,9 +1200,9 @@ KYTY_CP_OP_PARSER(CpOpAnyPs5Flip) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 6u);
-	cp.WriteBackImages();
-	cp.Flip(static_cast<int>(buffer[0]), static_cast<int32_t>(buffer[1]), static_cast<int>(buffer[2]),
-	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
+	cp.FlipPacket(buffer - 1, static_cast<int>(buffer[0]), static_cast<int32_t>(buffer[1]),
+	              static_cast<int>(buffer[2]),
+	              static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
@@ -1211,7 +1211,7 @@ KYTY_CP_OP_PARSER(CpOpAnyPs5RenderingWait) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u || buffer[2] != 0u);
-	cp.RenderingWait(buffer[0], buffer[1]);
+	cp.RenderingWait(buffer[0], buffer[1], buffer - 1);
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 

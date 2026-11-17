@@ -1114,9 +1114,21 @@ bool CommandProcessor::EopFlip(uint32_t token) {
 	return true;
 }
 
-void CommandProcessor::RenderingWait(uint32_t handle, uint32_t index) {
+void CommandProcessor::RenderingWait(uint32_t handle, uint32_t index, const uint32_t* packet) {
+	// Suspended like WAIT_REG_MEM while the buffer is in use: a guest thread holding libSceVideoOut's
+	// lock may be waiting for this thread to serve its page fault.
 	BufferFlush();
-	m_renderer.GetVideoOut().RenderingWait(handle, index);
+	if (!m_renderer.GetVideoOut().RenderingReady(handle, index, packet)) {
+		SuspendPm4();
+	}
+}
+
+void CommandProcessor::FlipPacket(const uint32_t* packet, int handle, int index, int flip_mode,
+                                  int64_t flip_arg) {
+	VideoOut::VideoOutDriver::SetFlipPacket(packet);
+	WriteBackImages();
+	Flip(handle, index, flip_mode, flip_arg);
+	VideoOut::VideoOutDriver::SetFlipPacket(nullptr);
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {

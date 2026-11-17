@@ -35,8 +35,9 @@ namespace Host {
 
 // Reserves the flip with libSceVideoOut; false when the output is not registered. `display` gets
 // the buffer it shows and `hasDisplay` whether it shows one (false: black or blank).
+// `packet`: the flip packet being executed (its flip was reserved when it was submitted), or null.
 bool ReserveFlip(std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument,
-                 std::uint64_t* request, DisplayDesc* display, bool* hasDisplay);
+                 const std::uint32_t* packet, std::uint64_t* request, DisplayDesc* display, bool* hasDisplay);
 // An end-of-pipe release whose interrupt context is a reserved EOP flip token (queue 0).
 bool TakeEopFlip(std::uint32_t token, std::uint64_t* request, DisplayDesc* display, bool* hasDisplay);
 // The work before the flip completed on the GPU: libSceVideoOut may present it.
@@ -44,7 +45,8 @@ void CompleteFlip(std::uint64_t request);
 // The address libSceVideoOut passes back to Present for this request.
 void* FlipKey(std::uint64_t request);
 void WaitForFlipRoom(std::uint32_t handle);
-void RenderingWait(std::uint32_t handle, std::uint32_t index);
+// `packet`: the wait packet in guest memory; its wait was captured when it was submitted.
+bool RenderingReady(std::uint32_t handle, std::uint32_t index, const std::uint32_t* packet);
 void DeliverInterrupt(std::uint32_t queue, std::uint32_t context);
 // GPU-backend fatal error: report it through libSceAgcDriver's failure path.
 [[noreturn]] void Fail(const char* message);
@@ -60,6 +62,8 @@ void Start(const WindowDesc* window);
 void AttachWindow(const WindowDesc& window);
 void Submit(std::uint32_t queue, const std::uint32_t* commands, std::uint32_t dwords);
 void SuspendPoint();
+// sceAgcCreateShader: the relocated shader header (SDK layout) of a program the game created.
+void RegisterShader(const void* header);
 void WaitIdle();
 void Shutdown();
 // Presenter thread: shows the frame recorded for `key` (or a clear) and calls gpuReady(context).

@@ -24,6 +24,12 @@ class IRenderingWait {
 public:
     virtual ~IRenderingWait() = default;
     virtual void Wait() = 0;
+    // Non-blocking form for a GPU thread that must keep serving other work: false while the buffer
+    // is still in use or its lock is held by another thread.
+    virtual bool Ready() {
+        Wait();
+        return true;
+    }
 };
 
 struct FlipInfo {

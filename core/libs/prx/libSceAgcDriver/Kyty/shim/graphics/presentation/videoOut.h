@@ -37,7 +37,9 @@ public:
 	// AnyPS5 extensions: an end-of-pipe release whose interrupt context is a reserved flip token
 	// flips (true, request reserved); the driver's rendering wait packet.
 	bool TakeEopFlip(uint32_t token, Graphics::CommandBuffer& buffer, uint64_t& request_id);
-	void RenderingWait(uint32_t handle, uint32_t index);
+	[[nodiscard]] bool RenderingReady(uint32_t handle, uint32_t index, const uint32_t* packet);
+	// The AnyPS5 flip packet the GPU thread executes (set around CommandProcessor::Flip).
+	static void SetFlipPacket(const uint32_t* packet);
 
 	[[nodiscard]] Impl& State() noexcept { return *m_impl; }
 
