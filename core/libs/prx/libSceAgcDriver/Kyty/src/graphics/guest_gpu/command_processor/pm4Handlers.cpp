@@ -1171,6 +1171,30 @@ KYTY_CP_OP_PARSER(CpOpNop) {
 	return 0;
 }
 
+// AnyPS5: COND_WRITE {control, poll lo, poll hi, reference, mask, destination lo, hi, data}
+// (sceAgcCbCondWrite): writes the data once when the polled dword passes the compare.
+KYTY_CP_OP_PARSER(CpOpCondWrite) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 9u);
+	const auto* poll =
+	    reinterpret_cast<const volatile uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+	auto* destination =
+	    reinterpret_cast<volatile uint32_t*>(buffer[5] | (static_cast<uint64_t>(buffer[6]) << 32u));
+	if (TestWaitRegMemValue(*poll, buffer[3], buffer[4], buffer[0] & 0x7u)) {
+		*destination = buffer[7];
+	}
+	return KYTY_PM4_LEN(cmd_id) - 1;
+}
+
+// AnyPS5: SET_INDEX_INDIRECT_ARGS (sceAgcDcbSetIndexIndirectArgs) has no effect on the draws Kyty
+// records; the packet is skipped.
+KYTY_CP_OP_PARSER(CpOpSkipPacket) {
+	KYTY_PROFILER_FUNCTION();
+
+	return KYTY_PM4_LEN(cmd_id) - 1;
+}
+
 // AnyPS5's libSceAgcDriver flip packet {header, handle, index, mode, argument low, high}.
 KYTY_CP_OP_PARSER(CpOpAnyPs5Flip) {
 	KYTY_PROFILER_FUNCTION();
@@ -1351,6 +1375,10 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 			return KYTY_PM4_LEN(cmd_id) - 1u;
 		}
 	}
+	// AnyPS5: compute queues write the same driver tags without the shader-type bit.
+	if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 
 	auto raw_cmd_offset = buffer[0];
 	auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -1432,6 +1460,12 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 
 	auto  write_control = buffer[0];
 	auto* dst = reinterpret_cast<uint32_t*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
+
+	// AnyPS5: a register destination (dst_sel 0) carries libSceAgcDriver's inline user data.
+	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
+	if (dst_sel == 0) {
+		return 1 + dw_num;
+	}
 
 	cp.WriteData(dst, buffer + 3, dw_num - 2, write_control);
 
