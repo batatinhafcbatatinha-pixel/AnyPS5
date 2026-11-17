@@ -166,11 +166,11 @@ struct PageManager::Impl {
 	}
 
 	Region* FindRegion(uint64_t vaddr) const noexcept {
-		return regions[vaddr / REGION_SIZE].load(std::memory_order_acquire);
+		return regions[TrackerOffset(vaddr) / REGION_SIZE].load(std::memory_order_acquire);
 	}
 
 	Region* GetOrCreateRegion(uint64_t vaddr) {
-		const auto index = vaddr / REGION_SIZE;
+		const auto index = TrackerOffset(vaddr) / REGION_SIZE;
 		if (auto* region = regions[index].load(std::memory_order_acquire); region != nullptr) {
 			return region;
 		}

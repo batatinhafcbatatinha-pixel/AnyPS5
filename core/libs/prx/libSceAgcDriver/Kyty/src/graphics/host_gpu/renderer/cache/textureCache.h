@@ -140,8 +140,8 @@ private:
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
 		static constexpr bool RETURNS_BOOL =
 		    std::is_same_v<std::invoke_result_t<Func, uint64_t>, bool>;
-		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
-		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
+		const uint64_t page_end = (TrackerOffset(address) + size - 1) >> ImagePageTable::kPageBits;
+		for (uint64_t page = TrackerOffset(address) >> ImagePageTable::kPageBits; page <= page_end; ++page) {
 			if constexpr (RETURNS_BOOL) {
 				if (func(page)) {
 					break;
@@ -162,10 +162,10 @@ private:
 		static constexpr bool BOOL_BREAK =
 		    std::is_same_v<std::invoke_result_t<Func, ImageId, Image&>, bool>;
 		ImagePageTable::PageRange pages {};
-		if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		if (!ImagePageTable::TryGetPageRange(TrackerOffset(address), size, pages)) {
 			return;
 		}
-		const uint64_t first_page = address >> ImagePageTable::kPageBits;
+		const uint64_t first_page = TrackerOffset(address) >> ImagePageTable::kPageBits;
 		ForEachPage(address, size, [&](uint64_t page) {
 			const auto* bucket = m_image_page_table.Find(page);
 			if (bucket == nullptr) {
@@ -176,7 +176,7 @@ private:
 				}
 			}
 			for (const auto& entry: bucket->entries) {
-				const uint64_t base_page = entry.address >> ImagePageTable::kPageBits;
+				const uint64_t base_page = TrackerOffset(entry.address) >> ImagePageTable::kPageBits;
 				if (page != std::max(first_page, base_page)) {
 					continue;
 				}
@@ -201,7 +201,7 @@ private:
 	// Calls func for each image registered at address.
 	template <typename Func>
 	void ForEachImageWithAddress(uint64_t address, Func&& func) {
-		const auto* bucket = m_image_page_table.Find(address >> ImagePageTable::kPageBits);
+		const auto* bucket = m_image_page_table.Find(TrackerOffset(address) >> ImagePageTable::kPageBits);
 		if (bucket == nullptr) {
 			return;
 		}

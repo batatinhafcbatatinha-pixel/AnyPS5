@@ -32,6 +32,21 @@ struct GuestRange {
 	auto                             operator<=>(const GuestRange&) const = default;
 };
 
+// AnyPS5: guest addresses are host addresses, and the extended window (the relinked executable's
+// data near the top of the user address space) is folded right above the lower window, so tables
+// indexed by address stay below TRACKER_ADDRESS_SIZE.
+constexpr uint64_t TrackerOffset(uint64_t address) noexcept {
+	return address < LOWER_ADDRESS_SIZE
+	           ? address
+	           : address - LibKernel::Memory::kExtendedMemoryBase + LOWER_ADDRESS_SIZE;
+}
+constexpr uint64_t TrackerAddress(uint64_t offset) noexcept {
+	return offset < LOWER_ADDRESS_SIZE
+	           ? offset
+	           : offset - LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemoryBase;
+}
+static_assert(LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize <= TRACKER_ADDRESS_SIZE);
+
 enum class DirtySource { Cpu, Gpu };
 using RegionBits = Common::BitArray<TRACKER_REGION_PAGES>;
 static_assert(sizeof(RegionBits) == TRACKER_REGION_PAGES / 8);

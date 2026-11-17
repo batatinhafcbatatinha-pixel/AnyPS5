@@ -5,6 +5,7 @@
 #include <exception>
 #include <memory>
 #include <stdexcept>
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 
 namespace AgcDriver {
 
@@ -42,6 +43,9 @@ public:
     virtual ~IFlipRequest() = default;
     virtual void GpuReady(const std::shared_ptr<FrameTiming>& timing) = 0;
     virtual void Fail(std::exception_ptr error) noexcept = 0;
+    // The registered buffer the flip shows, as captured at reservation; false for black, blank or
+    // unregistered buffers.
+    virtual bool Display(DisplayBuffer& display) { return false; }
 };
 
 class IVideoOutput {

@@ -342,6 +342,33 @@ public:
         return true;
     }
 
+    bool BackingCopy(std::uintptr_t address, void* buffer, std::size_t bytes, bool write) {
+        std::lock_guard lock(mutex);
+        auto* cursor = static_cast<unsigned char*>(buffer);
+        while (bytes != 0) {
+            const auto base = address & ~(pageBytes - 1);
+            const auto found = views.find(base);
+            if (found == views.end() || found->second.resident || !found->second.section) return false;
+            const auto within = address - base;
+            if (within >= found->second.viewBytes) return false;
+            const auto count = std::min(bytes, found->second.viewBytes - within);
+            auto& section = *found->second.section;
+            auto host = section.hostViews.find(found->second.offset);
+            if (host == section.hostViews.end()) {
+                const auto lead = found->second.offset % 0x10000u;
+                auto* view = static_cast<unsigned char*>(map(section.handle, GetCurrentProcess(), nullptr, found->second.offset - lead, lead + found->second.viewBytes, 0, PAGE_READWRITE, nullptr, 0));
+                if (view == nullptr) return false;
+                host = section.hostViews.emplace(found->second.offset, view + lead).first;
+            }
+            if (write) std::memcpy(host->second + within, cursor, count);
+            else std::memcpy(cursor, host->second + within, count);
+            cursor += count;
+            address += count;
+            bytes -= count;
+        }
+        return true;
+    }
+
     bool HandleRead(std::uintptr_t address) {
         std::lock_guard lock(mutex);
         if (!views.contains(address & ~(pageBytes - 1))) return false;
@@ -1069,10 +1096,14 @@ private:
     };
     struct Section {
         HANDLE handle;
+        std::map<std::uint64_t, unsigned char*> hostViews;
         explicit Section(HANDLE handle) : handle(handle) {}
         Section(const Section&) = delete;
         Section& operator=(const Section&) = delete;
-        ~Section() { CloseHandle(handle); }
+        ~Section() {
+            for (const auto& [offset, view] : hostViews) UnmapViewOfFile(view - offset % 0x10000u);
+            CloseHandle(handle);
+        }
     };
     struct Saved {
         unsigned char* bytes = nullptr;

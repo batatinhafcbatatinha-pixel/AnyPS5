@@ -100,6 +100,13 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes);
+// Called before a guest range is released or reset (unmapped).
+void GuestArenaSetReleaseObserver_nid_no_patch(void (*callback)(std::uintptr_t address, std::size_t bytes));
+#ifdef _WIN32
+// Copies to or from the direct-memory backing of a guest range through a host view that ignores
+// the guest page protections; false where the range is not backed by a shared section.
+bool GuestArenaBackingCopy_nid_no_patch(std::uintptr_t address, void* buffer, std::size_t bytes, bool write);
+#endif
 
 }
 
