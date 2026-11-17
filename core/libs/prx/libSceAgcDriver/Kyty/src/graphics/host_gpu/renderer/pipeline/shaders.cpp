@@ -383,9 +383,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	CreateLayouts(graphics, pipeline, descriptor_bindings);
 
 	vk::ComputePipelineCreateInfo info {};
-	if (module.info.info.uses_gds) {
-		info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
-	}
+	// AnyPS5: every compute pipeline takes a dispatch base, so dispatches above the device's
+	// workgroup-count limits are split (RenderExecutor::DispatchDirect).
+	info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 

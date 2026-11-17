@@ -831,7 +831,10 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
-	if (error) {
+	// AnyPS5: validation errors are logged (APS5_KYTY_FATAL_VALIDATION=1 makes them fatal) so a
+	// diagnostic run reaches the failure it is looking for.
+	static const bool fatal = std::getenv("APS5_KYTY_FATAL_VALIDATION") != nullptr;
+	if (error && fatal) {
 		EXIT("[Vulkan][%s][%u]: %s\n", severity_str, static_cast<uint32_t>(message_types),
 		     callback_data->pMessage);
 	}

@@ -531,7 +531,25 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			}
 		}
 	} else {
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		// AnyPS5: guest dispatches can exceed the host's workgroup-count limits (GTA V uses
+		// millions of groups in Y); split them with a dispatch base, as the legacy driver did.
+		const auto& limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+		const uint32_t max_x = limits.maxComputeWorkGroupCount[0];
+		const uint32_t max_y = limits.maxComputeWorkGroupCount[1];
+		const uint32_t max_z = limits.maxComputeWorkGroupCount[2];
+		if (thread_group_x <= max_x && thread_group_y <= max_y && thread_group_z <= max_z) {
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		} else {
+			for (uint32_t z = 0; z < thread_group_z; z += std::min(max_z, thread_group_z - z)) {
+				for (uint32_t y = 0; y < thread_group_y; y += std::min(max_y, thread_group_y - y)) {
+					for (uint32_t x = 0; x < thread_group_x; x += std::min(max_x, thread_group_x - x)) {
+						vk_buffer.dispatchBase(x, y, z, std::min(max_x, thread_group_x - x),
+						                       std::min(max_y, thread_group_y - y),
+						                       std::min(max_z, thread_group_z - z));
+					}
+				}
+			}
+		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
