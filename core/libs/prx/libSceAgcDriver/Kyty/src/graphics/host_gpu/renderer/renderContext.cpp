@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
+#include "glue/Core.hpp"
 
 #include <algorithm>
 
@@ -204,27 +205,8 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 }
 
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
-	std::vector<InterruptEqRegistration> registrations;
-	{
-		Common::LockGuard lock(m_interrupt_mutex);
-		for (const auto& registration: m_interrupt_eqs) {
-			if (registration.event_id == event_id) {
-				registrations.push_back(registration);
-			}
-		}
-	}
-
-	for (const auto& registration: registrations) {
-		const auto result = LibKernel::EventQueue::KernelTriggerEvent(
-		    registration.eq, static_cast<uintptr_t>(registration.event_id),
-		    LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,
-		    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)));
-		if (result == LibKernel::KERNEL_ERROR_EBADF || result == LibKernel::KERNEL_ERROR_ENOENT) {
-			DeleteInterruptEq(registration.eq, registration.event_id);
-			continue;
-		}
-		EXIT_NOT_IMPLEMENTED(result != OK);
-	}
+	// AnyPS5: graphics events are registered with libSceAgcDriver (AGC/Eq), which delivers them.
+	AgcDriver::VramBackend::Host::DeliverInterrupt(static_cast<uint32_t>(event_id), context_id);
 }
 
 } // namespace Libs::Graphics

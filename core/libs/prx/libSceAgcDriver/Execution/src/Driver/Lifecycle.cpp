@@ -1,3 +1,4 @@
+#include "prx/libc/include/GpuBackend.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThread.hpp"
@@ -233,6 +234,7 @@ Driver::Driver() {
         stop();
         throw;
     }
+    if (GpuBackend::VramResident()) return;
     GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&GuestMemory::PrepareHostWrite);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& ranges, std::uint64_t generation) {
         const auto import = [&] {

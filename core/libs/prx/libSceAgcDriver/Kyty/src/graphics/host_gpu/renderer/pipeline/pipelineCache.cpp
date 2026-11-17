@@ -34,7 +34,9 @@
 #include <limits>
 #include <ranges>
 #include <span>
+#if KYTY_HAS_SPIRV_TOOLS
 #include <spirv-tools/libspirv.hpp>
+#endif
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -137,6 +139,13 @@ void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
 	if (!Config::ShaderValidationEnabled()) {
 		return;
 	}
+#if !KYTY_HAS_SPIRV_TOOLS
+	// AnyPS5 builds SPIRV-Tools only with ANYPS5_ENABLE_SPIRV_TOOLS.
+	static_cast<void>(stage);
+	static_cast<void>(shader_hash);
+	static_cast<void>(spirv);
+	static_cast<void>(maintenance8_enabled);
+#else
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
 	std::string          messages;
 	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*,
@@ -161,6 +170,7 @@ void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
 	LOGF("%s\n", text.c_str());
 	EXIT("ShaderRecompiler %s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s", stage,
 	     shader_hash, messages.c_str());
+#endif
 }
 
 // Formats with a narrower host variant drop the components the shader does not read.

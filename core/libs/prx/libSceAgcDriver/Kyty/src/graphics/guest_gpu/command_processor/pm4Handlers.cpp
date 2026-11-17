@@ -1171,6 +1171,26 @@ KYTY_CP_OP_PARSER(CpOpNop) {
 	return 0;
 }
 
+// AnyPS5's libSceAgcDriver flip packet {header, handle, index, mode, argument low, high}.
+KYTY_CP_OP_PARSER(CpOpAnyPs5Flip) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 6u);
+	cp.WriteBackImages();
+	cp.Flip(static_cast<int>(buffer[0]), static_cast<int32_t>(buffer[1]), static_cast<int>(buffer[2]),
+	        static_cast<int64_t>(buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u)));
+	return KYTY_PM4_LEN(cmd_id) - 1;
+}
+
+// AnyPS5's libSceAgcDriver rendering wait {header, handle, index, mode}.
+KYTY_CP_OP_PARSER(CpOpAnyPs5RenderingWait) {
+	KYTY_PROFILER_FUNCTION();
+
+	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != 4u || buffer[2] != 0u);
+	cp.RenderingWait(buffer[0], buffer[1]);
+	return KYTY_PM4_LEN(cmd_id) - 1;
+}
+
 KYTY_CP_OP_PARSER(CpOpNumInstances) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1202,14 +1222,23 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0064900);
 
+	// AnyPS5: an interrupting release whose context is a reserved EOP flip token is the flip
+	// (sceVideoOutSubmitEopFlip); it delivers no graphics interrupt.
+	const auto interrupt_selector = (buffer[1] >> 24u) & 0x7u;
+	const bool flip = interrupt_selector != 0 && interrupt_selector != 3 &&
+	                  cp.EopFlip(buffer[6] & 0x07ffffffu);
+
 	// The event type, cache actions and destination cache only order GPU work, which the renderer's
 	// resource barriers already order. A GL2 writeback (GCR_CNTL bit 9) also makes shader writes
 	// visible to the CPU.
 	cp.ReleaseMem(
-	    (buffer[1] >> 29u) & 0x7u, (buffer[1] >> 24u) & 0x7u,
+	    (buffer[1] >> 29u) & 0x7u, flip ? 0u : interrupt_selector,
 	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
 	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu,
 	    (buffer[0] & (1u << 21u)) != 0);
+	if (flip) {
+		cp.BufferFlush();
+	}
 
 	return 7;
 }

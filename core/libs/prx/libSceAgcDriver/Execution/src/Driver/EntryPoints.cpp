@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Kyty/glue/Backend.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
@@ -14,6 +15,10 @@ namespace AgcDriver {
 
 void Submit(const Packet* packet, std::uint32_t queue) try {
     KernelNoteGpuSubmit_nid_no_patch();
+    if (VramBackend::Enabled()) {
+        VramBackend::Submit(packet, queue);
+        return;
+    }
     auto& driver = DriverDetail::Driver::Get();
     auto* const recorder = FrameRecorder::Active();
     if (recorder == nullptr) {
@@ -30,19 +35,23 @@ void Submit(const Packet* packet, std::uint32_t queue) try {
 }
 
 void WaitIdle() {
+    if (VramBackend::Enabled()) return VramBackend::WaitIdle();
     DriverDetail::Driver::Get().WaitIdle();
 }
 
 void Shutdown() {
+    if (VramBackend::Enabled()) return VramBackend::Shutdown();
     DriverDetail::Driver::Get().Shutdown();
 }
 
 void RegisterShader(const Shader* shader) {
+    if (VramBackend::Enabled()) return;
     if (auto* const recorder = FrameRecorder::Active()) recorder->RegisterShader(shader);
     DriverDetail::Driver::Get().RegisterShader(shader);
 }
 
 void SuspendPoint() {
+    if (VramBackend::Enabled()) return VramBackend::SuspendPoint();
     auto* const recorder = FrameRecorder::Active();
     if (recorder == nullptr) {
         DriverDetail::Driver::Get().SuspendPoint();
@@ -52,29 +61,35 @@ void SuspendPoint() {
 }
 
 void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
+    if (VramBackend::Enabled()) return VramBackend::RegisterVideoOutput(handle, output);
     if (auto* const recorder = FrameRecorder::Active()) recorder->RegisterVideoOutput(handle);
     DriverDetail::Driver::Get().RegisterVideoOutput(handle, output);
 }
 
 void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
+    if (VramBackend::Enabled()) return VramBackend::UnregisterVideoOutput(handle, output);
     if (auto* const recorder = FrameRecorder::Active()) recorder->UnregisterVideoOutput(handle);
     DriverDetail::Driver::Get().UnregisterVideoOutput(handle, output);
 }
 
 void AttachWindow(const PresentationWindow& window) {
+    if (VramBackend::Enabled()) return VramBackend::AttachWindow(window);
     DriverDetail::Driver::Get().AttachWindow(window);
 }
 
 void PresentClear(const PresentationWindow& window, bool opaque, const DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
+    if (VramBackend::Enabled()) return VramBackend::Present(window, nullptr, plane, opaque, gpuReady, context);
     DriverDetail::Driver::Get().Present(window, nullptr, plane, opaque, gpuReady, context);
 }
 
 void PresentBuffer(const PresentationWindow& window, const DisplayBuffer& buffer, const DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
+    if (VramBackend::Enabled()) return VramBackend::Present(window, &buffer, plane, true, gpuReady, context);
     if (auto* const recorder = FrameRecorder::Active()) recorder->PresentBuffer(buffer);
     DriverDetail::Driver::Get().Present(window, &buffer, plane, true, gpuReady, context);
 }
 
 void ReleaseWindow(void* window) {
+    if (VramBackend::Enabled()) return VramBackend::ReleaseWindow(window);
     DriverDetail::Driver::Get().ReleaseWindow(window);
 }
 
@@ -125,6 +140,7 @@ extern "C" void AgcDriverRequestScreenshot_nid_postfix() {
 }
 
 extern "C" void AgcDriverTracePresent_nid_postfix(std::uint32_t width, std::uint32_t height) {
+    if (AgcDriver::VramBackend::Enabled()) return;
     AgcDriver::DriverDetail::Driver::Get().TracePresent(width, height);
 }
 
@@ -150,6 +166,7 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
 }
 
 extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::FlipInfo& info) {
+    if (AgcDriver::VramBackend::Enabled()) return AgcDriver::VramBackend::ReserveEopFlip(info, 0);
     const auto token = AgcDriver::DriverDetail::Driver::Get().ReserveEopFlip(info);
     if (auto* const recorder = AgcDriver::FrameRecorder::Active(); recorder != nullptr && token != 0) {
         recorder->RewindTailFlips(AgcDriver::DriverDetail::Driver::Get().RewindTailFlips());
@@ -159,6 +176,7 @@ extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::Fl
 }
 
 extern "C" std::uint32_t AgcDriverReserveEopFlipAt_nid_postfix(const AgcDriver::FlipInfo& info, std::uint32_t token) {
+    if (AgcDriver::VramBackend::Enabled()) return AgcDriver::VramBackend::ReserveEopFlip(info, token);
     return AgcDriver::DriverDetail::Driver::Get().ReserveEopFlipAt(info, token);
 }
 
@@ -208,6 +226,7 @@ extern "C" bool AgcDriverSettled_nid_postfix() {
 }
 
 extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
+    if (AgcDriver::VramBackend::Enabled()) return AgcDriver::VramBackend::SubmitFlip(info);
     auto* const recorder = AgcDriver::FrameRecorder::Active();
     if (recorder == nullptr) {
         AgcDriver::DriverDetail::Driver::Get().SubmitFlip(info);
@@ -261,6 +280,7 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
 }
 
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
+    if (AgcDriver::VramBackend::Enabled()) return;
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveShaderAbi(shader, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
 } catch (const ProcessShutdown&) {
@@ -268,12 +288,14 @@ extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std:
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
+    if (AgcDriver::VramBackend::Enabled()) return;
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsAbi(vertex, pixel, primitiveType);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
+    if (AgcDriver::VramBackend::Enabled()) return;
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsStagesAbi(stages, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
 } catch (const ProcessShutdown&) {
