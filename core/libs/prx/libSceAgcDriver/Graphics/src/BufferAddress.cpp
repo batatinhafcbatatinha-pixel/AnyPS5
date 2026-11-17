@@ -1,9 +1,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include <cstdio>
 
 namespace AgcDriver::Graphics {
 
 VkDeviceAddress Buffer::DeviceAddress() const {
-    Require(deviceAddress != 0, "buffer has no device address");
+    if (deviceAddress == 0) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "buffer has no device address (usage 0x%x, size %zu, caller %p)", static_cast<unsigned>(usage), size, __builtin_return_address(0));
+        Require(false, text);
+    }
     return deviceAddress;
 }
 
