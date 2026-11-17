@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 namespace Libs::Graphics {
@@ -54,7 +55,18 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	// AnyPS5: waits in 5 s slices and reports a wait that does not end (diagnostic for hangs).
+	auto result = m_graphics.device.waitSemaphores(&wait_info, 5'000'000'000ull);
+	for (uint32_t slices = 1; result == vk::Result::eTimeout; ++slices) {
+		uint64_t counter = 0;
+		(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+		if (slices <= 3) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "[gpu-wait] semaphore {} waits for tick {} for {} s: counter {}, next tick {}\n",
+			    static_cast<const void*>(this), tick, slices * 5, counter, CurrentTick()));
+		}
+		result = m_graphics.device.waitSemaphores(&wait_info, 5'000'000'000ull);
+	}
 	if (result != vk::Result::eSuccess) {
 		ReportDeviceLoss(m_graphics, "semaphore wait", static_cast<int>(result));
 	}
