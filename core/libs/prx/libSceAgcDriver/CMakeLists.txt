@@ -555,7 +555,7 @@ file(GLOB_RECURSE agcShaderCacheGuardSources CONFIGURE_DEPENDS RELATIVE "${CMAKE
         "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
 )
-list(FILTER agcShaderCacheGuardSources EXCLUDE REGEX "^(tests|tools)/")
+list(FILTER agcShaderCacheGuardSources EXCLUDE REGEX "^(tests|tools|Kyty)/")
 add_shader_recompiler(shader_recompiler_agc_driver libc
         GUARD_SOURCES
         ${agcShaderCacheGuardSources}
