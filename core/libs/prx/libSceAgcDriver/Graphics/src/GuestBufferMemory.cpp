@@ -8271,6 +8271,14 @@ std::optional<std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderR
     }
 }
 
+void GuestBufferMemory::TouchAddressSpace() noexcept {
+    try {
+        const auto space = Spaces().current.load();
+        (void)space;
+    } catch (...) {
+    }
+}
+
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");

@@ -950,6 +950,10 @@ void ShaderMemory::SetTraceProgram(std::uint64_t program) {
     if (TraceSlowHooks()) HostThreadLocal<std::uint64_t, TraceProgramStorage>() = program;
 }
 
+std::uint64_t ShaderMemory::TraceProgram() {
+    return HostThreadLocal<std::uint64_t, TraceProgramStorage>();
+}
+
 void ShaderMemory::CountHandleMemo(bool hit) {
     if (!CaptureProfiled()) return;
     (hit ? CaptureTotals().handleHits : CaptureTotals().handleMisses).fetch_add(1, std::memory_order_relaxed);
