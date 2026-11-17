@@ -21,6 +21,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "ShaderCacheDirectory.hpp"
@@ -2021,11 +2022,7 @@ void RenderScaleTick() {
 std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, VkExtent2D hostExtent) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
-    static const bool unwatchHooked = [] {
-        GuestMemory::SetUnwatchHook(&StorageTexture::SaveBeforeUnwatch);
-        return true;
-    }();
-    static_cast<void>(unwatchHooked);
+    InstallUnwatchHook();
     const MapImportGate::PublishHold publication(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes);
     auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel, hostExtent));
     uploadReason = "first";
@@ -5915,6 +5912,7 @@ void StorageTexture::SetPendingHookForTest(void (*hook)(std::uint64_t address, s
 }
 
 bool StorageTexture::UnwatchHookLocksGpu(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (MultisampleDccUnwatchLocksGpu(ranges)) return true;
     if (AnyPendingOverlaps(ranges)) return true;
     auto& live = Live();
     std::lock_guard lock(live.mutex);
@@ -5928,8 +5926,17 @@ bool StorageTexture::UnwatchHookLocksGpu(std::span<const std::pair<std::uint64_t
     return false;
 }
 
+void StorageTexture::InstallUnwatchHook() {
+    static const bool installed = [] {
+        GuestMemory::SetUnwatchHook(&StorageTexture::SaveBeforeUnwatch);
+        return true;
+    }();
+    static_cast<void>(installed);
+}
+
 void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0) return;
+    SaveMultisampleDccBeforeUnwatch(address, bytes);
     std::vector<std::shared_ptr<StorageTexture>> overlapping;
     {
         auto& pending = Pending();
