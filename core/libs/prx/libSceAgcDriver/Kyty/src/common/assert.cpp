@@ -1,26 +1,26 @@
 #include "common/assert.h"
 
-#include "common/subsystems.h"
 #include "kytyGitVersion.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <stdexcept>
+
+// AnyPS5: a failed check of the GPU backend is reported on stderr before the process ends.
 
 namespace Common {
 
 [[noreturn]] static void DbgReport(const char* title, std::string_view text, const char* file,
                                    int line) {
-	Log::WriteToConsoleAndLog(fmt::format("--- Build ---\n{}\n{}\n{} in {}:{}\n", KYTY_BUILD_LABEL,
-	                                      title, text, file, line));
-	Subsystems::EmergencyShutdownActive();
+	const auto message = fmt::format("{}\n{}\n{} in {}:{}\n", KYTY_BUILD_LABEL, title, text, file, line);
+	Log::WriteToConsoleAndLog(message);
 	std::fflush(nullptr);
 	std::_Exit(321);
 }
 
 void DbgExitIfHandler(const char* expr, const char* file, int line) {
-	DbgReport("--- Fatal Error ---", fmt::format("Error: condition ({}) is true", expr), file,
-	          line);
+	DbgReport("--- Fatal Error ---", fmt::format("Error: condition ({}) is true", expr), file, line);
 }
 
 void DbgNotImplementedHandler(const char* expr, const char* file, int line) {

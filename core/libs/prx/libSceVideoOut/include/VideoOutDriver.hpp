@@ -207,6 +207,7 @@ struct FlipRequest final : AgcDriver::IFlipRequest, std::enable_shared_from_this
     ~FlipRequest() override;
     void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameTiming) override;
     void Fail(std::exception_ptr error) noexcept override;
+    bool Display(AgcDriver::DisplayBuffer& display) override;
     void Cancel() noexcept;
     void ReleaseLocked() noexcept;
 };

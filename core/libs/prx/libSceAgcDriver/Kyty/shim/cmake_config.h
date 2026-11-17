@@ -1,0 +1,16 @@
+#ifndef APS5_KYTY_CMAKE_CONFIG_H
+#define APS5_KYTY_CMAKE_CONFIG_H
+
+#if defined(_WIN32)
+#define KYTY_PLATFORM KYTY_PLATFORM_WINDOWS
+#else
+#define KYTY_PLATFORM KYTY_PLATFORM_LINUX
+#endif
+#if defined(__clang__)
+#define KYTY_COMPILER KYTY_COMPILER_CLANG
+#else
+#define KYTY_COMPILER KYTY_COMPILER_GCC
+#endif
+#define KYTY_BUILD KYTY_BUILD_RELEASE
+
+#endif

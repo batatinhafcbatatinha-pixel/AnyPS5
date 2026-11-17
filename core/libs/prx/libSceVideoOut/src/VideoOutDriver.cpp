@@ -325,6 +325,17 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
     require(gpuComplete, "flip preparation did not complete on GPU");
 }
 
+bool FlipRequest::Display(AgcDriver::DisplayBuffer& display) {
+    if (index < 0 || cfg == nullptr) return false;
+    std::lock_guard lock(cfg->mutex);
+    const auto& registered = cfg->buffers[index];
+    if (!registered.Occupied() || registered.groupIndex >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX) return false;
+    const auto& owner = groupCaptured ? group : cfg->groups[registered.groupIndex];
+    if (!owner.occupied) return false;
+    display = DescribeVideoOutBuffer(registered, owner);
+    return true;
+}
+
 void FlipRequest::Fail(std::exception_ptr error) noexcept {
     if (!error) std::terminate();
     std::lock_guard lock(cfg->mutex);

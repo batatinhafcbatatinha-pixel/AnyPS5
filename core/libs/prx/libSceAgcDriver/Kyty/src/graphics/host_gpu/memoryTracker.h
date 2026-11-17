@@ -105,7 +105,7 @@ private:
 		using Result = std::invoke_result_t<Func, RegionManager*, uint64_t, uint64_t>;
 		constexpr bool returns_bool = std::is_same_v<Result, bool>;
 		uint64_t       remaining    = size;
-		uint64_t       index        = vaddr / TRACKER_REGION_SIZE;
+		uint64_t       index        = TrackerOffset(vaddr) / TRACKER_REGION_SIZE;
 		uint64_t       offset       = vaddr % TRACKER_REGION_SIZE;
 		while (remaining != 0) {
 			const auto bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);

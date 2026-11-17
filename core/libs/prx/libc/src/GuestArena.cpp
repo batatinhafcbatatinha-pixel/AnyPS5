@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GpuBackend.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostRegionIndex.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
@@ -44,6 +45,7 @@ std::atomic<std::uint64_t> commitGeneration{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t, std::uint64_t)> privateMappingObserver{nullptr};
 #endif
 std::atomic<void (*)(std::uintptr_t, std::size_t)> accessObserver{nullptr};
+std::atomic<void (*)(std::uintptr_t, std::size_t)> releaseObserver{nullptr};
 
 void noteAccess(const void* pointer, std::size_t bytes) {
     if (const auto callback = accessObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -194,7 +196,7 @@ private:
 #elif defined(__linux__) || defined(__APPLE__)
         SeedHostUsedRanges();
 #elif defined(_WIN32)
-        _writeWatched = std::getenv("APS5_NO_WRITE_WATCH") == nullptr;
+        _writeWatched = std::getenv("APS5_NO_WRITE_WATCH") == nullptr && !GpuBackend::VramResident();
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         const std::uintptr_t granularity = system.dwAllocationGranularity;
@@ -478,7 +480,12 @@ void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes) {
 }
 
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {
+    if (const auto callback = releaseObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     Arena::Get().Release(pointer, bytes);
+}
+
+void GuestArenaSetReleaseObserver_nid_no_patch(void (*callback)(std::uintptr_t address, std::size_t bytes)) {
+    releaseObserver.store(callback, std::memory_order_release);
 }
 
 void GuestArenaRange_nid_postfix(std::uintptr_t* base, std::size_t* bytes) {
@@ -720,6 +727,10 @@ bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleWrite(address);
 }
 
+bool GuestArenaBackingCopy_nid_no_patch(std::uintptr_t address, void* buffer, std::size_t bytes, bool write) {
+    return WindowsMappings::Get().BackingCopy(address, buffer, bytes, write);
+}
+
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
 }
@@ -786,6 +797,7 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 }
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
+    if (const auto callback = releaseObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
     WindowsMappings::Get().Reset(pointer, bytes);
 }
@@ -928,6 +940,7 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 }
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
+    if (const auto callback = releaseObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
     if (PlaceAt(pointer, bytes, 0x01) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "guest arena reset failed");
 }
@@ -946,6 +959,7 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 }
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
+    if (const auto callback = releaseObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
     Arena::Get().NoteDirty(pointer, bytes);
 }

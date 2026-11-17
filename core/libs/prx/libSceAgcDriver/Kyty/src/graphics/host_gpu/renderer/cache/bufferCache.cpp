@@ -111,7 +111,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
-	        !PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
+	        !PageTable::TryGetPageRange(TrackerOffset(buffer.CpuAddress()), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		if constexpr (insert) {
 			m_page_table[page] = id;
@@ -365,7 +365,7 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 		EXIT("BufferCache: invalid buffer discovery request 0x%016" PRIx64 " size 0x%" PRIx64
 		     " (program 0x%016" PRIx64 ")\n", vaddr, size, m_current_program);
 	}
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const auto* owner = m_page_table.Find(PageIndex(vaddr));
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
@@ -622,7 +622,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	const auto* owner = m_page_table.Find(PageIndex(vaddr));
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
@@ -884,7 +884,7 @@ void BufferCache::RecordSideDownloads(std::span<const EarlyRange> ranges, uint64
 		});
 		pages.ForEach([&](uint64_t begin, uint64_t end) {
 			for (auto address = begin; address < end;) {
-				const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
+				const auto* owner = m_page_table.Find(PageIndex(address));
 				if (owner == nullptr || !*owner) {
 					address = std::min(end, Common::AlignDown(address, CACHING_PAGESIZE) + CACHING_PAGESIZE);
 					continue;
@@ -919,7 +919,7 @@ void BufferCache::RecordEagerDownloads() {
 		const auto writes = std::exchange(m_eager_writes, {});
 		writes.ForEach([&](uint64_t begin, uint64_t end) {
 			for (auto address = begin; address < end;) {
-				const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
+				const auto* owner = m_page_table.Find(PageIndex(address));
 				if (owner == nullptr || !*owner) {
 					address = std::min(end, Common::AlignDown(address, CACHING_PAGESIZE) +
 					                            CACHING_PAGESIZE);
@@ -1372,7 +1372,7 @@ void BufferCache::WriteBdaEntries(uint64_t begin, uint64_t end) {
 		});
 	}
 	for (auto address = begin; address < end; address += CACHING_PAGESIZE) {
-		const auto* owner  = m_page_table.Find(address >> PageTable::kPageBits);
+		const auto* owner  = m_page_table.Find(PageIndex(address));
 		const bool  cached = owner != nullptr && *owner && !m_slot_buffers[*owner].is_deleted;
 		vk::DeviceAddress entry = 0;
 		// The cache buffer when its copy is current (GPU-owned, or no CPU write since its upload);

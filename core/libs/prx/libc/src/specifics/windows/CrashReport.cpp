@@ -361,8 +361,11 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+std::atomic<LibcGpuFaultHandler> g_gpuFaultHandler{nullptr};
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
+    if (const auto gpu = g_gpuFaultHandler.load(std::memory_order_acquire); gpu != nullptr && info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2 && gpu(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (GuestArena::GuestArenaRecoverRead_nid_no_patch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* fault = info->ExceptionRecord;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
@@ -705,6 +708,10 @@ const bool g_crashReportInstalled = [] {
     return true;
 }();
 
+}
+
+extern "C" void LibcSetGpuFaultHandler_nid_no_patch(LibcGpuFaultHandler handler) noexcept {
+    g_gpuFaultHandler.store(handler, std::memory_order_release);
 }
 
 extern "C" void LibcSetHostFaultHandler_nid_no_patch(LibcHostFaultHandler handler) noexcept {
