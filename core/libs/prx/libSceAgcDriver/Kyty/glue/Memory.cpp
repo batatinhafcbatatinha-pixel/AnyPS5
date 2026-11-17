@@ -126,6 +126,17 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 	}
 }
 
+// Set while a backing read runs a guarded copy: its faults belong to libc's read recovery.
+thread_local bool t_guarded_read = false;
+
+// A plain copy of guest bytes that fails instead of faulting (no tracker read-back, no page walk).
+bool GuardedRead(uint64_t address, void* data, uint64_t bytes) {
+	t_guarded_read = true;
+	const bool copied = GuestArena::GuestArenaCopyOwned_nid_no_patch(address, data, bytes);
+	t_guarded_read = false;
+	return copied;
+}
+
 bool Tracked(uint64_t address) {
 	std::lock_guard lock(ProtectionMutex());
 	return Originals().contains(address & ~(PageBytes - 1));
@@ -194,7 +205,7 @@ bool Core::HandleFault(void* exception_pointers) noexcept {
 	const auto* record = info->ExceptionRecord;
 	auto*       context = info->ContextRecord;
 	auto*       renderer = Internal::Renderer();
-	if (renderer == nullptr) {
+	if (renderer == nullptr || t_guarded_read) {
 		return false;
 	}
 	const auto kind    = record->ExceptionInformation[0];
@@ -341,6 +352,10 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (size == 0) {
 		return true;
 	}
+	// Fast path (most reads): the pages are readable as mapped.
+	if (AgcDriver::VramBackend::GuardedRead(vaddr, data, size)) {
+		return true;
+	}
 	if (GuestArena::GuestArenaBackingCopy_nid_no_patch(vaddr, data, size, false)) {
 		return true;
 	}
@@ -366,6 +381,9 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 static bool CopySparse(uint64_t vaddr, void* data, uint64_t size, bool zero_unmapped) {
+	if (AgcDriver::VramBackend::GuardedRead(vaddr, data, size)) {
+		return true;
+	}
 	auto*      out = static_cast<std::byte*>(data);
 	const auto end = vaddr + size;
 	while (vaddr < end) {
