@@ -1,0 +1,515 @@
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/deviceLossReport.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include <cstdlib>
+
+#include "common/assert.h"
+#include "common/debugCounters.h"
+#include "common/logging/log.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+
+#include <algorithm>
+#include <atomic>
+#include <optional>
+
+namespace Libs::Graphics {
+
+static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+
+CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
+    : m_graphics(graphics), m_master(master) {
+	EXIT_IF(graphics.queue_family == static_cast<uint32_t>(-1));
+	vk::CommandPoolCreateInfo create {};
+	create.queueFamilyIndex = graphics.queue_family;
+	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+	const auto result       = graphics.device.createCommandPool(&create, nullptr, &m_pool);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_pool == nullptr);
+}
+
+CommandScheduler::CommandPool::~CommandPool() {
+	m_graphics.device.destroyCommandPool(m_pool, nullptr);
+}
+
+size_t CommandScheduler::CommandPool::Grow() {
+	const auto first = m_ticks.size();
+	m_ticks.resize(first + GrowStep);
+	m_buffers.resize(first + GrowStep);
+
+	vk::CommandBufferAllocateInfo allocate {};
+	allocate.commandPool        = m_pool;
+	allocate.level              = vk::CommandBufferLevel::ePrimary;
+	allocate.commandBufferCount = static_cast<uint32_t>(GrowStep);
+	EXIT_IF(m_graphics.device.allocateCommandBuffers(&allocate, m_buffers.data() + first) !=
+	        vk::Result::eSuccess);
+	return first;
+}
+
+vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+	auto       gpu_tick = m_master.KnownGpuTick();
+	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
+		for (size_t index = begin; index < end; ++index) {
+			if (gpu_tick >= m_ticks[index]) {
+				m_ticks[index] = m_master.CurrentTick();
+				return index;
+			}
+		}
+		return std::nullopt;
+	};
+
+	auto found = search(m_hint, m_ticks.size());
+	if (!found) {
+		m_master.Refresh();
+		gpu_tick = m_master.KnownGpuTick();
+		found    = search(m_hint, m_ticks.size());
+	}
+	if (!found) {
+		found = search(0, m_hint);
+	}
+	if (!found) {
+		found           = Grow();
+		m_ticks[*found] = m_master.CurrentTick();
+	}
+
+	m_hint = (*found + 1) % m_ticks.size();
+	return m_buffers[*found];
+}
+
+bool CommandScheduler::InDeferredOperation() noexcept {
+	return g_deferred_callback_scheduler != nullptr;
+}
+
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+    : m_master(graphics), m_side(graphics), m_context(context), m_graphics(graphics),
+      m_command_pool(graphics, m_master), m_side_pool(graphics, m_master), m_command(*this),
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	// Run-time descriptor variants need the image heap's global map, which the heap no longer has
+	// since upstream made heap elements shared across tables: no program is learned.
+	ShaderRecompiler::IR::SetRuntimeLearning(false);
+	const char* async_submit = std::getenv("KYTY_ASYNC_SUBMIT");
+	m_async_submit           = async_submit == nullptr || async_submit[0] != '0';
+}
+
+bool CommandScheduler::EarlyComputeEnabled() const noexcept {
+	static const char* setting = std::getenv("KYTY_EARLY_COMPUTE"); // 0 turns it off.
+	return SideAvailable() && !(setting != nullptr && setting[0] == '0');
+}
+
+CommandScheduler::~CommandScheduler() {
+	Shutdown();
+}
+
+void CommandScheduler::Shutdown() {
+	{
+		std::unique_lock lock(m_operation_mutex);
+		if (m_operation_state == OperationState::Closed) {
+			return;
+		}
+		if (g_deferred_callback_scheduler == this) {
+			EXIT_IF(m_operation_state == OperationState::Open);
+			// A priority callback cannot join its own runner, while a normal callback can be
+			// executing inside the shutdown owner's final PopPendingOperations. The owning
+			// thread will finish shutdown after this callback returns.
+			return;
+		}
+		if (m_operation_state == OperationState::Draining) {
+			m_operation_available.wait(
+			    lock, [this] { return m_operation_state == OperationState::Closed; });
+			return;
+		}
+		m_operation_state = OperationState::Draining;
+	}
+	if (!m_command.IsInvalid()) {
+		Submit();
+	}
+	m_master.Wait(CurrentTick() - 1);
+	PopPendingOperations();
+	DrainPriorityOperations();
+	m_priority_thread.request_stop();
+	m_operation_available.notify_all();
+	if (m_priority_thread.joinable()) {
+		m_priority_thread.join();
+	}
+	{
+		std::lock_guard lock(m_operation_mutex);
+		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
+		        m_priority_active_tick != 0);
+		m_operation_state = OperationState::Closed;
+	}
+	m_operation_available.notify_all();
+}
+
+void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config,
+                             HW::Shader& shaders) {
+	{
+		std::lock_guard lock(m_operation_mutex);
+		EXIT_IF(m_operation_state != OperationState::Open);
+	}
+	m_command.Bind(registers, user_config, shaders);
+
+	if (m_command.IsInvalid()) {
+		BeginNext();
+	}
+}
+
+void CommandScheduler::Flush() {
+	SubmitInfo submit;
+	Flush(submit);
+}
+
+void CommandScheduler::Flush(SubmitInfo& submit) {
+	m_context.GetBufferCache().RecordEagerDownloads();
+	Submit(submit);
+	BeginNext();
+}
+
+void CommandScheduler::Finish() {
+	CheckActive();
+	if (!m_command.IsInvalid()) {
+		Submit();
+	}
+	SubmitQueuedUpTo(UINT64_MAX);
+	m_master.Wait(CurrentTick() - 1);
+	BeginNext();
+	PopPendingOperations();
+}
+
+void CommandScheduler::SubmitToQueue(const SubmitInfo& submit, vk::CommandBuffer buffer, uint64_t tick) {
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+	timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+	timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+	timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext                = &timeline_info;
+	submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+	submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+	submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+	submit_info.commandBufferCount   = 1;
+	submit_info.pCommandBuffers      = &buffer;
+	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		result = m_graphics.queue.submit(1, &submit_info, nullptr);
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	if (result != vk::Result::eSuccess) {
+		ReportDeviceLoss(m_graphics, "submit", static_cast<int>(result));
+		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
+	}
+}
+
+// Printed once: the case in which the submit worker must not take a batch.
+static void NoteSubmitHeldBack() {
+	static std::atomic_flag noted;
+	if (!noted.test_and_set()) {
+		Log::WriteToConsoleAndLog("CommandScheduler: submit worker held back while a waiting thread "
+		                          "submits an earlier batch (queue kept in tick order)\n");
+	}
+}
+
+void CommandScheduler::SubmitThread(std::stop_token stop) {
+	for (;;) {
+		QueuedSubmit item;
+		{
+			std::unique_lock lock(m_submit_mutex);
+			// Only one thread submits at a time. A batch taken here while a waiting thread is still
+			// submitting an earlier one could reach the queue first; the timeline semaphore would
+			// then be signalled with a lower value after a higher one and waits on it never end.
+			m_submit_changed.wait(lock, stop, [this] {
+				if (m_submits.empty()) {
+					return false;
+				}
+				if (m_submit_busy) {
+					NoteSubmitHeldBack();
+					return false;
+				}
+				return true;
+			});
+			if (m_submits.empty() || m_submit_busy) {
+				return;
+			}
+			item = m_submits.front();
+			m_submits.pop_front();
+			m_submit_busy = true;
+		}
+		SubmitToQueue(item.info, item.buffer, item.tick);
+		{
+			std::lock_guard lock(m_submit_mutex);
+			m_submit_busy = false;
+		}
+		m_submit_changed.notify_all();
+	}
+}
+
+// A wait on a queued batch submits it on the waiting thread instead of waiting for the worker.
+void CommandScheduler::SubmitQueuedUpTo(uint64_t tick) {
+	if (!m_submit_thread.joinable()) {
+		return;
+	}
+	std::unique_lock lock(m_submit_mutex);
+	for (;;) {
+		if (m_submit_busy) {
+			m_submit_changed.wait(lock, [this] { return !m_submit_busy; });
+			continue;
+		}
+		if (m_submits.empty() || m_submits.front().tick > tick) {
+			return;
+		}
+		const auto item = m_submits.front();
+		m_submits.pop_front();
+		m_submit_busy = true;
+		lock.unlock();
+		SubmitToQueue(item.info, item.buffer, item.tick);
+		lock.lock();
+		m_submit_busy = false;
+		m_submit_changed.notify_all();
+	}
+}
+
+void CommandScheduler::DrainSubmits() {
+	if (!m_submit_thread.joinable()) {
+		return;
+	}
+	std::unique_lock lock(m_submit_mutex);
+	m_submit_changed.wait(lock, [this] { return m_submits.empty() && !m_submit_busy; });
+}
+
+void CommandScheduler::Wait(uint64_t tick) {
+	EXIT_IF(tick > CurrentTick());
+	EXIT_IF(m_in_side && tick == CurrentTick());
+	if (tick == CurrentTick()) {
+		CheckActive();
+		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
+		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
+		// resources are released only at the next GPU operation boundary.
+		const auto submitted_tick = Submit();
+		EXIT_IF(submitted_tick != tick);
+		SubmitQueuedUpTo(tick);
+		m_master.Wait(tick);
+		BeginNext();
+	} else {
+		SubmitQueuedUpTo(tick);
+		m_master.Wait(tick);
+	}
+}
+
+void CommandScheduler::PopPendingOperations() {
+	m_master.Refresh();
+	for (;;) {
+		PendingOperation operation;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			if (m_pending_operations.empty() ||
+			    !m_master.IsFree(m_pending_operations.front().tick)) {
+				return;
+			}
+			operation = std::move(m_pending_operations.front());
+			m_pending_operations.pop();
+		}
+		WaitPriorityOperations(operation.tick);
+		RunOperation(std::move(operation.callback));
+	}
+}
+
+void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
+	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+	QueueOperation(std::move(operation), true);
+}
+
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
+	CheckActive();
+	EXIT_IF(!operation);
+	std::unique_lock lock(m_operation_mutex);
+	if (m_operation_state == OperationState::Open) {
+		auto& queue = priority ? m_priority_operations : m_pending_operations;
+		queue.push({std::move(operation), CurrentTick()});
+		lock.unlock();
+		if (priority) {
+			m_operation_available.notify_one();
+		}
+		return;
+	}
+	if (g_deferred_callback_scheduler != this) {
+		m_operation_available.wait(lock,
+		                           [this] { return m_operation_state == OperationState::Closed; });
+	}
+	lock.unlock();
+	operation();
+}
+
+bool CommandScheduler::HasPendingPriorityOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	return !m_priority_operations.empty() || m_priority_active_tick != 0;
+}
+
+void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	while (!stop.stop_requested()) {
+		PendingOperation operation;
+		{
+			std::unique_lock lock(m_operation_mutex);
+			m_operation_available.wait(lock, [this, &stop] {
+				return stop.stop_requested() || !m_priority_operations.empty();
+			});
+			if (stop.stop_requested()) {
+				return;
+			}
+			operation = std::move(m_priority_operations.front());
+			m_priority_operations.pop();
+			m_priority_active_tick = operation.tick;
+		}
+		m_master.Wait(operation.tick);
+		if (!stop.stop_requested()) {
+			RunOperation(std::move(operation.callback));
+		}
+		{
+			std::lock_guard lock(m_operation_mutex);
+			m_priority_active_tick = 0;
+		}
+		m_operation_available.notify_all();
+	}
+}
+
+void CommandScheduler::DrainPriorityOperations() {
+	EXIT_IF(g_deferred_callback_scheduler == this);
+	std::unique_lock lock(m_operation_mutex);
+	m_operation_available.wait(
+	    lock, [this] { return m_priority_operations.empty() && m_priority_active_tick == 0; });
+}
+
+void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
+	EXIT_IF(g_deferred_callback_scheduler == this);
+	std::unique_lock lock(m_operation_mutex);
+	m_operation_available.wait(lock, [this, tick] {
+		const bool active_before_or_at =
+		    m_priority_active_tick != 0 && m_priority_active_tick <= tick;
+		const bool queued_before_or_at =
+		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
+		return !active_before_or_at && !queued_before_or_at;
+	});
+}
+
+void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
+	auto* previous                = g_deferred_callback_scheduler;
+	g_deferred_callback_scheduler = this;
+	operation();
+	g_deferred_callback_scheduler = previous;
+}
+
+bool CommandScheduler::IsFree(uint64_t tick) {
+	if (m_master.IsFree(tick)) {
+		return true;
+	}
+	m_master.Refresh();
+	return m_master.IsFree(tick);
+}
+
+void CommandScheduler::CheckActive() const {
+	EXIT_IF(!Active());
+}
+
+CommandBuffer& CommandScheduler::Current() {
+	EXIT_IF(m_command.IsInvalid());
+	return m_command;
+}
+
+CommandBuffer& CommandScheduler::BeginCommand() {
+	EXIT_IF(!m_command.IsInvalid());
+	m_command.m_buffer = m_command_pool.Commit();
+	m_command.Begin();
+	m_dynamic_state.Invalidate();
+	return m_command;
+}
+
+void CommandScheduler::BeginSide() {
+	EXIT_IF(m_in_side || !SideAvailable() || m_command.IsInvalid());
+	m_command.EndRendering();
+	m_main_buffer      = m_command.m_buffer;
+	m_command.m_buffer = m_side_pool.Commit();
+	m_command.Begin();
+	m_in_side = true;
+}
+
+uint64_t CommandScheduler::SubmitSide() {
+	EXIT_IF(!m_in_side);
+	m_command.End();
+	const auto buffer = m_command.m_buffer;
+	m_command.m_buffer = m_main_buffer;
+	m_main_buffer      = nullptr;
+	m_in_side          = false;
+
+	const uint64_t value = m_side.NextTick();
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.signalSemaphoreValueCount = 1;
+	timeline_info.pSignalSemaphoreValues    = &value;
+	const auto semaphore = m_side.Handle();
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext                = &timeline_info;
+	submit_info.commandBufferCount   = 1;
+	submit_info.pCommandBuffers      = &buffer;
+	submit_info.signalSemaphoreCount = 1;
+	submit_info.pSignalSemaphores    = &semaphore;
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.side_queue_mutex);
+		result = m_graphics.side_queue.submit(1, &submit_info, nullptr);
+	}
+	if (result != vk::Result::eSuccess) {
+		ReportDeviceLoss(m_graphics, "side submit", static_cast<int>(result));
+		EXIT("vkQueueSubmit (side) failed: %s\n", vk::to_string(result).c_str());
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	m_side_wait = value;
+	return value;
+}
+
+uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	EXIT_IF(m_in_side);
+	if (m_side_wait != 0) {
+		submit.AddWait(m_side.Handle(), m_side_wait, vk::PipelineStageFlagBits::eAllCommands);
+		m_side_wait = 0;
+	}
+	EXIT_IF(m_command.IsInvalid());
+
+	m_command.End();
+	const auto buffer   = m_command.m_buffer;
+	auto&      graphics = m_graphics;
+	EXIT_IF(graphics.queue == nullptr);
+
+	const uint64_t tick = m_master.NextTick();
+	submit.AddSignal(m_master.Handle(), tick);
+	// The GPU thread hands its batches to the submit worker: vkQueueSubmit costs it ~28 us each.
+	if (m_async_submit && GuestGpu::IsGpuThread()) {
+		if (!m_submit_thread.joinable()) {
+			m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+		}
+		{
+			std::lock_guard lock(m_submit_mutex);
+			m_submits.push_back({submit, buffer, tick});
+		}
+		m_submit_changed.notify_all();
+	} else {
+		DrainSubmits();
+		SubmitToQueue(submit, buffer, tick);
+	}
+	m_command.m_buffer = nullptr;
+	return tick;
+}
+
+void CommandScheduler::BeginNext() {
+	CheckActive();
+	BeginCommand();
+}
+
+} // namespace Libs::Graphics
