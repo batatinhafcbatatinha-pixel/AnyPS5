@@ -150,34 +150,38 @@ bool CopyOpened(uint64_t address, void* data, uint64_t bytes, bool write) {
 	const auto      begin     = address & ~(PageBytes - 1);
 	const auto      end       = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
 	std::vector<std::pair<uint64_t, DWORD>> reduced;
+	const auto restore = [&] {
+		for (const auto& [opened, protection]: reduced) {
+			(void)Protect(opened, PageBytes, protection);
+		}
+	};
 	for (uint64_t page = begin; page < end; page += PageBytes) {
 		MEMORY_BASIC_INFORMATION memory {};
 		if (VirtualQuery(reinterpret_cast<void*>(page), &memory, sizeof(memory)) == 0 ||
 		    memory.State != MEM_COMMIT) {
+			restore();
 			return false;
 		}
 		if (const auto found = originals.find(page); found != originals.end()) {
-			reduced.emplace_back(page, memory.Protect);
 			if (!Protect(page, PageBytes, write ? PAGE_READWRITE : found->second)) {
+				restore();
 				return false;
 			}
+			reduced.emplace_back(page, memory.Protect);
 		} else if (write ? (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
 		                                      PAGE_EXECUTE_WRITECOPY)) == 0
 		                 : (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-			for (const auto& [opened, protection]: reduced) {
-				(void)Protect(opened, PageBytes, protection);
-			}
+			restore();
 			return false;
 		}
 	}
+	// `data` is host memory (staging): a guest page there would fault into this mutex.
 	if (write) {
 		std::memcpy(reinterpret_cast<void*>(address), data, bytes);
 	} else {
 		std::memcpy(data, reinterpret_cast<const void*>(address), bytes);
 	}
-	for (const auto& [opened, protection]: reduced) {
-		(void)Protect(opened, PageBytes, protection);
-	}
+	restore();
 	return true;
 }
 

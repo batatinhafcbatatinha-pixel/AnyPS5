@@ -358,10 +358,11 @@ public:
                 const auto lead = found->second.offset % 0x10000u;
                 auto* view = static_cast<unsigned char*>(map(section.handle, GetCurrentProcess(), nullptr, found->second.offset - lead, lead + found->second.viewBytes, 0, PAGE_READWRITE, nullptr, 0));
                 if (view == nullptr) return false;
-                host = section.hostViews.emplace(found->second.offset, view + lead).first;
+                host = section.hostViews.emplace(found->second.offset, std::pair{view + lead, found->second.viewBytes}).first;
             }
-            if (write) std::memcpy(host->second + within, cursor, count);
-            else std::memcpy(cursor, host->second + within, count);
+            if (within + count > host->second.second) return false;
+            if (write) std::memcpy(host->second.first + within, cursor, count);
+            else std::memcpy(cursor, host->second.first + within, count);
             cursor += count;
             address += count;
             bytes -= count;
@@ -1096,12 +1097,12 @@ private:
     };
     struct Section {
         HANDLE handle;
-        std::map<std::uint64_t, unsigned char*> hostViews;
+        std::map<std::uint64_t, std::pair<unsigned char*, std::size_t>> hostViews;
         explicit Section(HANDLE handle) : handle(handle) {}
         Section(const Section&) = delete;
         Section& operator=(const Section&) = delete;
         ~Section() {
-            for (const auto& [offset, view] : hostViews) UnmapViewOfFile(view - offset % 0x10000u);
+            for (const auto& [offset, view] : hostViews) UnmapViewOfFile(view.first - offset % 0x10000u);
             CloseHandle(handle);
         }
     };

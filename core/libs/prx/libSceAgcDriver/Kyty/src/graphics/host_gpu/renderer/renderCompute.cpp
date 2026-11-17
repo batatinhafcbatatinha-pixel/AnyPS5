@@ -290,7 +290,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 			size *= count;
 		}
 	}
-	bindings.shared_memory = {storage.Handle(), 0, size};
+	bindings.shared_memory = vk::DescriptorBufferInfo{storage.Handle(), 0, size};
 }
 
 static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,

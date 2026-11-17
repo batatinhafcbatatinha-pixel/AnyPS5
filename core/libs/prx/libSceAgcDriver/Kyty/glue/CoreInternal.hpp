@@ -20,6 +20,8 @@ namespace AgcDriver::VramBackend::Internal {
 Libs::Graphics::RenderContext* Renderer();
 Libs::Graphics::GraphicContext& Graphics();
 
+struct Frame;
+
 // Frames copied from display buffers on the GPU thread and shown by the presenter thread.
 class Presenter {
 public:
@@ -38,6 +40,7 @@ public:
 
 private:
 	struct Impl;
+	void Store(void* key, std::unique_ptr<Frame> frame);
 	std::unique_ptr<Impl> m_impl;
 };
 
