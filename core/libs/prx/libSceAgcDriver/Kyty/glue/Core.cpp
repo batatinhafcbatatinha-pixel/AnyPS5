@@ -1,0 +1,301 @@
+// Lifecycle of the KytyPS5 GPU stack inside AnyPS5's libSceAgcDriver: device creation, the guest
+// GPU thread, command submission and the video-out bridge the stack calls at flips.
+
+#include "glue/Core.hpp"
+#include "glue/CoreInternal.hpp"
+#include "glue/VulkanDevice.hpp"
+
+#include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/videoOut.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "libs/errno.h"
+
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/HostFault.hpp"
+
+#include <windows.h>
+
+#include <atomic>
+#include <mutex>
+#include <span>
+
+namespace AgcDriver::VramBackend {
+
+namespace {
+
+std::recursive_mutex                          g_mutex;
+Libs::Graphics::GraphicContext                g_graphics;
+std::unique_ptr<Libs::Graphics::RenderContext> g_renderer;
+std::unique_ptr<Libs::VideoOut::VideoOutDriver> g_video_out;
+std::unique_ptr<Internal::Presenter>          g_presenter;
+std::atomic<Libs::Graphics::RenderContext*>    g_published {nullptr};
+HMODULE                                       g_vulkan = nullptr;
+
+bool FaultThunk(void* exception_pointers) noexcept {
+	return Core::HandleFault(exception_pointers);
+}
+
+void MappedThunk(std::uintptr_t address, std::size_t bytes) {
+	Core::NoteMapped(address, bytes);
+}
+
+void ReleasedThunk(std::uintptr_t address, std::size_t bytes) {
+	Core::NoteReleased(address, bytes);
+}
+
+void HostWriteThunk(std::uintptr_t address, std::size_t bytes) {
+	Core::NoteHostWrite(address, bytes);
+}
+
+void HostReadThunk(std::uintptr_t address, std::size_t bytes) {
+	Core::NoteHostRead(address, bytes);
+}
+
+// SRT-walker loads of the current guest word without touching a protected page (KytyPS5
+// src/kernel/memory.cpp WalkerFastLoad, commit 3a7d8030).
+uint64_t WalkerFastLoad(uint64_t vaddr) {
+	auto* renderer = g_published.load(std::memory_order_acquire);
+	uint32_t value = 0;
+	if ((vaddr & 3u) != 0 || renderer == nullptr || !Libs::Graphics::GuestGpu::IsGpuThread() ||
+	    !renderer->GetBufferCache().TryCurrentWalkerLoad(vaddr, value)) {
+		return 0;
+	}
+	return (uint64_t {1} << 32u) | value;
+}
+
+vk::SurfaceKHR CreateSurface(const WindowDesc& window) {
+	if (window.createSurface == nullptr || window.context == nullptr) {
+		return nullptr;
+	}
+	const auto handle = window.createSurface(
+	    window.context, static_cast<void*>(static_cast<VkInstance>(g_graphics.instance)));
+	return vk::SurfaceKHR(reinterpret_cast<VkSurfaceKHR>(handle));
+}
+
+// The guest arena and the relinked executable: every range the GPU may be handed.
+void MapGuestRanges(Libs::Graphics::RenderContext& renderer) {
+	std::uintptr_t base  = 0;
+	std::size_t    bytes = 0;
+	GuestArena::GuestArenaRange_nid_postfix(&base, &bytes);
+	const auto lower = std::min<uint64_t>(base + bytes, Libs::Graphics::LOWER_ADDRESS_SIZE);
+	if (base != 0 && lower > base) {
+		renderer.MapMemory(base, lower - base);
+	}
+	const auto* image = reinterpret_cast<const std::byte*>(GetModuleHandleW(nullptr));
+	const auto* dos   = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
+	const auto* nt    = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+	const auto  start = reinterpret_cast<uint64_t>(image);
+	const auto  size  = static_cast<uint64_t>(nt->OptionalHeader.SizeOfImage);
+	if (Libs::Graphics::GuestRange {start, size}.Valid()) {
+		renderer.MapMemory(start, size);
+	}
+}
+
+} // namespace
+
+namespace Internal {
+
+Libs::Graphics::RenderContext* Renderer() {
+	return g_published.load(std::memory_order_acquire);
+}
+
+Libs::Graphics::GraphicContext& Graphics() {
+	return g_graphics;
+}
+
+Presenter* CurrentPresenter() {
+	return g_presenter.get();
+}
+
+} // namespace Internal
+
+bool Core::Started() {
+	return g_published.load(std::memory_order_acquire) != nullptr;
+}
+
+void Core::Start(const WindowDesc* window) {
+	std::lock_guard lock(g_mutex);
+	if (g_renderer != nullptr) {
+		return;
+	}
+	Common::InitializeThreads();
+	g_vulkan = LoadLibraryW(L"vulkan-1.dll");
+	if (g_vulkan == nullptr) {
+		Host::Fail("the Vulkan loader vulkan-1.dll is missing");
+	}
+	const auto get_instance_proc_addr =
+	    reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(g_vulkan, "vkGetInstanceProcAddr"));
+	if (get_instance_proc_addr == nullptr) {
+		Host::Fail("vulkan-1.dll exports no vkGetInstanceProcAddr");
+	}
+	const std::span<const char* const> extensions =
+	    window != nullptr && window->extensions != nullptr
+	        ? std::span<const char* const>(window->extensions, window->extensionCount)
+	        : std::span<const char* const> {};
+	Libs::Graphics::CreateBackendInstance(g_graphics, get_instance_proc_addr, extensions);
+	const auto surface = window != nullptr ? CreateSurface(*window) : vk::SurfaceKHR {};
+	Libs::Graphics::CreateBackendDevice(g_graphics, surface);
+	g_renderer  = std::make_unique<Libs::Graphics::RenderContext>(g_graphics);
+	g_presenter = std::make_unique<Internal::Presenter>(*g_renderer);
+	if (surface != nullptr) {
+		g_presenter->AttachSurface(surface, window->context);
+	}
+	g_video_out = std::make_unique<Libs::VideoOut::VideoOutDriver>();
+	MapGuestRanges(*g_renderer);
+	Libs::Graphics::ShaderRecompiler::IR::SetWalkerFastLoad(&WalkerFastLoad);
+	g_published.store(g_renderer.get(), std::memory_order_release);
+	GuestArena::GuestArenaSetAccessObserver_nid_postfix(&MappedThunk);
+	GuestArena::GuestArenaSetReleaseObserver_nid_no_patch(&ReleasedThunk);
+	GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&HostWriteThunk);
+	GuestArena::GuestArenaSetHostReadHook_nid_no_patch(&HostReadThunk);
+	LibcSetGpuFaultHandler_nid_no_patch(&FaultThunk);
+	g_renderer->InitializeGpu(g_video_out.get());
+	Log::WriteToConsoleAndLog("libSceAgcDriver: VRAM-resident GPU backend (KytyPS5 renderer) started\n");
+}
+
+void Core::AttachWindow(const WindowDesc& window) {
+	std::lock_guard lock(g_mutex);
+	if (g_renderer == nullptr) {
+		Start(&window);
+		return;
+	}
+	g_presenter->AttachSurface(CreateSurface(window), window.context);
+}
+
+void Core::Submit(std::uint32_t queue, const std::uint32_t* commands, std::uint32_t dwords) {
+	if (!Started()) {
+		Start(nullptr);
+	}
+	if (commands == nullptr || dwords == 0) {
+		return;
+	}
+	auto& gpu = g_published.load(std::memory_order_acquire)->GetGpu();
+	const std::span<const std::uint32_t> words(commands, dwords);
+	if (queue == 0) {
+		gpu.Submit(words);
+	} else {
+		gpu.SubmitCompute(queue, words);
+	}
+}
+
+void Core::SuspendPoint() {
+	if (Started()) {
+		g_published.load(std::memory_order_acquire)->GetGpu().SuspendPoint();
+	}
+}
+
+void Core::WaitIdle() {
+	if (Started()) {
+		g_published.load(std::memory_order_acquire)->GetGpu().WaitForIdle();
+	}
+}
+
+void Core::Shutdown() {
+	std::lock_guard lock(g_mutex);
+	if (g_renderer == nullptr) {
+		return;
+	}
+	LibcSetGpuFaultHandler_nid_no_patch(nullptr);
+	GuestArena::GuestArenaSetAccessObserver_nid_postfix(nullptr);
+	GuestArena::GuestArenaSetReleaseObserver_nid_no_patch(nullptr);
+	GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
+	GuestArena::GuestArenaSetHostReadHook_nid_no_patch(nullptr);
+	g_renderer->ShutdownGpu();
+	g_presenter.reset();
+	g_published.store(nullptr, std::memory_order_release);
+	Libs::Graphics::ShaderRecompiler::IR::SetWalkerFastLoad(nullptr);
+	g_renderer.reset();
+	g_video_out.reset();
+	Libs::Graphics::DestroyBackendDevice(g_graphics);
+}
+
+void Core::Present(const WindowDesc& window, void* key, bool hasBuffer, bool opaque,
+                   void (*gpuReady)(void*), void* context) {
+	if (auto* presenter = g_presenter.get(); presenter != nullptr && Started()) {
+		presenter->Present(window, hasBuffer ? key : nullptr, opaque);
+	}
+	gpuReady(context);
+}
+
+void Core::ReleaseWindow(void* window) {
+	std::lock_guard lock(g_mutex);
+	if (g_presenter != nullptr) {
+		g_presenter->ReleaseWindow(window);
+	}
+}
+
+} // namespace AgcDriver::VramBackend
+
+namespace Libs::VideoOut {
+
+// AnyPS5: the flip queue, buffer reuse and vblank pacing stay in libSceVideoOut; the stack only
+// reserves flips, copies their display buffers and reports when the copies completed.
+struct VideoOutDriver::Impl {};
+
+VideoOutDriver::VideoOutDriver(): m_impl(std::make_unique<Impl>()) {}
+
+VideoOutDriver::~VideoOutDriver() = default;
+
+int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, int index,
+                                      int flip_mode, int64_t flip_arg, uint64_t& request_id) {
+	namespace Bridge = AgcDriver::VramBackend;
+	Bridge::DisplayDesc display {};
+	bool                has_display = false;
+	if (!Bridge::Host::ReserveFlip(static_cast<uint32_t>(handle), index,
+	                               static_cast<uint32_t>(flip_mode), flip_arg, &request_id, &display,
+	                               &has_display)) {
+		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+	}
+	auto* presenter = Bridge::Internal::CurrentPresenter();
+	auto* key       = Bridge::Host::FlipKey(request_id);
+	if (has_display) {
+		presenter->PrepareFrame(buffer, key, display);
+	} else {
+		presenter->PrepareBlank(key);
+	}
+	return OK;
+}
+
+void VideoOutDriver::PrepareFlip(uint64_t /*request_id*/, Graphics::CommandBuffer& /*buffer*/) {}
+
+void VideoOutDriver::CompleteFlip(uint64_t request_id) {
+	AgcDriver::VramBackend::Host::CompleteFlip(request_id);
+}
+
+void VideoOutDriver::WaitForSubmitSlot(int handle) {
+	AgcDriver::VramBackend::Host::WaitForFlipRoom(static_cast<uint32_t>(handle));
+}
+
+void VideoOutDriver::WaitFlipDone(const uint64_t* /*label*/) {
+	// AnyPS5's libSceAgc emits its own rendering-wait packet (RenderingWait below) instead.
+}
+
+bool VideoOutDriver::TakeEopFlip(uint32_t token, Graphics::CommandBuffer& buffer, uint64_t& request_id) {
+	namespace Bridge = AgcDriver::VramBackend;
+	Bridge::DisplayDesc display {};
+	bool                has_display = false;
+	if (!Bridge::Host::TakeEopFlip(token, &request_id, &display, &has_display)) {
+		return false;
+	}
+	auto* presenter = Bridge::Internal::CurrentPresenter();
+	auto* key       = Bridge::Host::FlipKey(request_id);
+	if (has_display) {
+		presenter->PrepareFrame(buffer, key, display);
+	} else {
+		presenter->PrepareBlank(key);
+	}
+	return true;
+}
+
+void VideoOutDriver::RenderingWait(uint32_t handle, uint32_t index) {
+	AgcDriver::VramBackend::Host::RenderingWait(handle, index);
+}
+
+} // namespace Libs::VideoOut

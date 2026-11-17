@@ -1,3 +1,4 @@
+#include "prx/libc/include/GpuBackend.hpp"
 #include "prx/libc/include/general/LogMacros.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
@@ -3032,7 +3033,7 @@ void Driver::RegisterShader(const Shader* shader) {
 }
 
 extern "C" AgcDriver::DriverDetail::ShaderPreparationTransaction* AgcDriverBeginShaderPreparation_nid_postfix(const Shader* const* shaders, std::size_t count) {
-    AgcDriver::DriverDetail::Driver::Get().SettleShaderPreparations({shaders, count});
+    if (!GpuBackend::VramResident()) AgcDriver::DriverDetail::Driver::Get().SettleShaderPreparations({shaders, count});
     return new AgcDriver::DriverDetail::ShaderPreparationTransaction();
 }
 

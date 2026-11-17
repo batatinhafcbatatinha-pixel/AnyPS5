@@ -1098,6 +1098,27 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	GetScheduler().Flush();
 }
 
+bool CommandProcessor::EopFlip(uint32_t token) {
+	constexpr uint32_t EOP_FLIP_TOKEN_BASE = 0x04000000u;
+	if (IsAsyncComputeQueue() || token < EOP_FLIP_TOKEN_BASE) {
+		return false;
+	}
+	WriteBackImages();
+	m_renderer.GetOcclusionQueries().Publish();
+	uint64_t request = 0;
+	if (!m_renderer.GetVideoOut().TakeEopFlip(token, CurrentBuffer(), request)) {
+		return false;
+	}
+	GetScheduler().DeferPriorityOperation(
+	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	return true;
+}
+
+void CommandProcessor::RenderingWait(uint32_t handle, uint32_t index) {
+	BufferFlush();
+	m_renderer.GetVideoOut().RenderingWait(handle, index);
+}
+
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
