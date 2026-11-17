@@ -3,6 +3,13 @@
 
 #include <cstdint>
 
+namespace Libs::Graphics {
+
+// Command buffer dumps (KytyPS5 --graphics-debug-dump) are not part of AnyPS5.
+inline void GraphicsDbgDumpDcb(const char* /*type*/, uint32_t /*num_dw*/, const uint32_t* /*cmd_buffer*/) {}
+
+} // namespace Libs::Graphics
+
 namespace Libs::Graphics::Gen5 {
 
 // User-config register writes that carry driver data instead of a register value. AnyPS5's

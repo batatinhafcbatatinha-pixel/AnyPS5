@@ -7,6 +7,7 @@
 // src/graphics/presentation/window/swapchain.cpp and videoOut.cpp (commit 3a7d8030, GPL-2.0).
 
 #include "glue/CoreInternal.hpp"
+#include "glue/VulkanDevice.hpp"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -29,13 +30,17 @@ namespace AgcDriver::VramBackend::Internal {
 
 using namespace Libs::Graphics;
 
-namespace {
-
 struct Frame {
 	VulkanImage image;
 	bool        blank        = false;
 	uint64_t    present_tick = 0;
+	uint64_t    sequence     = 0;
 };
+
+namespace {
+
+// Prepared frames whose flip libSceVideoOut dropped (closed output) are never presented.
+constexpr size_t MaxPreparedFrames = 8;
 
 void TransitFrame(vk::CommandBuffer command, VulkanImage& image, vk::ImageLayout layout,
                   vk::AccessFlags2 access, vk::PipelineStageFlags2 stage) {
@@ -111,7 +116,7 @@ bool DisplayImageInfo(const DisplayDesc& display, ImageInfo& info) {
 	info.pixel_format    = pixel_format.format;
 	info.guest_format    = pixel_format.guest_format;
 	info.type            = Prospero::ImageType::kColor2D;
-	info.extent          = {display.width, display.height, 1};
+	info.extent          = vk::Extent3D{display.width, display.height, 1};
 	info.resources       = {1, 1};
 	info.bytes_per_block = pixel_format.bytes_per_element;
 	info.samples         = 1;
@@ -217,6 +222,11 @@ struct Presenter::Impl {
 			return;
 		}
 		present_scheduler.Finish();
+		{
+			// The presentation engine may still wait on the semaphores of the last present.
+			Common::LockGuard queue_lock(graphics.queue_mutex);
+			RequireVulkanSuccess(graphics.queue.waitIdle(), "vkQueueWaitIdle");
+		}
 		for (auto semaphore: acquired) {
 			graphics.device.destroySemaphore(semaphore, nullptr);
 		}
@@ -321,7 +331,9 @@ struct Presenter::Impl {
 	RenderContext&                         renderer;
 	GraphicContext&                        graphics;
 	CommandScheduler                       present_scheduler;
-	std::mutex                             mutex;
+	std::mutex                             mutex;          // pool, prepared
+	std::mutex                             present_mutex;  // surface, swapchain
+	uint64_t                               sequence = 0;
 	std::vector<std::unique_ptr<Frame>>    pool;
 	std::map<void*, std::unique_ptr<Frame>> prepared;
 	vk::SurfaceKHR                         surface = nullptr;
@@ -394,23 +406,39 @@ void Presenter::PrepareFrame(CommandBuffer& command_buffer, void* key, const Dis
 		             vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eTransfer);
 	}
 	frame->blank = false;
+	Store(key, std::move(frame));
+}
+
+void Presenter::Store(void* key, std::unique_ptr<Frame> frame) {
 	std::lock_guard lock(m_impl->mutex);
-	if (auto previous = m_impl->prepared.find(key); previous != m_impl->prepared.end()) {
-		m_impl->pool.push_back(std::move(previous->second));
-		m_impl->prepared.erase(previous);
+	auto&           prepared = m_impl->prepared;
+	frame->sequence          = ++m_impl->sequence;
+	if (auto previous = prepared.find(key); previous != prepared.end()) {
+		if (previous->second->image.image != nullptr) {
+			m_impl->pool.push_back(std::move(previous->second));
+		}
+		prepared.erase(previous);
 	}
-	m_impl->prepared.emplace(key, std::move(frame));
+	while (prepared.size() >= MaxPreparedFrames) {
+		auto oldest = std::min_element(prepared.begin(), prepared.end(), [](const auto& a, const auto& b) {
+			return a.second->sequence < b.second->sequence;
+		});
+		if (oldest->second->image.image != nullptr) {
+			m_impl->pool.push_back(std::move(oldest->second));
+		}
+		prepared.erase(oldest);
+	}
+	prepared.emplace(key, std::move(frame));
 }
 
 void Presenter::PrepareBlank(void* key) {
 	auto frame   = std::make_unique<Frame>();
 	frame->blank = true;
-	std::lock_guard lock(m_impl->mutex);
-	m_impl->prepared[key] = std::move(frame);
+	Store(key, std::move(frame));
 }
 
 void Presenter::AttachSurface(vk::SurfaceKHR surface, void* window) {
-	std::lock_guard lock(m_impl->mutex);
+	std::lock_guard lock(m_impl->present_mutex);
 	m_impl->DestroySwapchain();
 	if (m_impl->surface != nullptr) {
 		m_impl->graphics.instance.destroySurfaceKHR(m_impl->surface, nullptr);
@@ -425,7 +453,7 @@ void Presenter::AttachSurface(vk::SurfaceKHR surface, void* window) {
 }
 
 void Presenter::ReleaseWindow(void* window) {
-	std::lock_guard lock(m_impl->mutex);
+	std::lock_guard lock(m_impl->present_mutex);
 	if (m_impl->window != window) {
 		return;
 	}
@@ -440,8 +468,8 @@ void Presenter::ReleaseWindow(void* window) {
 void Presenter::Present(const WindowDesc& window, void* key, bool opaque) {
 	auto&                  impl = *m_impl;
 	std::unique_ptr<Frame> frame;
-	std::lock_guard        lock(impl.mutex);
 	if (key != nullptr) {
+		std::lock_guard lock(impl.mutex);
 		if (const auto found = impl.prepared.find(key); found != impl.prepared.end()) {
 			frame = std::move(found->second);
 			impl.prepared.erase(found);
@@ -449,9 +477,12 @@ void Presenter::Present(const WindowDesc& window, void* key, bool opaque) {
 	}
 	const auto give_back = [&] {
 		if (frame != nullptr && frame->image.image != nullptr) {
+			std::lock_guard pool_lock(impl.mutex);
 			impl.pool.push_back(std::move(frame));
 		}
 	};
+	// The GPU thread never takes present_mutex: a blocked acquire cannot stall rendering.
+	std::lock_guard present_lock(impl.present_mutex);
 	if (impl.surface == nullptr || window.context != impl.window) {
 		give_back();
 		return;
@@ -471,8 +502,13 @@ void Presenter::Present(const WindowDesc& window, void* key, bool opaque) {
 	const auto slot = impl.frame_index;
 	impl.present_scheduler.Wait(impl.acquired_ticks[slot]);
 	uint32_t   image_index = 0;
+	constexpr uint64_t AcquireTimeoutNs = 100'000'000;
 	const auto acquired    = impl.graphics.device.acquireNextImageKHR(
-        impl.swapchain, std::numeric_limits<uint64_t>::max(), impl.acquired[slot], nullptr, &image_index);
+        impl.swapchain, AcquireTimeoutNs, impl.acquired[slot], nullptr, &image_index);
+	if (acquired == vk::Result::eTimeout || acquired == vk::Result::eNotReady) {
+		give_back();
+		return;
+	}
 	if (acquired != vk::Result::eSuccess && acquired != vk::Result::eSuboptimalKHR) {
 		impl.DestroySwapchain();
 		give_back();
@@ -527,7 +563,7 @@ void Presenter::Present(const WindowDesc& window, void* key, bool opaque) {
 	}
 	impl.frame_index = (impl.frame_index + 1u) % static_cast<uint32_t>(impl.images.size());
 	give_back();
-	if (presented != vk::Result::eSuccess) {
+	if (presented != vk::Result::eSuccess && presented != vk::Result::eSuboptimalKHR) {
 		impl.DestroySwapchain();
 	}
 }

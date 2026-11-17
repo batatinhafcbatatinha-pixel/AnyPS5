@@ -440,7 +440,7 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	// compresses mip 1 through a T# that declares one level).
 	if (base_level >= physical_levels) {
 		const auto mip  = info.MipExtent(base_level);
-		physical.extent = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
+		physical.extent = vk::Extent3D{mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
 		physical_levels = view_levels;
 	}
 	physical.resources.levels = physical_levels;
@@ -627,7 +627,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
 	desc.info.type         = TextureBaseType(type);
-	desc.info.extent       = {width, height, volume ? depth : 1u};
+	desc.info.extent       = vk::Extent3D{width, height, volume ? depth : 1u};
 	desc.info.resources    = {levels, image_layers};
 	desc.info.bytes_per_block =
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
@@ -786,10 +786,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	    program.info.uses_dma ||
 	        program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::BdaPagetable)] != 0);
 	prepared.runtime = &runtime;
-	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
-	prepared.flattened_srt = {};
-	prepared.shader_data_buffer = {};
-	prepared.shared_memory = {};
+	prepared.gds = vk::DescriptorBufferInfo{nullptr, 0, VK_WHOLE_SIZE};
+	prepared.flattened_srt = vk::DescriptorBufferInfo{};
+	prepared.shader_data_buffer = vk::DescriptorBufferInfo{};
+	prepared.shared_memory = vk::DescriptorBufferInfo{};
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
@@ -1169,7 +1169,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						                             ? cache.GetBdaPageTableBuffer()
 						                             : cache.GetFaultBuffer();
 						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
-						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
+						view = vk::DescriptorBufferInfo{bda_buffer->Handle(), 0, bda_buffer->Size()};
 						write.pBufferInfo = &view;
 						break;
 					}

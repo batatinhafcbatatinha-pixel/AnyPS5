@@ -202,18 +202,11 @@ void Core::Shutdown() {
 	if (g_renderer == nullptr) {
 		return;
 	}
-	LibcSetGpuFaultHandler_nid_no_patch(nullptr);
+	// Process exit: the GPU thread stops; the device, caches and presenter stay alive, since the
+	// presenter thread and faulting guest threads may still be inside them.
 	GuestArena::GuestArenaSetAccessObserver_nid_postfix(nullptr);
 	GuestArena::GuestArenaSetReleaseObserver_nid_no_patch(nullptr);
-	GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
-	GuestArena::GuestArenaSetHostReadHook_nid_no_patch(nullptr);
 	g_renderer->ShutdownGpu();
-	g_presenter.reset();
-	g_published.store(nullptr, std::memory_order_release);
-	Libs::Graphics::ShaderRecompiler::IR::SetWalkerFastLoad(nullptr);
-	g_renderer.reset();
-	g_video_out.reset();
-	Libs::Graphics::DestroyBackendDevice(g_graphics);
 }
 
 void Core::Present(const WindowDesc& window, void* key, bool hasBuffer, bool opaque,

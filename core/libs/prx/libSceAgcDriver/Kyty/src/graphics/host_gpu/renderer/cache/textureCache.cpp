@@ -1120,7 +1120,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			const bool depth = image.info.IsDepth();
 			if (depth) {
 				const auto value = clear.color.float32[0];
-				clear.depthStencil = {value, 0u};
+				clear.depthStencil = vk::ClearDepthStencilValue{value, 0u};
 			}
 			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
 			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
@@ -1648,7 +1648,7 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 		attachment.clearValue = *clear;
 	}
 	vk::RenderingInfo rendering {};
-	rendering.renderArea.extent    = {std::max(image.info.extent.width >> level, 1u),
+	rendering.renderArea.extent    = vk::Extent2D{std::max(image.info.extent.width >> level, 1u),
 	                                  std::max(image.info.extent.height >> level, 1u)};
 	rendering.layerCount           = layers;
 	rendering.colorAttachmentCount = 1;
@@ -1975,7 +1975,7 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 	ImageInfo  part   = info;
 	const auto extent = info.MipExtent(first);
 	part.data.size    = size;
-	part.extent       = {extent.width, extent.height, 1};
+	part.extent       = vk::Extent3D{extent.width, extent.height, 1};
 	part.resources    = {count, 1};
 	part.pitch        = std::max(info.pitch >> first, 1u);
 	part.first_tail_level -= std::min(first, info.first_tail_level);

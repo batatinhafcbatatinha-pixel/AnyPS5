@@ -23,7 +23,7 @@ foreach(shaderName IN LISTS agcKytyTilerShaders)
     add_custom_command(
             OUTPUT "${shaderHeader}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${agcKytyGenerated}/gpu_tiler_shaders"
-            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.3 -Os "-I${agcKytyShaders}" -o "${shaderSpv}" "${shaderSource}"
+            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.3 "-I${agcKytyShaders}" -o "${shaderSpv}" "${shaderSource}"
             COMMAND ${CMAKE_COMMAND} -DINPUT=${shaderSpv} -DOUTPUT=${shaderHeader} -DSYMBOL=${shaderSymbol} -P "${agcKytyRoot}/embed_spirv.cmake"
             DEPENDS "${shaderSource}" ${agcKytyTilerIncludes} glslang-standalone
             VERBATIM
@@ -36,7 +36,7 @@ set(faultShaderHeader "${agcKytyGenerated}/gpu_tiler_shaders/fault_buffer_proces
 add_custom_command(
         OUTPUT "${faultShaderHeader}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${agcKytyGenerated}/gpu_tiler_shaders"
-        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.3 -Os -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024 -o "${faultShaderSpv}" "${agcKytyShaders}/fault_buffer_process.comp"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.3 -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024 -o "${faultShaderSpv}" "${agcKytyShaders}/fault_buffer_process.comp"
         COMMAND ${CMAKE_COMMAND} -DINPUT=${faultShaderSpv} -DOUTPUT=${faultShaderHeader} -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${agcKytyRoot}/embed_spirv.cmake"
         DEPENDS "${agcKytyShaders}/fault_buffer_process.comp" glslang-standalone
         VERBATIM
@@ -50,7 +50,7 @@ function(agc_kyty_blit_shader shaderName shaderFile)
     add_custom_command(
             OUTPUT "${shaderHeader}"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${agcKytyGenerated}/gpu_blit_shaders"
-            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.3 -Os ${ARGN} "-I${agcKytyShaders}" -o "${shaderSpv}" "${agcKytyShaders}/${shaderFile}"
+            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.3 ${ARGN} "-I${agcKytyShaders}" -o "${shaderSpv}" "${agcKytyShaders}/${shaderFile}"
             COMMAND ${CMAKE_COMMAND} -DINPUT=${shaderSpv} -DOUTPUT=${shaderHeader} -DSYMBOL=${shaderSymbol} -P "${agcKytyRoot}/embed_spirv.cmake"
             DEPENDS "${agcKytyShaders}/${shaderFile}" "${agcKytyShaders}/gpu_video_out_hdr10_to_sdr.inc" glslang-standalone
             VERBATIM
