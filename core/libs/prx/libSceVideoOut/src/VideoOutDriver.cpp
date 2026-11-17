@@ -182,6 +182,12 @@ public:
         });
         _config->CheckAlive();
     }
+    bool Ready() override {
+        std::unique_lock lock(_config->mutex, std::try_to_lock);
+        if (!lock.owns_lock()) return false;
+        _config->CheckAlive();
+        return _config->failure || _config->Closed() || _config->bufferReuse[_index].IsComplete(_ticket);
+    }
 };
 
 class VideoOutput final : public AgcDriver::IVideoOutput {

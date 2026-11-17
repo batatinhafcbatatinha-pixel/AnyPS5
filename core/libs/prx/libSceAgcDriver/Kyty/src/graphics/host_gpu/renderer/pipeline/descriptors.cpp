@@ -922,6 +922,18 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
+			// AnyPS5: an address outside the guest windows (host memory, or a stale descriptor) is
+			// bound like a null buffer instead of ending the process.
+			if (!GuestRange {address, size}.Valid()) {
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "buffer outside the guest address windows bound as null: 0x{:016x} size 0x{:x}\n",
+					    address, size));
+				}
+				source = {};
+				continue;
+			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 		for (const auto& table: program.info.written_tables) {

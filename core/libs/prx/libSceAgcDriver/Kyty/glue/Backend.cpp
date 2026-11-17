@@ -7,11 +7,15 @@
 
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/GpuBackend.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -28,7 +32,16 @@ struct Registry {
 	std::mutex                                                  mutex;
 	std::map<std::uint32_t, std::shared_ptr<IVideoOutput>>     outputs;
 	std::map<std::uint64_t, std::shared_ptr<IFlipRequest>>     requests;
-	std::map<std::uint32_t, std::pair<FlipInfo, std::uint64_t>> tokens;
+	struct Prepared {
+		std::uint64_t request    = 0;
+		DisplayDesc   display    = {};
+		bool          hasDisplay = false;
+	};
+	std::map<std::uint32_t, std::pair<FlipInfo, Prepared>> tokens;
+	// Flips reserved at submission (on the submitting thread, as the legacy driver), by packet.
+	std::map<const std::uint32_t*, std::deque<Prepared>> flips;
+	// Rendering waits captured at submission, by packet address, in submission order.
+	std::map<const std::uint32_t*, std::deque<std::shared_ptr<IRenderingWait>>> renderingWaits;
 	std::uint64_t                                               nextRequest = 1;
 	std::uint32_t                                               nextToken   = EopFlipTokenBase;
 	std::atomic<std::uint64_t>                                  frames {0};
@@ -60,6 +73,28 @@ std::uint64_t Remember(Registry& registry, std::shared_ptr<IFlipRequest> request
 	const auto id = registry.nextRequest++;
 	registry.requests.emplace(id, std::move(request));
 	return id;
+}
+
+// Reserves on the calling thread (never the GPU thread: libSceVideoOut's locks may be held by a
+// guest thread that waits for the GPU thread) and captures the buffer the flip shows.
+Registry::Prepared ReserveNow(IVideoOutput& output, const FlipInfo& info, bool limited) {
+	auto request = limited ? output.TryReserve(info) : output.Reserve(info);
+	if (request == nullptr) {
+		return {};
+	}
+	Registry::Prepared prepared;
+	Describe(request, &prepared.display, &prepared.hasDisplay);
+	auto&           registry = Get();
+	std::lock_guard lock(registry.mutex);
+	prepared.request = Remember(registry, std::move(request));
+	return prepared;
+}
+
+std::shared_ptr<IVideoOutput> OutputOf(std::uint32_t handle) {
+	auto&           registry = Get();
+	std::lock_guard lock(registry.mutex);
+	const auto      found = registry.outputs.find(handle);
+	return found == registry.outputs.end() ? nullptr : found->second;
 }
 
 // The window's surface callback takes a VkInstance; the stack passes it as a pointer.
@@ -96,6 +131,36 @@ void Submit(const Packet* packet, std::uint32_t queue) {
 	if (packet->flags != 0) {
 		throw std::runtime_error("AGC: nonzero submission flags are not implemented");
 	}
+	// As the legacy driver: a rendering wait waits for the buffer uses known when it is submitted,
+	// not for flips reserved later (an EOP flip reserved after it would deadlock it).
+	const auto* words = packet->addr;
+	for (std::uint32_t cursor = 0; words != nullptr && cursor < packet->dw_num;) {
+		const auto header = words[cursor];
+		if (header == FlipPacketHeader && cursor + FlipPacketWords <= packet->dw_num) {
+			if (auto output = OutputOf(words[cursor + 1])) {
+				const FlipInfo info {words[cursor + 1], static_cast<std::int32_t>(words[cursor + 2]), words[cursor + 3],
+				                     static_cast<std::int64_t>(static_cast<std::uint64_t>(words[cursor + 4]) | (static_cast<std::uint64_t>(words[cursor + 5]) << 32u))};
+				auto prepared = ReserveNow(*output, info, false);
+				auto& registry = Get();
+				std::lock_guard lock(registry.mutex);
+				registry.flips[words + cursor].push_back(prepared);
+			}
+		}
+		if (header == RenderingWaitPacketHeader && cursor + RenderingWaitPacketWords <= packet->dw_num) {
+			auto& registry = Get();
+			std::shared_ptr<IVideoOutput> output;
+			{
+				std::lock_guard lock(registry.mutex);
+				if (const auto found = registry.outputs.find(words[cursor + 1]); found != registry.outputs.end()) output = found->second;
+			}
+			if (output != nullptr) {
+				auto wait = output->CaptureRenderingWait(words[cursor + 2]);
+				std::lock_guard lock(registry.mutex);
+				registry.renderingWaits[words + cursor].push_back(std::move(wait));
+			}
+		}
+		cursor += static_cast<std::uint32_t>(Pm4::PacketWords(header));
+	}
 	Core::Submit(queue, packet->addr, packet->dw_num);
 }
 
@@ -118,6 +183,12 @@ void SubmitFlip(const FlipInfo& info) {
 	words[3]            = info.mode;
 	words[4]            = static_cast<std::uint32_t>(argument);
 	words[5]            = static_cast<std::uint32_t>(argument >> 32u);
+	if (auto output = OutputOf(info.handle)) {
+		auto prepared = ReserveNow(*output, info, false);
+		auto& registry = Get();
+		std::lock_guard lock(registry.mutex);
+		registry.flips[words].push_back(prepared);
+	}
 	Core::Submit(0, words, FlipPacketWords);
 }
 
@@ -146,12 +217,12 @@ std::uint32_t ReserveEopFlip(const FlipInfo& info, std::uint32_t token) {
 			throw EopFlipAlreadyReserved {};
 		}
 	}
-	auto request = output->TryReserve(info);
-	if (!request) {
+	auto prepared = ReserveNow(*output, info, true);
+	if (prepared.request == 0) {
 		return 0;
 	}
 	std::lock_guard lock(registry.mutex);
-	registry.tokens.emplace(token, std::pair {info, Remember(registry, std::move(request))});
+	registry.tokens.emplace(token, std::pair {info, prepared});
 	registry.nextToken = std::max(registry.nextToken, token + 1);
 	if (registry.nextToken > EopFlipTokenLimit) {
 		registry.nextToken = EopFlipTokenBase;
@@ -203,6 +274,10 @@ void ReleaseWindow(void* window) {
 	Core::ReleaseWindow(window);
 }
 
+void RegisterShader(const void* header) {
+	Core::RegisterShader(header);
+}
+
 void SuspendPoint() {
 	Core::SuspendPoint();
 }
@@ -218,45 +293,92 @@ void Shutdown() {
 namespace Host {
 
 bool ReserveFlip(std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument,
-                 std::uint64_t* request, DisplayDesc* display, bool* hasDisplay) {
+                 const std::uint32_t* packet, std::uint64_t* request, DisplayDesc* display, bool* hasDisplay) {
 	auto& registry = Get();
-	std::shared_ptr<IVideoOutput> output;
 	{
 		std::lock_guard lock(registry.mutex);
-		const auto found = registry.outputs.find(handle);
-		if (found == registry.outputs.end()) {
-			Fail("flip references an unregistered video output");
+		if (const auto found = registry.flips.find(packet); packet != nullptr && found != registry.flips.end()) {
+			const auto prepared = found->second.front();
+			found->second.pop_front();
+			if (found->second.empty()) registry.flips.erase(found);
+			if (prepared.request == 0) Fail("flip reservation failed at submission");
+			*request    = prepared.request;
+			*display    = prepared.display;
+			*hasDisplay = prepared.hasDisplay;
+			return true;
 		}
-		output = found->second;
 	}
-	// Back-pressure: the GPU thread stays at most a flip queue ahead of the presenter.
-	output->WaitForFlipRoom();
-	auto reserved = output->Reserve(FlipInfo {handle, index, mode, argument});
-	if (reserved == nullptr) {
+	// A flip not seen at submission (inside an indirect buffer): reserved here.
+	auto output = OutputOf(handle);
+	if (output == nullptr) {
+		Fail("flip references an unregistered video output");
+	}
+	const auto prepared = ReserveNow(*output, FlipInfo {handle, index, mode, argument}, false);
+	if (prepared.request == 0) {
 		Fail("video output returned a null flip reservation");
 	}
-	Describe(reserved, display, hasDisplay);
-	std::lock_guard lock(registry.mutex);
-	*request = Remember(registry, std::move(reserved));
+	*request    = prepared.request;
+	*display    = prepared.display;
+	*hasDisplay = prepared.hasDisplay;
 	return true;
 }
 
 bool TakeEopFlip(std::uint32_t token, std::uint64_t* request, DisplayDesc* display, bool* hasDisplay) {
-	auto&                         registry = Get();
-	std::shared_ptr<IFlipRequest> reserved;
-	{
-		std::lock_guard lock(registry.mutex);
-		const auto      found = registry.tokens.find(token);
-		if (found == registry.tokens.end()) {
-			return false;
-		}
-		*request = found->second.second;
-		registry.tokens.erase(found);
-		reserved = registry.requests.at(*request);
+	auto&           registry = Get();
+	std::lock_guard lock(registry.mutex);
+	const auto      found = registry.tokens.find(token);
+	if (found == registry.tokens.end()) {
+		return false;
 	}
-	Describe(reserved, display, hasDisplay);
+	*request    = found->second.second.request;
+	*display    = found->second.second.display;
+	*hasDisplay = found->second.second.hasDisplay;
+	registry.tokens.erase(found);
 	return true;
 }
+
+// GpuReady takes libSceVideoOut's locks, which a guest thread may hold while it waits for the GPU
+// thread (a fault read-back); the GPU thread in turn waits for Kyty's priority operations. So the
+// completion is handed to a thread of its own instead of running on the priority thread.
+class FlipCompleter {
+public:
+	static FlipCompleter& Get() {
+		static auto* completer = new FlipCompleter;
+		return *completer;
+	}
+	void Push(std::shared_ptr<IFlipRequest> request) {
+		{
+			std::lock_guard lock(mutex);
+			pending.push_back(std::move(request));
+		}
+		changed.notify_one();
+	}
+
+private:
+	FlipCompleter() : worker([this] { Run(); }) { worker.detach(); }
+	void Run() {
+		for (;;) {
+			std::shared_ptr<IFlipRequest> request;
+			{
+				std::unique_lock lock(mutex);
+				changed.wait(lock, [this] { return !pending.empty(); });
+				request = std::move(pending.front());
+				pending.pop_front();
+			}
+			auto frame = std::make_shared<FrameTiming>(++frames);
+			try {
+				request->GpuReady(frame);
+			} catch (...) {
+				request->Fail(std::current_exception());
+			}
+		}
+	}
+	std::mutex                                 mutex;
+	std::condition_variable                    changed;
+	std::deque<std::shared_ptr<IFlipRequest>> pending;
+	std::uint64_t                              frames = 0;
+	std::thread                                worker;
+};
 
 void CompleteFlip(std::uint64_t request) {
 	auto&                         registry = Get();
@@ -270,12 +392,7 @@ void CompleteFlip(std::uint64_t request) {
 		completed = std::move(found->second);
 		registry.requests.erase(found);
 	}
-	auto frame = std::make_shared<FrameTiming>(registry.frames.fetch_add(1, std::memory_order_relaxed) + 1);
-	try {
-		completed->GpuReady(frame);
-	} catch (...) {
-		completed->Fail(std::current_exception());
-	}
+	FlipCompleter::Get().Push(std::move(completed));
 }
 
 void* FlipKey(std::uint64_t request) {
@@ -299,21 +416,35 @@ void WaitForFlipRoom(std::uint32_t handle) {
 	}
 }
 
-void RenderingWait(std::uint32_t handle, std::uint32_t index) {
-	std::shared_ptr<IVideoOutput> output;
+bool RenderingReady(std::uint32_t handle, std::uint32_t index, const std::uint32_t* packet) {
+	auto&                           registry = Get();
+	std::shared_ptr<IRenderingWait> captured;
 	{
-		auto&           registry = Get();
 		std::lock_guard lock(registry.mutex);
-		if (const auto found = registry.outputs.find(handle); found != registry.outputs.end()) {
-			output = found->second;
+		auto            found = registry.renderingWaits.find(packet);
+		if (found == registry.renderingWaits.end()) {
+			// Not seen at submission (inside an indirect buffer): captured now.
+			std::shared_ptr<IVideoOutput> output;
+			if (const auto known = registry.outputs.find(handle); known != registry.outputs.end()) output = known->second;
+			if (output == nullptr) Fail("rendering wait references an unregistered video output");
+			registry.mutex.unlock();
+			auto wait = output->CaptureRenderingWait(index);
+			registry.mutex.lock();
+			found = registry.renderingWaits.find(packet);
+			if (found == registry.renderingWaits.end()) found = registry.renderingWaits.emplace(packet, std::deque<std::shared_ptr<IRenderingWait>> {}).first;
+			found->second.push_front(std::move(wait));
 		}
+		captured = found->second.front();
 	}
-	if (output == nullptr) {
-		Fail("rendering wait references an unregistered video output");
+	if (captured != nullptr && !captured->Ready()) {
+		return false;
 	}
-	if (auto wait = output->CaptureRenderingWait(index)) {
-		wait->Wait();
+	std::lock_guard lock(registry.mutex);
+	if (const auto found = registry.renderingWaits.find(packet); found != registry.renderingWaits.end()) {
+		found->second.pop_front();
+		if (found->second.empty()) registry.renderingWaits.erase(found);
 	}
+	return true;
 }
 
 void DeliverInterrupt(std::uint32_t queue, std::uint32_t context) {

@@ -93,7 +93,8 @@ public:
 	// AnyPS5: a release whose interrupt context is a reserved EOP flip token flips (graphics queue).
 	[[nodiscard]] bool EopFlip(uint32_t token);
 	// AnyPS5: libSceAgcDriver's rendering wait (sceAgcDriverWaitUntilSafeForRendering).
-	void RenderingWait(uint32_t handle, uint32_t index);
+	void RenderingWait(uint32_t handle, uint32_t index, const uint32_t* packet);
+	void FlipPacket(const uint32_t* packet, int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
 	                    uint32_t mode);

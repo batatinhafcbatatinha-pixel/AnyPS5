@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/shader.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "libs/errno.h"
 
@@ -156,6 +157,7 @@ void Core::Start(const WindowDesc* window) {
 	GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&HostWriteThunk);
 	GuestArena::GuestArenaSetHostReadHook_nid_no_patch(&HostReadThunk);
 	LibcSetGpuFaultHandler_nid_no_patch(&FaultThunk);
+	Libs::Graphics::ShaderInit();
 	g_renderer->InitializeGpu(g_video_out.get());
 	Log::WriteToConsoleAndLog("libSceAgcDriver: VRAM-resident GPU backend (KytyPS5 renderer) started\n");
 }
@@ -184,6 +186,28 @@ void Core::Submit(std::uint32_t queue, const std::uint32_t* commands, std::uint3
 	} else {
 		gpu.Submit(words);
 	}
+}
+
+void Core::RegisterShader(const void* header) {
+	// As KytyPS5's AgcCreateShader: the shader map keys programs by their code address.
+	if (header == nullptr) {
+		return;
+	}
+	if (!Started()) {
+		Start(nullptr);
+	}
+	const auto* shader = static_cast<const Libs::Graphics::Shader*>(header);
+	if (shader->code == nullptr || shader->shader_size == 0) {
+		return;
+	}
+	Libs::Graphics::ShaderMappedData map;
+	map.type                = static_cast<Libs::Graphics::Prospero::ShaderBinaryType>(shader->type);
+	map.user_data           = shader->user_data;
+	map.input_semantics     = shader->input_semantics;
+	map.num_input_semantics = shader->num_input_semantics;
+	map.code_size_bytes     = shader->shader_size;
+	map.scratch_size_dwords = shader->scratch_size_dw_per_thread;
+	Libs::Graphics::ShaderMapUserData(reinterpret_cast<uint64_t>(const_cast<const void*>(shader->code)), map);
 }
 
 void Core::SuspendPoint() {
@@ -231,6 +255,10 @@ namespace Libs::VideoOut {
 
 // AnyPS5: the flip queue, buffer reuse and vblank pacing stay in libSceVideoOut; the stack only
 // reserves flips, copies their display buffers and reports when the copies completed.
+namespace {
+thread_local const uint32_t* g_flip_packet = nullptr;
+} // namespace
+
 struct VideoOutDriver::Impl {};
 
 VideoOutDriver::VideoOutDriver(): m_impl(std::make_unique<Impl>()) {}
@@ -243,8 +271,8 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	Bridge::DisplayDesc display {};
 	bool                has_display = false;
 	if (!Bridge::Host::ReserveFlip(static_cast<uint32_t>(handle), index,
-	                               static_cast<uint32_t>(flip_mode), flip_arg, &request_id, &display,
-	                               &has_display)) {
+	                               static_cast<uint32_t>(flip_mode), flip_arg, g_flip_packet,
+	                               &request_id, &display, &has_display)) {
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
 	auto* presenter = Bridge::Internal::CurrentPresenter();
@@ -288,8 +316,12 @@ bool VideoOutDriver::TakeEopFlip(uint32_t token, Graphics::CommandBuffer& buffer
 	return true;
 }
 
-void VideoOutDriver::RenderingWait(uint32_t handle, uint32_t index) {
-	AgcDriver::VramBackend::Host::RenderingWait(handle, index);
+void VideoOutDriver::SetFlipPacket(const uint32_t* packet) {
+	g_flip_packet = packet;
+}
+
+bool VideoOutDriver::RenderingReady(uint32_t handle, uint32_t index, const uint32_t* packet) {
+	return AgcDriver::VramBackend::Host::RenderingReady(handle, index, packet);
 }
 
 } // namespace Libs::VideoOut

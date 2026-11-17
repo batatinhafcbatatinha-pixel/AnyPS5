@@ -359,13 +359,10 @@ static bool CopySparse(uint64_t vaddr, void* data, uint64_t size, bool zero_unma
 		const auto region_end =
 		    std::min(end, reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize);
 		const auto bytes = region_end - vaddr;
-		if (memory.State != MEM_COMMIT) {
-			if (!zero_unmapped) {
-				return false;
-			}
+		// As KytyPS5: gaps (reserved, free or inaccessible guest pages) read as zero.
+		static_cast<void>(zero_unmapped);
+		if (memory.State != MEM_COMMIT || !TryReadBacking(vaddr, out, bytes)) {
 			std::memset(out, 0, bytes);
-		} else if (!TryReadBacking(vaddr, out, bytes)) {
-			return false;
 		}
 		out += bytes;
 		vaddr = region_end;
