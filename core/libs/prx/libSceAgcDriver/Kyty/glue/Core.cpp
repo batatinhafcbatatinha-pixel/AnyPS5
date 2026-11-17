@@ -178,10 +178,11 @@ void Core::Submit(std::uint32_t queue, const std::uint32_t* commands, std::uint3
 	}
 	auto& gpu = g_published.load(std::memory_order_acquire)->GetGpu();
 	const std::span<const std::uint32_t> words(commands, dwords);
-	if (queue == 0) {
-		gpu.Submit(words);
-	} else {
+	// As KytyPS5's libSceAgcDriver: queues 0x20..0x57 are the compute rings, the rest graphics.
+	if (queue >= 0x20 && queue < 0x58) {
 		gpu.SubmitCompute(queue, words);
+	} else {
+		gpu.Submit(words);
 	}
 }
 
