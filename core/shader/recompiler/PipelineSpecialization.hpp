@@ -41,6 +41,8 @@ inline constexpr std::uint32_t DepthRemapBase = 8240u;
 inline constexpr std::uint32_t DepthRemapWords = 1u;
 inline constexpr std::uint32_t WorkgroupOffsetBase = 8241u;
 inline constexpr std::uint32_t WorkgroupOffsetWords = 3u;
+inline constexpr std::uint32_t AtomicLockTableBase = 8244u;
+inline constexpr std::uint32_t AtomicLockTableWords = 2u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 inline constexpr std::uint32_t StoreQuantizeBase = 12288u;
@@ -76,6 +78,10 @@ inline constexpr bool IsFragmentScale(std::uint32_t id) {
 
 inline constexpr bool IsGridScale(std::uint32_t id) {
     return id >= GridScaleBase && id < GridScaleBase + GridScaleWords;
+}
+
+inline constexpr bool IsAtomicLockTable(std::uint32_t id) {
+    return id >= AtomicLockTableBase && id < AtomicLockTableBase + AtomicLockTableWords;
 }
 
 }

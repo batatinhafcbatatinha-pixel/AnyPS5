@@ -405,7 +405,7 @@ std::optional<CachedBufferRange> ObtainCachedBuffer(const Context& context, Reco
     // the range go to guest memory (recorded), queued labels and copied writers refuse, and the
     // read is noted. The import is the upload source.
     bool behind = false;
-    const auto* import = InPlaceDrawInput(context, address, bytes, 1, &behind, true);
+    const auto* import = ForcedInPlaceDrawInput(context, address, bytes, 1, &behind);
     std::lock_guard lock(state.mutex);
     ++state.stats.obtained;
     const auto refuse = [&](std::uint64_t Stats::* counter) -> std::optional<CachedBufferRange> {
@@ -460,7 +460,7 @@ bool MakeResident(const Context& context, Recorder& recorder, std::uint64_t addr
         const auto from = std::max(address, chunkBase);
         const auto to = std::min(end, chunkBase + ChunkBytes);
         bool behind = false;
-        const auto* import = InPlaceDrawInput(context, from, static_cast<std::size_t>(to - from), 1, &behind, true);
+        const auto* import = ForcedInPlaceDrawInput(context, from, static_cast<std::size_t>(to - from), 1, &behind);
         if (import == nullptr && to - from > TablePageBytes) {
             // No one import holds the whole part (two allocations meet in it): page by page.
             for (auto page = from / TablePageBytes * TablePageBytes; page < to; page += TablePageBytes) {

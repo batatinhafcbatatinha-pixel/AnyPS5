@@ -437,6 +437,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     appendKey(keys.vertexInput, state.topology);
     appendKey(keys.vertexInput, state.primitiveRestart);
     appendKey(keys.preRasterization, state.provokingVertexMode);
+    appendKey(keys.preRasterization, ViewportCount(state));
     appendKey(keys.preRasterization, state.polygonMode);
     appendKey(keys.preRasterization, state.lineWidth);
     appendKey(keys.preRasterization, state.negativeOneToOne);
@@ -599,7 +600,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             stages[i].module = _modules[i];
             stages[i].pName = "main";
             if (shaders[i].stage == ShaderRecompiler::ShaderStage::Mesh && context.meshWave32 && shader.hostSubgroupSize == 32u) stages[i].pNext = &meshSubgroup;
-            specializations.emplace_back(shader, state.meshLayerBase, state.meshLayerCount, state.fragmentGuestExtent, state.fragmentHostExtent);
+            specializations.emplace_back(shader, context.atomicLockTable, state.meshLayerBase, state.meshLayerCount, state.fragmentGuestExtent, state.fragmentHostExtent);
             stages[i].pSpecializationInfo = specializations.back().Info();
         }
         if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); })) {
@@ -708,8 +709,9 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         VkPipelineViewportDepthClipControlCreateInfoEXT depthClip{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT};
         depthClip.negativeOneToOne = state.negativeOneToOne;
         if (state.negativeOneToOne) viewports.pNext = &depthClip;
-        viewports.viewportCount = 1;
-        viewports.scissorCount = 1;
+        Require(!patches || state.extraViewports.empty(), "a viewport index through the barycentric patch stages is unsupported");
+        viewports.viewportCount = ViewportCount(state);
+        viewports.scissorCount = ViewportCount(state);
         PipelineLibraryKeys keys;
         libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders);
         std::vector<VkDynamicState> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -1040,12 +1042,34 @@ void Pipeline::Begin(CommandState& recording, const Framebuffer& framebuffer, Vk
     Continue(recording, state, masked, scale);
 }
 
+void Pipeline::setViewports(CommandState& recording, const State& state, const TargetScale* scale) const {
+    if (state.extraViewports.empty()) {
+        recording.SetViewport(context, scale != nullptr ? scale->Viewport(state.viewport) : state.viewport);
+        recording.SetScissor(context, scale != nullptr ? scale->Scissor(state.scissor) : state.scissor);
+        return;
+    }
+    Require(state.viewportScissors.size() == ViewportCount(state), "every viewport needs a scissor");
+    std::array<VkViewport, MaxViewports> viewports{};
+    viewports[0] = state.viewport;
+    std::copy(state.extraViewports.begin(), state.extraViewports.end(), viewports.begin() + 1);
+    const auto count = ViewportCount(state);
+    if (scale == nullptr) {
+        recording.SetViewports(context, std::span(viewports.data(), count), state.viewportScissors);
+        return;
+    }
+    std::array<VkRect2D, MaxViewports> scissors{};
+    for (std::size_t index = 0; index < count; ++index) {
+        viewports[index] = scale->Viewport(viewports[index]);
+        scissors[index] = scale->Scissor(state.viewportScissors[index]);
+    }
+    recording.SetViewports(context, std::span(viewports.data(), count), std::span<const VkRect2D>(scissors.data(), count));
+}
+
 void Pipeline::Continue(CommandState& recording, const State& state, const State* masked, const TargetScale* scale) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     recording.BindPipeline(context, best != VK_NULL_HANDLE ? best : pipeline, dynamicSlots);
-    recording.SetViewport(context, scale != nullptr ? scale->Viewport(state.viewport) : state.viewport);
-    recording.SetScissor(context, scale != nullptr ? scale->Scissor(state.scissor) : state.scissor);
+    setViewports(recording, state, scale);
     setColorWriteMasks(recording, state, masked, false);
     if (state.stencilReplayReference) recording.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
     if (libraries) {
@@ -1100,8 +1124,7 @@ void Pipeline::ContinueBackFaces(CommandState& recording, const State& state, co
     Require(backFaces != VK_NULL_HANDLE, "the pipeline draws both faces in one pass");
     recording.BindPipeline(context, backFaces, dynamicSlots);
     setColorWriteMasks(recording, state, masked, false);
-    recording.SetViewport(context, scale != nullptr ? scale->Viewport(state.viewport) : state.viewport);
-    recording.SetScissor(context, scale != nullptr ? scale->Scissor(state.scissor) : state.scissor);
+    setViewports(recording, state, scale);
     recording.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
     if (depthBounds) recording.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
 }
@@ -1206,6 +1229,7 @@ std::size_t pipelineKey(std::vector<std::byte>& storage, const Context& context,
     append(key, state.lineWidth);
     append(key, state.frontFace);
     append(key, state.provokingVertexMode);
+    append(key, ViewportCount(state));
     append(key, state.negativeOneToOne);
     append(key, state.depthClamp && context.depthClamp);
     append(key, state.conservativeRasterization);

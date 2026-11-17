@@ -281,6 +281,7 @@ function(add_shader_recompiler target runtimeTarget)
             IsFmaskTextureFormat
             PipelineSpecialization::IsGridScale
             PipelineSpecialization::GridScaleBase
+            PipelineSpecialization::IsAtomicLockTable
             PipelineSpecialization::IsWorkgroupOffset
             PipelineSpecialization::WorkgroupOffsetBase
             PipelineSpecialization::WorkgroupOffsetWords

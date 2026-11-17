@@ -22,6 +22,10 @@ std::optional<VkExtent2D> DepthSurfaceHostExtent(const Context& context, const D
 VkImageView DemoteDepthSurface(const Context& context, const DepthTarget& target);
 bool DemoteDepthSurfaceAt(const Context& context, std::uint64_t address);
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil = std::nullopt);
+VkImageView RepeatDepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilWritten);
+bool DepthTargetOverlaps(const DepthTarget& target, std::uint64_t address, std::uint64_t bytes);
+const char* DepthPlanesObligation(VkDevice device, std::uint64_t address, std::uint64_t bytes);
+const char* DepthTargetObligation(const Context& context, const DepthTarget& target, bool depthWritten);
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target);
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target);
 enum class DepthPlaneScope { Overlapped, Whole };
