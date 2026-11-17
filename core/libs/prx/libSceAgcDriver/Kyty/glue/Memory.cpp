@@ -32,6 +32,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cstring>
 #include <mutex>
@@ -130,10 +131,46 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 thread_local bool t_guarded_read = false;
 
 // A plain copy of guest bytes that fails instead of faulting (no tracker read-back, no page walk).
+// APS5_KYTY_MEMSTATS=1: guarded reads (calls, bytes, failures) and slow reads, every 10 s.
+struct MemStats {
+	std::atomic<uint64_t> calls {0}, bytes {0}, failed {0}, slow {0}, slow_bytes {0};
+	std::atomic<int64_t>  next {0};
+};
+MemStats& Stats() {
+	static MemStats stats;
+	return stats;
+}
+void ReportStats() {
+	static const bool enabled = std::getenv("APS5_KYTY_MEMSTATS") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	auto&      stats = Stats();
+	const auto now   = std::chrono::steady_clock::now().time_since_epoch().count();
+	auto       next  = stats.next.load(std::memory_order_relaxed);
+	if (now < next || !stats.next.compare_exchange_strong(next, now + 10'000'000'000ll)) {
+		return;
+	}
+	if (next == 0) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[memstats] 10 s: guarded reads {} ({} MiB), failed {}, slow reads {} ({} MiB)",
+	    stats.calls.exchange(0), stats.bytes.exchange(0) >> 20, stats.failed.exchange(0),
+	    stats.slow.exchange(0), stats.slow_bytes.exchange(0) >> 20) + std::string(1, char(10)));
+}
+
 bool GuardedRead(uint64_t address, void* data, uint64_t bytes) {
 	t_guarded_read = true;
 	const bool copied = GuestArena::GuestArenaCopyOwned_nid_no_patch(address, data, bytes);
 	t_guarded_read = false;
+	auto& stats = Stats();
+	stats.calls.fetch_add(1, std::memory_order_relaxed);
+	stats.bytes.fetch_add(bytes, std::memory_order_relaxed);
+	if (!copied) {
+		stats.failed.fetch_add(1, std::memory_order_relaxed);
+	}
+	ReportStats();
 	return copied;
 }
 
@@ -356,6 +393,8 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (AgcDriver::VramBackend::GuardedRead(vaddr, data, size)) {
 		return true;
 	}
+	AgcDriver::VramBackend::Stats().slow.fetch_add(1, std::memory_order_relaxed);
+	AgcDriver::VramBackend::Stats().slow_bytes.fetch_add(size, std::memory_order_relaxed);
 	if (GuestArena::GuestArenaBackingCopy_nid_no_patch(vaddr, data, size, false)) {
 		return true;
 	}

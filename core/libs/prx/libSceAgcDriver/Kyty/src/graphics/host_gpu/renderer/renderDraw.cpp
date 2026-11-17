@@ -32,6 +32,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <set>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -468,6 +470,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		                                     view.layer_count},
 		              buffer.Handle());
 		const auto extent       = target.Extent();
+		// AnyPS5 diagnostic (APS5_KYTY_LOG_TARGETS=1): each new color target extent, once.
+		static const bool log_targets = std::getenv("APS5_KYTY_LOG_TARGETS") != nullptr;
+		if (log_targets) {
+			static std::mutex                                 seen_mutex;
+			static std::set<std::pair<uint32_t, uint32_t>> seen;
+			std::lock_guard                                   lock(seen_mutex);
+			if (seen.emplace(extent.width, extent.height).second) {
+				Log::WriteToConsoleAndLog(std::string(1, char(10)) + fmt::format("[targets] color target {}x{} (format {})",
+				                                      extent.width, extent.height,
+				                                      static_cast<int>(target.desc.info.pixel_format)));
+			}
+		}
 		state.width             = std::min(state.width, extent.width);
 		state.height            = std::min(state.height, extent.height);
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
