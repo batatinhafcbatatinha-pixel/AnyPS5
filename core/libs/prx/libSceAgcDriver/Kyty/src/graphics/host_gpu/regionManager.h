@@ -89,6 +89,7 @@ inline std::atomic<uint64_t> g_hot_upload_bytes {0};
 inline std::atomic<uint64_t> g_cold_upload_bytes {0};
 // APS5_KYTY_HOTCHECK: uploaded bytes unchanged / changed since their previous upload.
 inline std::atomic<uint64_t> g_upload_same_bytes {0};
+inline std::atomic<uint64_t> g_gpumod_calls {0}, g_gpumod_regions {0}, g_cpumod_calls {0}, g_cpumod_regions {0};
 inline std::atomic<uint64_t> g_upload_changed_bytes {0};
 
 inline uint64_t TrackerEpoch() noexcept {

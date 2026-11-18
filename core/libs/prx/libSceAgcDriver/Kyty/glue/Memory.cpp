@@ -322,6 +322,10 @@ void ReportStats() {
 	    stats.slow.exchange(0), stats.slow_bytes.exchange(0) >> 20) + std::string(1, char(10)));
 	ReportCallers();
 	ReportWaitSites();
+	Log::WriteToConsoleAndLog(fmt::format("[memstats] gpu-modified checks {} regions {}; cpu-modified checks {} regions {}",
+	                                      Libs::Graphics::g_gpumod_calls.exchange(0), Libs::Graphics::g_gpumod_regions.exchange(0),
+	                                      Libs::Graphics::g_cpumod_calls.exchange(0), Libs::Graphics::g_cpumod_regions.exchange(0)) +
+	                          std::string(1, char(10)));
 	{
 		static uint64_t last_generation = 0;
 		const auto      generation      = g_commit_generation.load();

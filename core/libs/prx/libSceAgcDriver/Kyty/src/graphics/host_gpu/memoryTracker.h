@@ -89,6 +89,7 @@ public:
 		});
 		upload_func();
 		if (is_written) {
+			NoteGpuWrittenRegions(vaddr, size);
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 				               manager->ChangeState<DirtySource::Gpu, true>(offset, bytes);
@@ -99,6 +100,31 @@ public:
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static_assert(REGION_COUNT % 64 == 0);
+
+	// AnyPS5: one bit per region that ever held GPU-written pages (set before the pages' bits).
+	// Most GPU-modified checks (several per draw) end on this bit without touching the region.
+	void NoteGpuWrittenRegions(uint64_t vaddr, uint64_t size) noexcept {
+		const auto first = TrackerOffset(vaddr) / TRACKER_REGION_SIZE;
+		const auto last  = TrackerOffset(vaddr + size - 1) / TRACKER_REGION_SIZE;
+		for (auto index = first; index <= last; ++index) {
+			const auto bit = uint64_t {1} << (index % 64);
+			if ((m_gpu_regions[index / 64].load(std::memory_order_relaxed) & bit) == 0) {
+				m_gpu_regions[index / 64].fetch_or(bit, std::memory_order_seq_cst);
+			}
+		}
+	}
+	[[nodiscard]] bool MayHoldGpuWrites(uint64_t vaddr, uint64_t size) const noexcept {
+		const auto first = TrackerOffset(vaddr) / TRACKER_REGION_SIZE;
+		const auto last  = TrackerOffset(vaddr + size - 1) / TRACKER_REGION_SIZE;
+		for (auto index = first; index <= last; ++index) {
+			if ((m_gpu_regions[index / 64].load(std::memory_order_seq_cst) >> (index % 64)) & 1u) {
+				return true;
+			}
+		}
+		return false;
+	}
+	std::unique_ptr<std::atomic<uint64_t>[]> m_gpu_regions;
 
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {
