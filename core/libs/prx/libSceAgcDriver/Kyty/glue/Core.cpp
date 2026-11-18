@@ -10,6 +10,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -287,7 +288,18 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 
 void VideoOutDriver::PrepareFlip(uint64_t /*request_id*/, Graphics::CommandBuffer& /*buffer*/) {}
 
+bool VideoOutDriver::FlipPacketReady(int handle, int index, int flip_mode, int64_t flip_arg,
+                                     const uint32_t* packet) {
+	return AgcDriver::VramBackend::Host::FlipPacketReady(static_cast<uint32_t>(handle), index,
+	                                                     static_cast<uint32_t>(flip_mode), flip_arg,
+	                                                     packet);
+}
+
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
+	// Kyty counts displayed frames in its own video-out; the tracker's rewritten ("hot") pages
+	// expire after a number of them (regionManager.h HotPageLifetime). Without it they never
+	// expire and every page the CPU ever rewrote is uploaded again on every submission.
+	Graphics::AdvanceTrackerFrame();
 	AgcDriver::VramBackend::Host::CompleteFlip(request_id);
 }
 

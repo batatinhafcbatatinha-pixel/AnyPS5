@@ -38,6 +38,8 @@ public:
 	// flips (true, request reserved); the driver's rendering wait packet.
 	bool TakeEopFlip(uint32_t token, Graphics::CommandBuffer& buffer, uint64_t& request_id);
 	[[nodiscard]] bool RenderingReady(uint32_t handle, uint32_t index, const uint32_t* packet);
+	[[nodiscard]] bool FlipPacketReady(int handle, int index, int flip_mode, int64_t flip_arg,
+	                                   const uint32_t* packet);
 	// The AnyPS5 flip packet the GPU thread executes (set around CommandProcessor::Flip).
 	static void SetFlipPacket(const uint32_t* packet);
 

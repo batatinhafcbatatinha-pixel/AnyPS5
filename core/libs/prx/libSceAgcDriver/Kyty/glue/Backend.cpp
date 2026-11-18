@@ -292,6 +292,37 @@ void Shutdown() {
 
 namespace Host {
 
+bool FlipPacketReady(std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument,
+                     const std::uint32_t* packet) {
+	auto& registry = Get();
+	{
+		std::lock_guard lock(registry.mutex);
+		if (packet == nullptr || registry.flips.contains(packet)) {
+			return true;
+		}
+	}
+	// Not seen at submission (inside an indirect buffer): reserved here, but never by waiting for
+	// libSceVideoOut's locks (a guest thread holding them may be waiting for this thread).
+	auto output = OutputOf(handle);
+	if (output == nullptr) {
+		Fail("flip references an unregistered video output");
+	}
+	bool busy    = false;
+	auto request = output->ReserveUnlessBusy(FlipInfo {handle, index, mode, argument}, busy);
+	if (busy) {
+		return false;
+	}
+	if (request == nullptr) {
+		Fail("video output returned a null flip reservation");
+	}
+	Registry::Prepared prepared;
+	Describe(request, &prepared.display, &prepared.hasDisplay);
+	std::lock_guard lock(registry.mutex);
+	prepared.request = Remember(registry, std::move(request));
+	registry.flips[packet].push_back(prepared);
+	return true;
+}
+
 bool ReserveFlip(std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument,
                  const std::uint32_t* packet, std::uint64_t* request, DisplayDesc* display, bool* hasDisplay) {
 	auto& registry = Get();

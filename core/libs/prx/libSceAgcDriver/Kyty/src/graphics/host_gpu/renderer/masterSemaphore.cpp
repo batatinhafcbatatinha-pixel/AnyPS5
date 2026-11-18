@@ -55,6 +55,19 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	// AnyPS5 diagnostic: blocking time per caller (APS5_KYTY_MEMSTATS report).
+	struct Timed {
+		void*                                 at;
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		~Timed() {
+			if (Common::DebugCounters::Enabled()) {
+				Common::DebugCounters::NoteWaitSite(
+				    at, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                                  std::chrono::steady_clock::now() - start)
+				                                  .count()));
+			}
+		}
+	} timed {__builtin_return_address(0)};
 	// AnyPS5: waits in 5 s slices and reports a wait that does not end (diagnostic for hangs).
 	auto result = m_graphics.device.waitSemaphores(&wait_info, 5'000'000'000ull);
 	for (uint32_t slices = 1; result == vk::Result::eTimeout; ++slices) {

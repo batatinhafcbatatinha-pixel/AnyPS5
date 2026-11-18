@@ -83,6 +83,14 @@ inline std::atomic<bool>     g_sticky_pages {true};
 // Frames the guest has submitted for display so far.
 inline std::atomic<uint64_t> g_tracker_frame {1};
 
+// AnyPS5 diagnostics (APS5_KYTY_MEMSTATS): bytes of rewritten ("hot") pages and of other dirty
+// pages handed to uploads.
+inline std::atomic<uint64_t> g_hot_upload_bytes {0};
+inline std::atomic<uint64_t> g_cold_upload_bytes {0};
+// APS5_KYTY_HOTCHECK: uploaded bytes unchanged / changed since their previous upload.
+inline std::atomic<uint64_t> g_upload_same_bytes {0};
+inline std::atomic<uint64_t> g_upload_changed_bytes {0};
+
 inline uint64_t TrackerEpoch() noexcept {
 	return g_tracker_epoch.load(std::memory_order_relaxed);
 }
@@ -171,17 +179,30 @@ public:
 			// A page written again after its upload is rewritten by the guest every frame:
 			// keeping it unwatched and uploading it once per submission saves a fault and two
 			// protection changes per write.
+			// AnyPS5: only when the two writes come in the same or consecutive frames. A page
+			// the guest writes every few frames was kept unwatched too and uploaded every frame
+			// unchanged (Grand Theft Auto V: 83% of 20 MiB a frame).
 			if (StickyPagesEnabled()) {
+				const auto frame = TrackerFrame();
+				if (frame != m_rewritten_frame) {
+					m_rewritten[frame & 1].Clear();
+					if (frame != m_rewritten_frame + 1) {
+						m_rewritten[(frame + 1) & 1].Clear();
+					}
+					m_rewritten_frame = frame;
+				}
+				auto&       current  = m_rewritten[frame & 1];
+				const auto& previous = m_rewritten[(frame + 1) & 1];
 				for (const auto [first, last]: changed) {
 					for (auto page = first; page < last; page++) {
-						if (m_rewritten.Get(page)) {
+						if (current.Get(page) || previous.Get(page)) {
 							if (!m_has_hot) {
 								m_has_hot   = true;
-								m_hot_since = TrackerFrame();
+								m_hot_since = frame;
 							}
 							m_hot.Set(page);
 						} else {
-							m_rewritten.Set(page);
+							current.Set(page);
 						}
 					}
 				}
@@ -212,7 +233,8 @@ public:
 				if (TrackerFrame() - m_hot_since > HotPageLifetime()) {
 					// Pages stop counting as rewritten after a while; they qualify again by faulting.
 					m_hot.Clear();
-					m_rewritten.Clear();
+					m_rewritten[0].Clear();
+					m_rewritten[1].Clear();
 					m_has_hot = false;
 				} else {
 					if (m_fresh_epoch != epoch) {
@@ -239,6 +261,13 @@ public:
 					}
 					UpdateProtection<true, false>(watch);
 					for (const auto [first, last]: upload) {
+						uint64_t hot = 0;
+						for (auto page = first; page < last; page++) {
+							hot += m_hot.Get(page) ? 1 : 0;
+						}
+						g_hot_upload_bytes.fetch_add(hot * TRACKER_PAGE_SIZE, std::memory_order_relaxed);
+						g_cold_upload_bytes.fetch_add((last - first - hot) * TRACKER_PAGE_SIZE,
+						                              std::memory_order_relaxed);
 						func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 					}
 					return;
@@ -255,6 +284,9 @@ public:
 			}
 		}
 		for (const auto [first, last]: mask) {
+			if constexpr (source == DirtySource::Cpu) {
+				g_cold_upload_bytes.fetch_add((last - first) * TRACKER_PAGE_SIZE, std::memory_order_relaxed);
+			}
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
 	}
@@ -310,7 +342,8 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
-	RegionBits   m_rewritten; // written again by the CPU after an upload
+	RegionBits   m_rewritten[2]; // write faults of the frame (index: frame parity) and the one before
+	uint64_t     m_rewritten_frame = 0;
 	RegionBits   m_hot;       // kept CPU-dirty and unwatched
 	RegionBits   m_hot_fresh; // hot pages uploaded in submission m_fresh_epoch
 	uint64_t     m_fresh_epoch = 0;

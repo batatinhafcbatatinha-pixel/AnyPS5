@@ -1125,6 +1125,13 @@ void CommandProcessor::RenderingWait(uint32_t handle, uint32_t index, const uint
 
 void CommandProcessor::FlipPacket(const uint32_t* packet, int handle, int index, int flip_mode,
                                   int64_t flip_arg) {
+	// AnyPS5: a flip not reserved at submission is reserved without waiting for libSceVideoOut's
+	// locks; while they are held the packet waits like WAIT_REG_MEM.
+	if (!m_renderer.GetVideoOut().FlipPacketReady(handle, index, flip_mode, flip_arg, packet)) {
+		BufferFlush();
+		SuspendPm4();
+		return;
+	}
 	VideoOut::VideoOutDriver::SetFlipPacket(packet);
 	WriteBackImages();
 	Flip(handle, index, flip_mode, flip_arg);

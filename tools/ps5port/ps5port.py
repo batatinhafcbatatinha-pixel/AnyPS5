@@ -247,7 +247,7 @@ def build(port):
 
     # The previous conversion goes; saves (_sd), trophies, data/ and screenshots in out/ stay.
     out.mkdir(parents=True, exist_ok=True)
-    for old in list(out.glob('app*.json')) + [out / 'app.exe', out / 'app0', out / 'libs']:
+    for old in list(out.glob('app*.json')) + [out / 'app.exe', out / 'app.exe.orig', out / 'app0', out / 'libs']:
         remove_tree(old)
     cmd = [str(relinker), '--windows'] + os.environ.get('PS5PORT_RELINK_FLAGS', '').split()
     for d in extra:
@@ -370,11 +370,15 @@ def patch_bytes(write, key):
 def apply_patches(port):
     """Makes the converted modules match the patches the player chose (the JSON files of <port>/patches, format of
     github.com/batatinhafcbatatinha-pixel/recomp-patches). Only *.guest.prx files are written, never the dump; each
-    changed module keeps a .orig copy, which is put back first, so removing a patch file undoes the patch."""
+    changed module keeps a .orig copy, which is put back first, so removing a patch file undoes the patch.
+    "offset" writes (values in the loaded main module) with "hold": true are replaced at run time whenever the game
+    writes them (APS5_HOLD_WRITES); without "hold" they are written once into app.exe before start (app.exe.orig)."""
     app0 = port / 'build' / 'out' / 'app0'
-    for original in app0.rglob('*.guest.prx.orig'):
-        shutil.copy2(original, str(original)[:-5])
-        original.unlink()
+    exe = port / 'build' / 'out' / 'app.exe'
+    for original in list(app0.rglob('*.guest.prx.orig')) + [Path(str(exe) + '.orig')]:
+        if original.is_file():
+            shutil.copy2(original, str(original)[:-5])
+            original.unlink()
     folder = port / 'patches'
     held = []
     for file in sorted(folder.glob('*.json')) if folder.is_dir() else []:
@@ -382,12 +386,17 @@ def apply_patches(port):
             patch = json.loads(file.read_text(encoding='utf-8'))
             plan = []
             for write in patch['writes']:
-                if 'offset' in write:  # a value in the loaded main module: held at run time (APS5_HOLD_WRITES)
+                if 'offset' in write and write.get('hold'):  # a value the game writes: held at run time
                     held.append(memory_write(port, write))
                     continue
+                if 'offset' in write:  # a value of the main module's image: written into app.exe once
+                    plan.append(image_write(port, write))
+                    continue
                 find, new = patch_bytes(write, 'find'), patch_bytes(write, 'write')
-                name = write['module'].lower() + '.guest.prx'
+                name = write['module'].lower().removesuffix('.guest.prx') + '.guest.prx'
                 modules = [p for p in app0.rglob('*.guest.prx') if p.name.lower() == name and not is_link(p)]
+                if not modules and name == 'eboot.bin.guest.prx':
+                    modules = [exe]  # the main module is relinked into app.exe (its data sections included)
                 if len(modules) != 1:
                     raise ValueError(f'{write["module"]}: {len(modules)} converted modules with that name')
                 data = modules[0].read_bytes()
@@ -425,8 +434,39 @@ def image_section_rva(exe, name):
     raise ValueError(f'{exe.name} has no section {name}')
 
 
+def image_sections(exe):
+    """(name, rva, virtual size, file offset, raw size) of each section of a PE file."""
+    data = exe.read_bytes()
+    pe = struct.unpack_from('<I', data, 0x3c)[0]
+    count, optional = struct.unpack_from('<H', data, pe + 6)[0], struct.unpack_from('<H', data, pe + 20)[0]
+    table = pe + 24 + optional
+    sections = []
+    for index in range(count):
+        name, size, rva, raw_size, raw = struct.unpack_from('<8sIIII', data, table + 40 * index)
+        sections.append((name.rstrip(bytes(1)).decode(errors='replace'), rva, size, raw, raw_size))
+    return sections
+
+
+def image_write(port, write):
+    """(app.exe, file offset, bytes) of an "offset" write without "hold", checked against its "find" bytes."""
+    if write['module'].lower() not in ('eboot.bin', 'eboot.bin.guest.prx'):
+        raise ValueError(f'{write["module"]}: memory writes are supported in eboot.bin only')
+    find, new = patch_bytes(write, 'find'), patch_bytes(write, 'write')
+    if len(find) != len(new):
+        raise ValueError('find and write sizes differ')
+    exe = port / 'build' / 'out' / 'app.exe'
+    rva = image_section_rva(exe, '.elf0') + int(write['offset'], 16) - GOLDHEN_MAIN_BASE
+    for _, start, size, raw, raw_size in image_sections(exe):
+        if start <= rva and rva + len(new) <= start + min(size, raw_size):
+            offset = raw + rva - start
+            if exe.read_bytes()[offset:offset + len(find)] != find:
+                raise ValueError(f'offset {write["offset"]}: the value to replace is not there (another game version?)')
+            return exe, offset, new
+    raise ValueError(f'offset {write["offset"]}: not in the file data of app.exe')
+
+
 def memory_write(port, write):
-    """'<rva>:<off>:<on>' of an "offset" write (always held: the value is replaced whenever found)."""
+    """'<rva>:<off>:<on>' of a held "offset" write (the value is replaced whenever the game writes it)."""
     if write['module'].lower() not in ('eboot.bin', 'eboot.bin.guest.prx'):
         raise ValueError(f'{write["module"]}: memory writes are supported in eboot.bin only')
     off, on = patch_bytes(write, 'find'), patch_bytes(write, 'write')

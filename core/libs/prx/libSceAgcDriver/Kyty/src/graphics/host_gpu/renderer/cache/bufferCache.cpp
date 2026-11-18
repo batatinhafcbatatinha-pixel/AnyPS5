@@ -25,6 +25,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
@@ -519,6 +520,20 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 				    if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset,
 					                                         copy.size)) {
 					    EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+				    }
+				    // AnyPS5 diagnostic (APS5_KYTY_HOTCHECK=1): uploaded 4 KiB pages whose bytes did
+				    // not change since their previous upload.
+				    static const bool hot_check = std::getenv("APS5_KYTY_HOTCHECK") != nullptr;
+				    if (hot_check) {
+					    static std::unordered_map<uint64_t, uint64_t> last;
+					    for (uint64_t at = 0; at + 4096 <= copy.size; at += 4096) {
+						    const auto hash = XXH3_64bits(mapped + copy.srcOffset + at, 4096);
+						    auto [entry, fresh] = last.try_emplace(address + at, hash);
+						    const bool same = !fresh && entry->second == hash;
+						    entry->second = hash;
+						    (same ? g_upload_same_bytes : g_upload_changed_bytes)
+						        .fetch_add(4096, std::memory_order_relaxed);
+					    }
 				    }
 				    copy.srcOffset += base_offset;
 			    }

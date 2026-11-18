@@ -284,6 +284,20 @@ void CommandScheduler::DrainSubmits() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	// AnyPS5 diagnostic: time blocked per caller (APS5_KYTY_MEMSTATS report).
+	struct Timed {
+		void*                                 at;
+		bool                                  blocks;
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+		~Timed() {
+			if (blocks && Common::DebugCounters::Enabled()) {
+				Common::DebugCounters::NoteWaitSite(
+				    at, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                                  std::chrono::steady_clock::now() - start)
+				                                  .count()));
+			}
+		}
+	} timed {__builtin_return_address(0), !m_master.IsFree(tick)};
 	EXIT_IF(tick > CurrentTick());
 	EXIT_IF(m_in_side && tick == CurrentTick());
 	if (tick == CurrentTick()) {

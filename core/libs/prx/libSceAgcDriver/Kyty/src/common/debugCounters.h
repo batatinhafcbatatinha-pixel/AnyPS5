@@ -63,6 +63,27 @@ inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 } // namespace Detail
 
+// AnyPS5: blocking waits for the GPU per calling place (return address into the caller).
+struct WaitSite {
+	std::atomic<uint64_t> at {0}, count {0}, ns {0};
+};
+inline WaitSite g_wait_sites[32];
+inline void NoteWaitSite(void* at, uint64_t ns) noexcept {
+	const auto key = reinterpret_cast<uint64_t>(at);
+	for (size_t probe = 0; probe < 32; ++probe) {
+		auto& site = g_wait_sites[(key / 16 + probe) % 32];
+		auto  seen = site.at.load(std::memory_order_relaxed);
+		if (seen == 0 && site.at.compare_exchange_strong(seen, key)) {
+			seen = key;
+		}
+		if (seen == key) {
+			site.count.fetch_add(1, std::memory_order_relaxed);
+			site.ns.fetch_add(ns, std::memory_order_relaxed);
+			return;
+		}
+	}
+}
+
 [[nodiscard]] inline bool Enabled() noexcept {
 	return Detail::g_enabled.load(std::memory_order_relaxed);
 }
