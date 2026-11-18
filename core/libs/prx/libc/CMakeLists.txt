@@ -180,6 +180,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Bessel.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/J0f.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/J1f.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/Jnf.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Random.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/VersionedMultiprecision.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FloatBuiltins.cpp
@@ -608,6 +609,15 @@ if(BUILD_TESTING)
     set_tests_properties(guest_memccpy_bounds PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_memccpy_bounds PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(guest_memrchr_blocks_tests ${LIBS_INCLUDE_DIR}/tests/GuestMemrchrBlocks.cpp)
+    target_include_directories(guest_memrchr_blocks_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_memrchr_blocks_tests PRIVATE libc)
+    configure_windows_unwind(guest_memrchr_blocks_tests)
+    add_test(NAME guest_memrchr_blocks COMMAND guest_memrchr_blocks_tests)
+    if(WIN32)
+        set_tests_properties(guest_memrchr_blocks PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_explicit_memset_tests ${LIBS_INCLUDE_DIR}/tests/GuestExplicitMemset.cpp)
