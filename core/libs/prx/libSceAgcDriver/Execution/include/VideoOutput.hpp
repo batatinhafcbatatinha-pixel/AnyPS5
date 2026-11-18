@@ -59,6 +59,12 @@ public:
     virtual ~IVideoOutput() = default;
     virtual std::shared_ptr<IFlipRequest> Reserve(const FlipInfo& info) = 0;
     virtual std::shared_ptr<IFlipRequest> TryReserve(const FlipInfo& info) { return Reserve(info); }
+    // Like Reserve, but `busy` (and null) instead of waiting when the output's locks are held: for
+    // the GPU thread, which a guest thread holding them may be waiting for.
+    virtual std::shared_ptr<IFlipRequest> ReserveUnlessBusy(const FlipInfo& info, bool& busy) {
+        busy = false;
+        return Reserve(info);
+    }
     virtual void WaitForFlipRoom() {}
     virtual std::shared_ptr<IRenderingWait> CaptureRenderingWait(std::uint32_t index) {
         throw std::runtime_error("VideoOut: rendering waits are unsupported by this output");

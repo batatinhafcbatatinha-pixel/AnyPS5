@@ -215,7 +215,12 @@ public:
     std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info) override { return Reserve(info, false); }
     std::shared_ptr<AgcDriver::IFlipRequest> TryReserve(const AgcDriver::FlipInfo& info) override { return Reserve(info, true); }
 
-    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info, bool limited) {
+    std::shared_ptr<AgcDriver::IFlipRequest> ReserveUnlessBusy(const AgcDriver::FlipInfo& info, bool& busy) override {
+        return Reserve(info, false, &busy);
+    }
+
+    // `busy`: try the locks only; set (and null returned) when one is held.
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info, bool limited, bool* busy = nullptr) {
         // All flip modes are presented at the next vsync.
         require(info.mode >= VIDEO_OUT_FLIP_MODE_VSYNC && info.mode <= 6, "unsupported flip mode");
         require(info.index >= VIDEO_OUT_BUFFER_INDEX_BLACK && info.index < VIDEO_OUT_BUFFER_NUM_MAX, "invalid flip index");
@@ -226,11 +231,24 @@ public:
         request->outputHandle = info.handle;
         request->flipMode = static_cast<int>(info.mode);
         request->flipArg = info.argument;
-        std::lock_guard queueLock(queue->mutex);
+        if (busy != nullptr) *busy = false;
+        std::unique_lock queueLock(queue->mutex, std::defer_lock);
+        if (busy == nullptr) {
+            queueLock.lock();
+        } else if (!queueLock.try_lock()) {
+            *busy = true;
+            return {};
+        }
         if (queue->failure) std::rethrow_exception(queue->failure);
         if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
         if (limited && queue->reservations.load() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) return {};
-        std::lock_guard lock(cfg->mutex);
+        std::unique_lock lock(cfg->mutex, std::defer_lock);
+        if (busy == nullptr) {
+            lock.lock();
+        } else if (!lock.try_lock()) {
+            *busy = true;
+            return {};
+        }
         checkConfig(*cfg);
         request->generation = cfg->generation;
         request->flipRate = cfg->flipRate;

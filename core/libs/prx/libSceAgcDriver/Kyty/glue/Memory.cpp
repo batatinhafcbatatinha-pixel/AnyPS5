@@ -14,9 +14,11 @@
 #include "glue/CoreInternal.hpp"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -37,6 +39,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace AgcDriver::VramBackend {
 
@@ -77,6 +80,40 @@ bool Protect(uint64_t address, uint64_t bytes, DWORD protection) {
 // Applies `mode` to [begin, end), page by page in runs of equal protection. Mutex held.
 void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode) {
 	auto& originals = Originals();
+	if (mode == Common::VirtualMemory::Mode::ReadWrite) {
+		// Restoring: exactly the pages this map holds get their guest protection back (released
+		// pages left it in NoteReleased), so no VirtualQuery is needed. A run that spans two
+		// mappings fails as a whole in VirtualProtect: it is then done page by page.
+		uint64_t run_begin  = begin;
+		DWORD    run_target = 0;
+		bool     run_open   = false;
+		const auto flush    = [&](uint64_t run_end) {
+			if (run_open && run_end > run_begin &&
+			    !Protect(run_begin, run_end - run_begin, run_target)) {
+				for (uint64_t page = run_begin; page < run_end; page += PageBytes) {
+					(void)Protect(page, PageBytes, run_target);
+				}
+			}
+			run_open = false;
+		};
+		for (uint64_t page = begin; page < end; page += PageBytes) {
+			const auto found = originals.find(page);
+			if (found == originals.end()) {
+				flush(page);
+				continue;
+			}
+			const DWORD target = found->second;
+			originals.erase(found);
+			if (!run_open || target != run_target) {
+				flush(page);
+				run_begin  = page;
+				run_target = target;
+				run_open   = true;
+			}
+		}
+		flush(end);
+		return;
+	}
 	uint64_t address = begin;
 	while (address < end) {
 		MEMORY_BASIC_INFORMATION memory {};
@@ -132,6 +169,9 @@ thread_local bool t_guarded_read = false;
 
 // A plain copy of guest bytes that fails instead of faulting (no tracker read-back, no page walk).
 // APS5_KYTY_MEMSTATS=1: guarded reads (calls, bytes, failures) and slow reads, every 10 s.
+// Bumped by every guest release (ClampRangeSize's committed-range cache).
+std::atomic<uint64_t> g_commit_generation {1};
+std::atomic<uint64_t> g_clamp_calls {0}, g_clamp_hits {0}, g_clamp_queries {0};
 struct MemStats {
 	std::atomic<uint64_t> calls {0}, bytes {0}, failed {0}, slow {0}, slow_bytes {0};
 	std::atomic<int64_t>  next {0};
@@ -140,8 +180,81 @@ MemStats& Stats() {
 	static MemStats stats;
 	return stats;
 }
-void ReportStats() {
+// Reads per calling place (return address), for the 10 s report.
+struct CallerSlot {
+	std::atomic<uint64_t> at {0}, calls {0}, bytes {0};
+};
+constexpr size_t CallerSlots = 64;
+CallerSlot* Callers() {
+	static CallerSlot slots[CallerSlots];
+	return slots;
+}
+void NoteCaller(void* at, uint64_t bytes) {
 	static const bool enabled = std::getenv("APS5_KYTY_MEMSTATS") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	const auto key  = reinterpret_cast<uint64_t>(at);
+	auto*      slot = Callers();
+	for (size_t probe = 0; probe < CallerSlots; ++probe) {
+		auto& entry = slot[(key / 16 + probe) % CallerSlots];
+		auto  seen  = entry.at.load(std::memory_order_relaxed);
+		if (seen == 0 && entry.at.compare_exchange_strong(seen, key)) {
+			seen = key;
+		}
+		if (seen == key) {
+			entry.calls.fetch_add(1, std::memory_order_relaxed);
+			entry.bytes.fetch_add(bytes, std::memory_order_relaxed);
+			return;
+		}
+	}
+}
+void ReportCallers() {
+	HMODULE self = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                   reinterpret_cast<LPCWSTR>(&ReportCallers), &self);
+	struct Row {
+		uint64_t at, calls, bytes;
+	};
+	std::vector<Row> rows;
+	for (size_t index = 0; index < CallerSlots; ++index) {
+		auto& entry = Callers()[index];
+		const auto at = entry.at.load(std::memory_order_relaxed);
+		if (at != 0) {
+			rows.push_back({at, entry.calls.exchange(0), entry.bytes.exchange(0)});
+		}
+	}
+	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.bytes > b.bytes; });
+	std::string text = "[memstats] callers (rva in libSceAgcDriver: calls, MiB):";
+	for (size_t index = 0; index < rows.size() && index < 8; ++index) {
+		text += fmt::format(" {:#x}: {} {}", rows[index].at - reinterpret_cast<uint64_t>(self), rows[index].calls,
+		                    rows[index].bytes >> 20);
+	}
+	Log::WriteToConsoleAndLog(text + std::string(1, char(10)));
+}
+void ReportWaitSites() {
+	HMODULE self = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                   reinterpret_cast<LPCWSTR>(&ReportWaitSites), &self);
+	std::string text = "[memstats] scheduler waits (rva: count, ms):";
+	for (auto& site: Common::DebugCounters::g_wait_sites) {
+		const auto at = site.at.load(std::memory_order_relaxed);
+		const auto count = site.count.exchange(0);
+		const auto ns = site.ns.exchange(0);
+		if (at != 0 && count != 0) {
+			text += fmt::format(" {:#x}: {} {}", at - reinterpret_cast<uint64_t>(self), count, ns / 1'000'000);
+		}
+	}
+	Log::WriteToConsoleAndLog(text + std::string(1, char(10)));
+}
+void ReportStats() {
+	static const bool enabled = [] {
+		const bool on = std::getenv("APS5_KYTY_MEMSTATS") != nullptr;
+		if (on) {
+			Common::DebugCounters::SetEnabled(true);
+		}
+		return on;
+	}();
 	if (!enabled) {
 		return;
 	}
@@ -158,6 +271,53 @@ void ReportStats() {
 	    "[memstats] 10 s: guarded reads {} ({} MiB), failed {}, slow reads {} ({} MiB)",
 	    stats.calls.exchange(0), stats.bytes.exchange(0) >> 20, stats.failed.exchange(0),
 	    stats.slow.exchange(0), stats.slow_bytes.exchange(0) >> 20) + std::string(1, char(10)));
+	ReportCallers();
+	ReportWaitSites();
+	{
+		static uint64_t last_generation = 0;
+		const auto      generation      = g_commit_generation.load();
+		Log::WriteToConsoleAndLog(fmt::format("[memstats] clamp: calls {} hits {} VirtualQuery {} invalidations {}",
+		                                      g_clamp_calls.exchange(0), g_clamp_hits.exchange(0),
+		                                      g_clamp_queries.exchange(0), generation - last_generation) +
+		                          std::string(1, char(10)));
+		last_generation = generation;
+	}
+	using Common::DebugCounters::Counter;
+	static uint64_t previous[static_cast<int>(Counter::Count)] {};
+	auto delta = [](Counter counter) {
+		const auto value = Common::DebugCounters::Get(counter);
+		const auto diff  = value - previous[static_cast<int>(counter)];
+		previous[static_cast<int>(counter)] = value;
+		return diff;
+	};
+	const auto draws = delta(Counter::Draws);
+	const auto dispatches = delta(Counter::Dispatches);
+	const auto submits = delta(Counter::QueueSubmits);
+	const auto waits = delta(Counter::GpuWaits);
+	const auto wait_ms = delta(Counter::GpuWaitNs) / 1'000'000;
+	const auto faults = delta(Counter::GpuFaults);
+	const auto tex_up = delta(Counter::TextureUploadBytes) >> 20;
+	const auto tex_down = delta(Counter::TextureDownloadBytes) >> 20;
+	const auto buf_up = delta(Counter::BufferUploadBytes) >> 20;
+	const auto buf_down = delta(Counter::BufferDownloadBytes) >> 20;
+	const auto meta = delta(Counter::ColorMetadataReadbacks);
+	const auto meta_ms = delta(Counter::ColorMetadataReadbackNs) / 1'000'000;
+	const auto busy_ms = delta(Counter::GpuThreadBusyNs) / 1'000'000;
+	static uint64_t last_epoch = 0, last_frame = 0;
+	const auto epoch = Libs::Graphics::TrackerEpoch(), frame = Libs::Graphics::TrackerFrame();
+	const auto epochs = epoch - last_epoch, flips = frame - last_frame;
+	last_epoch = epoch;
+	last_frame = frame;
+	const auto hot_mib  = Libs::Graphics::g_hot_upload_bytes.exchange(0) >> 20;
+	const auto cold_mib = Libs::Graphics::g_cold_upload_bytes.exchange(0) >> 20;
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[counters] 10 s: draws {} dispatches {} submits {} gpu-waits {} ({} ms) faults {} tex up {} MiB "
+	    "down {} MiB buf up {} MiB down {} MiB meta-readbacks {} ({} ms) gpu-thread busy {} ms frames {} "
+	    "guest submissions {} dirty pages uploaded: hot {} MiB, other {} MiB; unchanged {} MiB changed {} MiB",
+	    draws, dispatches, submits, waits, wait_ms, faults, tex_up, tex_down, buf_up, buf_down, meta,
+	    meta_ms, busy_ms, flips, epochs, hot_mib, cold_mib,
+	    Libs::Graphics::g_upload_same_bytes.exchange(0) >> 20,
+	    Libs::Graphics::g_upload_changed_bytes.exchange(0) >> 20) + std::string(1, char(10)));
 }
 
 bool GuardedRead(uint64_t address, void* data, uint64_t bytes) {
@@ -302,6 +462,7 @@ bool Core::HandleFault(void* exception_pointers) noexcept {
 }
 
 void Core::NoteMapped(std::uint64_t address, std::size_t bytes) {
+	g_commit_generation.fetch_add(1, std::memory_order_acq_rel);
 	auto* renderer = Internal::Renderer();
 	if (renderer == nullptr || bytes == 0) {
 		return;
@@ -322,6 +483,7 @@ void Core::NoteMapped(std::uint64_t address, std::size_t bytes) {
 }
 
 void Core::NoteReleased(std::uint64_t address, std::size_t bytes) {
+	g_commit_generation.fetch_add(1, std::memory_order_acq_rel);
 	auto* renderer = Internal::Renderer();
 	if (renderer == nullptr || bytes == 0 || !Libs::Graphics::GuestRange {address, bytes}.Valid()) {
 		return;
@@ -389,6 +551,7 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (size == 0) {
 		return true;
 	}
+	AgcDriver::VramBackend::NoteCaller(__builtin_return_address(0), size);
 	// Fast path (most reads): the pages are readable as mapped.
 	if (AgcDriver::VramBackend::GuardedRead(vaddr, data, size)) {
 		return true;
@@ -445,19 +608,57 @@ static bool CopySparse(uint64_t vaddr, void* data, uint64_t size, bool zero_unma
 }
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
+	AgcDriver::VramBackend::NoteCaller(__builtin_return_address(0), size);
 	return CopySparse(vaddr, data, size, false);
 }
 
 bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
+	AgcDriver::VramBackend::NoteCaller(__builtin_return_address(0), size);
 	return CopySparse(vaddr, data, size, true);
 }
 
+// Ranges ClampRangeSize found committed, per thread; a guest release drops them all.
+struct CommittedRange {
+	uint64_t begin = 0, end = 0;
+	bool     bounded = false;  // end is the first uncommitted byte
+};
+thread_local CommittedRange t_committed[16];
+thread_local uint64_t       t_committed_generation = 0;
+thread_local uint32_t       t_committed_next       = 0;
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+	// Vertex ranges are clamped at every draw: a range known committed needs no VirtualQuery.
+	AgcDriver::VramBackend::g_clamp_calls.fetch_add(1, std::memory_order_relaxed);
+	const auto generation = AgcDriver::VramBackend::g_commit_generation.load(std::memory_order_acquire);
+	if (t_committed_generation != generation) {
+		for (auto& range: t_committed) {
+			range = {};
+		}
+		t_committed_generation = generation;
+	}
+	for (const auto& range: t_committed) {
+		if (range.begin <= vaddr && vaddr < range.end) {
+			if (vaddr + size <= range.end) {
+				AgcDriver::VramBackend::g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
+				return size;
+			}
+			if (range.bounded) {
+				AgcDriver::VramBackend::g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
+				return range.end - vaddr;
+			}
+		}
+	}
+	// The renderer's map of guest mappings answers most ranges (ring buffers move every draw).
+	if (auto* renderer = Renderer(); renderer != nullptr && size != 0 && renderer->IsMapped(vaddr, size)) {
+		AgcDriver::VramBackend::g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
+		return size;
+	}
 	uint64_t       committed = 0;
 	const uint64_t end       = vaddr + size;
 	uint64_t       address   = vaddr;
 	while (address < end) {
 		MEMORY_BASIC_INFORMATION memory {};
+		AgcDriver::VramBackend::g_clamp_queries.fetch_add(1, std::memory_order_relaxed);
 		if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) == 0 ||
 		    memory.State != MEM_COMMIT) {
 			break;
@@ -466,6 +667,9 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		    std::min(end, reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize);
 		committed += region_end - address;
 		address = region_end;
+	}
+	if (committed != 0) {
+		t_committed[t_committed_next++ % 16] = {vaddr, vaddr + committed, committed != size};
 	}
 	if (committed == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64

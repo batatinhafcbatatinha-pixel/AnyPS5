@@ -38,6 +38,10 @@ namespace Host {
 // `packet`: the flip packet being executed (its flip was reserved when it was submitted), or null.
 bool ReserveFlip(std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument,
                  const std::uint32_t* packet, std::uint64_t* request, DisplayDesc* display, bool* hasDisplay);
+// GPU thread, before a flip packet: true when its flip is reserved (at submission, or now without
+// waiting); false when libSceVideoOut's locks are held: the packet waits and is tried again.
+bool FlipPacketReady(std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument,
+                     const std::uint32_t* packet);
 // An end-of-pipe release whose interrupt context is a reserved EOP flip token (queue 0).
 bool TakeEopFlip(std::uint32_t token, std::uint64_t* request, DisplayDesc* display, bool* hasDisplay);
 // The work before the flip completed on the GPU: libSceVideoOut may present it.
