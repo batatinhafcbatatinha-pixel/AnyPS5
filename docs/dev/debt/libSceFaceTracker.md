@@ -2,7 +2,7 @@
 
 ### Unknown function info
 
-- [Additional libSceFaceTracker exports](../../../core/libs/prx/libSceFaceTracker/Export.cpp) - the 10 name/NID pairs below are defined function exports recovered from the GTAVC-bundled `libSceFaceTracker.prx` export table (the 4.03 firmware dump does not ship this module; the GTAVC bundle is the only concrete binary evidence). Their signatures and behavior are unknown; parameterless `int` declarations are import placeholders, not verified ABI prototypes. Every call throws through `NotImplemented_nid_no_patch`. No tracking, update, or result behavior is implemented.
+- [Additional libSceFaceTracker exports](../../../core/libs/prx/libSceFaceTracker/Export.cpp) - the 10 name/NID pairs below are defined function exports recovered from the title-bundled `libSceFaceTracker.prx` export table (the 4.03 firmware dump does not ship this module; that bundle is the only concrete binary evidence). Their signatures and behavior are unknown; parameterless `int` declarations are import placeholders, not verified ABI prototypes. Every call throws through `NotImplemented_nid_no_patch`. No tracking, update, or result behavior is implemented.
 
 | Name | NID |
 | --- | --- |

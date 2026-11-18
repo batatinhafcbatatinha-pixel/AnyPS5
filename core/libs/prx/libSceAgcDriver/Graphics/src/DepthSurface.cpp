@@ -3691,7 +3691,7 @@ void forgetCopiesInside(std::uint64_t address, std::size_t bytes) {
 // storeBackClearedHtile, remembered per HTILE address: it holds while the same recorder has noted no
 // write over the metadata after the answer and the CPU has not written the metadata. A depth target
 // is attached by every draw of its pass; without this each of them walked every pending write of
-// the open and in-flight batches again (~48 us per draw in Grand Theft Auto V), so the check asks
+// the open and in-flight batches again (~48 us per draw in a measured title), so the check asks
 // Recorder::WriteNotedSince, which looks only at the notes newer than the answer.
 struct PendingHtileAnswer {
     std::size_t bytes = 0;

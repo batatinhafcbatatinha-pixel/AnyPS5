@@ -4164,7 +4164,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     // A draw none of whose targets can scale (yet) leaves them alone instead of refusing them for
     // good: a title that clears its scene targets by draws without depth before the first scene draw
-    // (Grand Theft Auto V's 2560x1440 G-buffer) reaches them before their size is known as a
+    // (a 2560x1440 G-buffer) reaches them before their size is known as a
     // render-target family, and a refusal then would keep every later scene draw at the guest size.
     const bool scalableTarget = RenderScaleEnabled() && !wholeDrawScales && !multisampledDraw && (std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice == 0 && ScaleCandidate(SurfaceForTarget(color), 0); }) || (state.depth && (DepthSurfaceHostExtent(context, *state.depth).has_value() || ScaleCandidateExtent(state.depth->address, DepthSliceBytes(state.depth->extent, 4u), state.depth->extent, true))));
     const ScaleRequestScope scaleScope(!RenderScaleEnabled() ? ScaleRequest::Keep : wholeDrawScales ? ScaleRequest::Allow : multisampledDraw || scalableTarget ? ScaleRequest::Refuse : ScaleRequest::Keep, multisampledDraw ? "multisampled" : "mixed targets");
@@ -4388,7 +4388,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // A draw that scales as a whole may still find one of its targets at the guest size: an image
     // with results pending on the GPU is not replaced by the lookup. Its results are published and
     // the lookup repeated, so the target joins the others instead of taking them all back to the
-    // guest size for good (Grand Theft Auto V's first G-buffer draw after the size becomes known).
+    // guest size for good (a first G-buffer draw after the size becomes known).
     if (wholeDrawScales) {
         for (std::size_t index = 0; index < targets.size(); ++index) {
             auto& binding = targets[index];

@@ -44,7 +44,7 @@ MODULE_EXTS = ('.prx', '.sprx')
 STANDARD_MODULE_DIRS = ('sce_module', 'sce_modules', 'prx')
 SKIP_DIRS = {'sce_sys'}
 # Bundled copies of these libraries are not relinked: the title uses the AnyPS5 library instead.
-# libSceAmpr records the commands that the AnyPS5 kernel runs; the copy Grand Theft Auto V carries
+# libSceAmpr records the commands that the AnyPS5 kernel runs; the copy a title carries
 # in fakelib/ keeps them in its own tables, so the kernel never sees the reads it asks for.
 PORT_LIBRARIES = {'libsceampr'}
 
@@ -417,7 +417,7 @@ def apply_patches(port):
 
 
 # GoldHEN/KytyPS5 memory offsets count from the main module's load address, at which the first
-# loadable segment (ELF vaddr 0) lies 0x10010000 above (PS5 cheat convention, checked on PPSA04264
+# loadable segment (ELF vaddr 0) lies 0x10010000 above (PS5 cheat convention, checked on a title
 # with a pattern anchor). The relinker places ELF vaddr v at app.exe's section .elf0 + v.
 GOLDHEN_MAIN_BASE = 0x10010000
 

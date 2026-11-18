@@ -8,36 +8,19 @@ reimplemented). This fork adds the launcher the other recompilers use, so a game
 **your own decrypted dump** with a few clicks. No game content (dump, executable, data or converted code) is in this
 repository.
 
-## Grand Theft Auto V: 60 fps at native 1080p with the new GPU engine
+## New GPU engine
 
-> **Grand Theft Auto V (PPSA04264) runs at 60 fps at native 1920x1080** (render and output; 59.6 fps measured, the
-> display's 60 Hz limit) in the bank scene of the prologue with the new GPU engine, on an **RTX 3050 laptop GPU (8 GB)
-> + Ryzen 5 3600**. Right picture, 900 s runs without a crash. At 720p the old engine reached 8.1 fps with a broken
-> picture.
+The new GPU engine (the default) keeps the game's data in video memory: the guest pages the GPU uses are
+write-protected, only the pages the CPU changed are uploaded, GPU writes are read back only when the CPU touches them,
+and each shader is compiled once. Vulkan commands are recorded on a thread of their own. The game's own code still runs
+natively (relinked, no emulation); only the GPU driver (`libSceAgcDriver`) changed. Its renderer, command processor and
+shader recompiler come from [KytyPS5](https://github.com/batatinhafcbatatinha-pixel/KytyPS5) (GPL-2.0, credits and the
+list of files in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). `APS5_GPU_BACKEND=legacy` selects the old engine
+(host-imported guest memory), which is obsolete and currently broken.
 
-| GPU engine | Bank scene of the prologue | Picture |
-| --- | --- | --- |
-| **New (default)**: VRAM-resident, based on KytyPS5's renderer | **60 fps at 1080p** (and at 720p) | right |
-| Old (host-imported guest memory) | 8.1 fps at 720p | broken |
-
-The new engine keeps the game's data in video memory: the guest pages the GPU uses are write-protected, only the
-pages the CPU changed are uploaded, GPU writes are read back only when the CPU touches them, and each shader is
-compiled once. Vulkan commands are recorded on a thread of their own. The game's own code still runs natively (relinked, no emulation); only the GPU driver
-(`libSceAgcDriver`) changed. Its renderer, command processor and shader recompiler come from
-[KytyPS5](https://github.com/batatinhafcbatatinha-pixel/KytyPS5) (GPL-2.0, credits and the list of files in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). It is the default; `APS5_GPU_BACKEND=legacy` selects the old
-engine, which is obsolete and currently broken (it stops at boot in Grand Theft Auto V).
-
-**1080p (or 720p) in Grand Theft Auto V:**
-
-1. In the game, choose **Performance** in the graphics settings (the patch replaces the sizes of that mode).
-2. Put [`render-1080p-output-1080p.json`](https://github.com/batatinhafcbatatinha-pixel/recomp-patches/tree/main/ps5/PPSA04264)
-   (or `render-720p-output-720p.json`) from recomp-patches into the port's `patches` folder:
-   `.local/ports/PPSA04264/patches/`. Use one of them only.
-3. **PLAY**. The patch holds addresses and values only (no game code). The display-mode writes are "held": the game
-   computes those sizes after start, and AnyPS5 writes the patch's values again whenever the game writes its own (the
-   log says `[patch] held value at ... replaced`). Both patches also set the game's render-scale table to 1.0,
-   written into `app.exe` before start. Remove the file to go back.
+Resolution patches (addresses and values only, no game code) go into the port's `patches` folder,
+`.local/ports/<title id>/patches/`. Display-mode writes can be "held": AnyPS5 writes the patch's values again
+whenever the game writes its own (the log says `[patch] held value at ... replaced`). Remove the file to go back.
 
 ## How to play a game
 
@@ -68,7 +51,6 @@ Every PS5 game takes the same generic path; there are no per-game profiles. Test
 | --- | --- | --- |
 | Dreaming Sarah | PPSA02929 | title menu at 60 fps; PC settings checked in game |
 | Control Ultimate Edition | PPSA01949 | reaches gameplay at about 2 fps |
-| Grand Theft Auto V | PPSA04264 | prologue gameplay, 60 fps at native 1080p (new GPU engine, see above) |
 
 ## Differences from upstream
 
