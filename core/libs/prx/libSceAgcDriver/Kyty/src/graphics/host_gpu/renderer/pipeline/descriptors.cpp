@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "common/fastTls.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -532,7 +533,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		vk::Format              view_format {};
 		Prospero::BufferFormat  format {};
 	};
-	static thread_local std::unordered_map<uint64_t, TextureDescEntry> desc_memo;
+	// AnyPS5: per-thread map through a TLS slot (MinGW thread_local is emulated, slow per call).
+	static Common::FastTls<std::unordered_map<uint64_t, TextureDescEntry>*> desc_memo_slot;
+	auto* desc_memo_ptr = desc_memo_slot.Get();
+	if (desc_memo_ptr == nullptr) {
+		desc_memo_ptr = new std::unordered_map<uint64_t, TextureDescEntry>();
+		desc_memo_slot.Set(desc_memo_ptr);
+	}
+	auto& desc_memo = *desc_memo_ptr;
 	const bool     memo_usable = !m_lod_stats && !resource.heap;
 	TextureDescKey memo_key {};
 	uint64_t       memo_hash = 0;

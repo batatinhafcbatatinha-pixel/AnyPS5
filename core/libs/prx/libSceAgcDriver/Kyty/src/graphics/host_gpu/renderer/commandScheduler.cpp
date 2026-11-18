@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "common/fastTls.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/deviceLossReport.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -18,7 +19,7 @@
 
 namespace Libs::Graphics {
 
-static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
+static Common::FastTls<CommandScheduler*> g_deferred_callback_scheduler;
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -415,7 +416,7 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
-	auto* previous                = g_deferred_callback_scheduler;
+	CommandScheduler* previous    = g_deferred_callback_scheduler;
 	g_deferred_callback_scheduler = this;
 	operation();
 	g_deferred_callback_scheduler = previous;

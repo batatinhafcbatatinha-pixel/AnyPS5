@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "common/fastTls.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -169,7 +170,7 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
 }
 
-thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+Common::FastTls<const Xbyak::CodeGenerator*> t_running_walker;
 
 std::atomic<WalkerFastLoad> g_walker_fast_load {nullptr};
 
@@ -1589,8 +1590,8 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 }
 
 namespace {
-thread_local bool t_walker_skips_gpu_written = false;
-thread_local bool t_walker_tainted           = false;
+Common::FastTls<bool> t_walker_skips_gpu_written;
+Common::FastTls<bool> t_walker_tainted;
 } // namespace
 
 void SetWalkerSkipsGpuWritten(bool skip) {
@@ -1606,7 +1607,9 @@ void MarkWalkerTainted() {
 }
 
 bool TakeWalkerTaint() {
-	return std::exchange(t_walker_tainted, false);
+	const bool tainted = t_walker_tainted;
+	t_walker_tainted   = false;
+	return tainted;
 }
 
 void SrtWalkerNoteProtectedPage(uint64_t address) {
@@ -1623,8 +1626,9 @@ void SetWalkerFastLoad(WalkerFastLoad function) {
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {
-	if (t_running_walker == nullptr ||
-	    rip - reinterpret_cast<uint64_t>(t_running_walker->getCode()) >= t_running_walker->getSize())
+	const Xbyak::CodeGenerator* running = t_running_walker;
+	if (running == nullptr ||
+	    rip - reinterpret_cast<uint64_t>(running->getCode()) >= running->getSize())
 		return 0;
 	const auto* code = reinterpret_cast<const uint8_t*>(rip);
 	return code[0] == 0x41u && code[1] == 0x8bu && code[2] == 0x02u ? 3 : 0;

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "common/fastTls.h"
 
 #include "common/assert.h"
 #include "common/frameClock.h"
@@ -72,9 +73,9 @@ LearnedPrograms& Learned() {
 	return learned;
 }
 
-thread_local uint64_t t_gpu_srt_program = 0;
-thread_local uint64_t t_walked_program  = 0;
-thread_local bool     t_runtime_variant = false;
+Common::FastTls<uint64_t> t_gpu_srt_program;
+Common::FastTls<uint64_t> t_walked_program;
+Common::FastTls<bool>     t_runtime_variant;
 
 } // namespace
 

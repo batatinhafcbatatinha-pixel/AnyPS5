@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "common/fastTls.h"
 #include "graphics/host_gpu/regionManager.h"
 
 #include "common/assert.h"
@@ -35,8 +36,8 @@
 
 namespace Libs::Graphics {
 
-static thread_local Pm4Execution* g_current_execution = nullptr;
-static thread_local GuestGpu*     g_gpu_state         = nullptr;
+static Common::FastTls<Pm4Execution*> g_current_execution;
+static Common::FastTls<GuestGpu*>     g_gpu_state;
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -568,8 +569,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
-	g_current_execution->m_next_buffer = commands;
-	g_current_execution->m_chain       = chain;
+	g_current_execution.Get()->m_next_buffer = commands;
+	g_current_execution.Get()->m_chain       = chain;
 }
 
 void CommandProcessor::SuspendPm4() {
