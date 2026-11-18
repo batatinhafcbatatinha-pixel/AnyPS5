@@ -29,7 +29,7 @@ whenever the game writes its own (the log says `[patch] held value at ... replac
 Lobby of the Federal Bureau of Control at native 720p, measured with the old GPU engine on an RTX 3050 laptop GPU +
 Ryzen 5 3600; not measured yet with the new one.
 
-**[See more games →](docs/games.md)** (Control and Grand Theft Auto V)
+**[See more games →](docs/games.md)**
 
 ## How to play a game
 
