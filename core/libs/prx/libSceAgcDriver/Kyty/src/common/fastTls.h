@@ -14,6 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <intrin.h>
 
 namespace Common {
 
@@ -26,8 +27,11 @@ public:
 	FastTls(const FastTls&)            = delete;
 	FastTls& operator=(const FastTls&) = delete;
 
+	// The first 64 slots live in the thread environment block (TEB TlsSlots at gs:0x1480): read and
+	// written in place; later ones through the API.
 	[[nodiscard]] T Get() const noexcept {
-		const auto raw   = reinterpret_cast<uintptr_t>(TlsGetValue(m_slot));
+		const auto raw   = m_slot < 64 ? static_cast<uintptr_t>(__readgsqword(0x1480 + m_slot * 8))
+		                               : reinterpret_cast<uintptr_t>(TlsGetValue(m_slot));
 		T          value {};
 		std::memcpy(&value, &raw, sizeof(T));
 		return value;
@@ -35,7 +39,11 @@ public:
 	void Set(T value) noexcept {
 		uintptr_t raw = 0;
 		std::memcpy(&raw, &value, sizeof(T));
-		TlsSetValue(m_slot, reinterpret_cast<void*>(raw));
+		if (m_slot < 64) {
+			__writegsqword(0x1480 + m_slot * 8, raw);
+		} else {
+			TlsSetValue(m_slot, reinterpret_cast<void*>(raw));
+		}
 	}
 
 	operator T() const noexcept { return Get(); } // NOLINT(google-explicit-constructor)
