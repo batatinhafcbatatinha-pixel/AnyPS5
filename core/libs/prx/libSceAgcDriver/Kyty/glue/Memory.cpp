@@ -58,6 +58,13 @@ std::unordered_map<uint64_t, DWORD>& Originals() {
 	return originals;
 }
 
+// Guest protection of committed pages the tracker gave back (restore): the next reduction of
+// those pages needs no VirtualQuery. Guest mappings and protection changes forget them.
+std::unordered_map<uint64_t, DWORD>& Known() {
+	static std::unordered_map<uint64_t, DWORD> known;
+	return known;
+}
+
 DWORD Reduce(DWORD original, Common::VirtualMemory::Mode mode) {
 	if (mode == Common::VirtualMemory::Mode::NoAccess) {
 		return PAGE_NOACCESS;
@@ -104,6 +111,7 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 			}
 			const DWORD target = found->second;
 			originals.erase(found);
+			Known()[page] = target;
 			if (!run_open || target != run_target) {
 				flush(page);
 				run_begin  = page;
@@ -113,6 +121,45 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 		}
 		flush(end);
 		return;
+	}
+	{
+		auto& known = Known();
+		bool  all   = true;
+		for (uint64_t page = begin; page < end && all; page += PageBytes) {
+			all = originals.contains(page) || known.contains(page);
+		}
+		if (all) {
+			uint64_t run_begin  = begin;
+			DWORD    run_target = 0;
+			bool     run_open   = false;
+			const auto flush    = [&](uint64_t run_end) {
+				if (run_open && run_end > run_begin &&
+				    !Protect(run_begin, run_end - run_begin, run_target)) {
+					for (uint64_t page = run_begin; page < run_end; page += PageBytes) {
+						(void)Protect(page, PageBytes, run_target);
+					}
+				}
+				run_open = false;
+			};
+			for (uint64_t page = begin; page < end; page += PageBytes) {
+				DWORD original = 0;
+				if (const auto found = originals.find(page); found != originals.end()) {
+					original = found->second;
+				} else {
+					original = known.at(page);
+					originals.emplace(page, original);
+				}
+				const DWORD target = Reduce(original, mode);
+				if (!run_open || target != run_target) {
+					flush(page);
+					run_begin  = page;
+					run_target = target;
+					run_open   = true;
+				}
+			}
+			flush(end);
+			return;
+		}
 	}
 	uint64_t address = begin;
 	while (address < end) {
@@ -474,6 +521,7 @@ void Core::NoteMapped(std::uint64_t address, std::size_t bytes) {
 		auto&           originals = Originals();
 		for (uint64_t page = address & ~(PageBytes - 1); page < address + bytes; page += PageBytes) {
 			originals.erase(page);
+			Known().erase(page);
 		}
 	}
 	if (Libs::Graphics::GuestRange {address, bytes}.Valid()) {
@@ -493,6 +541,7 @@ void Core::NoteReleased(std::uint64_t address, std::size_t bytes) {
 	auto&           originals = Originals();
 	for (uint64_t page = address & ~(PageBytes - 1); page < address + bytes; page += PageBytes) {
 		originals.erase(page);
+		Known().erase(page);
 	}
 }
 
