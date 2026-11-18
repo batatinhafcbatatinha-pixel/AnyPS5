@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "common/srwLock.h"
 
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -44,7 +45,7 @@ struct RecycledImage {
 constexpr uint64_t RecycleBytes = uint64_t {128} << 20u;
 constexpr auto     RecycleAge   = std::chrono::seconds(2);
 
-std::mutex                 g_recycle_mutex;
+Common::SrwMutex           g_recycle_mutex;
 std::vector<RecycledImage> g_recycled;
 uint64_t                   g_recycled_bytes = 0;
 

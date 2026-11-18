@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "common/srwLock.h"
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
@@ -265,7 +266,7 @@ struct PageManager::Impl {
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
-	std::mutex                              region_mutex;
+	Common::SrwMutex                        region_mutex;
 };
 
 static_assert(std::atomic<void*>::is_always_lock_free);

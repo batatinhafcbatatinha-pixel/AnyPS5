@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 
 #include "common/abi.h"
+#include "common/srwLock.h"
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
@@ -277,7 +278,7 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
-	std::mutex                                        m_write_back_mutex;
+	Common::SrwMutex                                  m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;

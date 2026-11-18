@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 
 #include "common/abi.h"
+#include "common/srwLock.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
@@ -88,7 +89,7 @@ private:
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
 	OcclusionQueries          m_occlusion_queries;
-	mutable std::shared_mutex m_mapped_ranges_mutex;
+	mutable Common::SrwSharedMutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;

@@ -11,6 +11,7 @@
 // GPL-2.0.
 
 #include "glue/Core.hpp"
+#include "common/srwLock.h"
 #include "common/fastTls.h"
 #include "glue/CoreInternal.hpp"
 
@@ -48,8 +49,8 @@ namespace {
 
 constexpr uint64_t PageBytes = 0x1000;
 
-std::mutex& ProtectionMutex() {
-	static std::mutex mutex;
+Common::SrwMutex& ProtectionMutex() {
+	static Common::SrwMutex mutex;
 	return mutex;
 }
 

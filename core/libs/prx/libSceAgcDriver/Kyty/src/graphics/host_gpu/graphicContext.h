@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICCONTEXT_H_
 
 #include "common/abi.h"
+#include "common/srwLock.h"
 #include "common/common.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
@@ -133,9 +134,9 @@ struct GraphicContext {
 	uint32_t screen_height = 0;
 
 private:
-	mutable std::mutex                                 m_format_properties_mutex;
+	mutable Common::SrwMutex                           m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
-	mutable std::mutex                                 m_image_format_properties_mutex;
+	mutable Common::SrwMutex                           m_image_format_properties_mutex;
 	mutable std::map<std::tuple<vk::Format, vk::ImageType, vk::ImageTiling, vk::ImageUsageFlags,
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
