@@ -4,6 +4,7 @@
 // created before a surface exists, and the headset, DLSS and FSR paths are left out.
 
 #include "glue/VulkanDevice.hpp"
+#include "glue/Recorder.hpp"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -940,6 +941,7 @@ void CreateBackendDevice(GraphicContext& graphics, vk::SurfaceKHR surface) {
 
 	graphics.device = VulkanCreateDevice(graphics, std::move(device_extensions));
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphics.device);
+	AgcDriver::VramBackend::Recorder::Install();
 	graphics.device.getQueue(graphics.queue_family, 0, &graphics.queue);
 	EXIT_IF(graphics.queue == nullptr);
 	if (graphics.side_queue_count >= 2) {
