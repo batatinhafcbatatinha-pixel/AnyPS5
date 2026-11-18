@@ -11,6 +11,7 @@
 // GPL-2.0.
 
 #include "glue/Core.hpp"
+#include "common/fastTls.h"
 #include "glue/CoreInternal.hpp"
 
 #include "common/assert.h"
@@ -212,7 +213,7 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 }
 
 // Set while a backing read runs a guarded copy: its faults belong to libc's read recovery.
-thread_local bool t_guarded_read = false;
+Common::FastTls<bool> t_guarded_read;
 
 // A plain copy of guest bytes that fails instead of faulting (no tracker read-back, no page walk).
 // APS5_KYTY_MEMSTATS=1: guarded reads (calls, bytes, failures) and slow reads, every 10 s.
@@ -671,19 +672,28 @@ struct CommittedRange {
 	uint64_t begin = 0, end = 0;
 	bool     bounded = false;  // end is the first uncommitted byte
 };
-thread_local CommittedRange t_committed[16];
-thread_local uint64_t       t_committed_generation = 0;
-thread_local uint32_t       t_committed_next       = 0;
+struct CommittedCache {
+	CommittedRange ranges[16];
+	uint64_t       generation = 0;
+	uint32_t       next       = 0;
+};
+Common::FastTls<CommittedCache*> t_committed_cache;
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	// Vertex ranges are clamped at every draw: a range known committed needs no VirtualQuery.
 	AgcDriver::VramBackend::g_clamp_calls.fetch_add(1, std::memory_order_relaxed);
 	const auto generation = AgcDriver::VramBackend::g_commit_generation.load(std::memory_order_acquire);
-	if (t_committed_generation != generation) {
+	auto*      cache      = t_committed_cache.Get();
+	if (cache == nullptr) {
+		cache = new CommittedCache();
+		t_committed_cache.Set(cache);
+	}
+	auto& t_committed = cache->ranges;
+	if (cache->generation != generation) {
 		for (auto& range: t_committed) {
 			range = {};
 		}
-		t_committed_generation = generation;
+		cache->generation = generation;
 	}
 	for (const auto& range: t_committed) {
 		if (range.begin <= vaddr && vaddr < range.end) {
@@ -718,7 +728,7 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		address = region_end;
 	}
 	if (committed != 0) {
-		t_committed[t_committed_next++ % 16] = {vaddr, vaddr + committed, committed != size};
+		t_committed[cache->next++ % 16] = {vaddr, vaddr + committed, committed != size};
 	}
 	if (committed == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
