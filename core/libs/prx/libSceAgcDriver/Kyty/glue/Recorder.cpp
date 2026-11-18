@@ -59,8 +59,11 @@ public:
 		const size_t size = (sizeof(Header) + SlotSize + extra + 15) & ~size_t {15};
 		EXIT_IF(size > Bytes / 4);
 		for (;;) {
-			const auto read = m_read.load(std::memory_order_acquire);
 			auto       write = m_write_local;
+			auto       read  = m_read_cached;
+			if (Bytes - (write - read) < size * 2 + 16) {
+				read = m_read_cached = m_read.load(std::memory_order_acquire);
+			}
 			const auto used  = write - read;
 			const auto at    = write % Bytes;
 			// A record never wraps: the tail is skipped with a wrap marker.
@@ -94,7 +97,6 @@ public:
 		header->size = static_cast<uint32_t>(m_pending_size);
 		m_write_local += m_pending_size;
 		m_write.store(m_write_local, std::memory_order_release);
-		m_published.fetch_add(1, std::memory_order_relaxed);
 		if (m_sleeping.load(std::memory_order_seq_cst)) {
 			Kick();
 		}
@@ -103,11 +105,11 @@ public:
 	// Waits until every published record ran.
 	void Drain() {
 		const auto target = m_write.load(std::memory_order_acquire);
-		if (m_done.load(std::memory_order_acquire) == target) {
+		if (m_done.load(std::memory_order_acquire) >= target) {
 			return;
 		}
 		Kick();
-		while (m_done.load(std::memory_order_acquire) != target) {
+		while (m_done.load(std::memory_order_acquire) < target) {
 			SpinOrYield();
 		}
 	}
@@ -154,8 +156,11 @@ private:
 				}
 				header->run(reinterpret_cast<uint8_t*>(header) + sizeof(Header));
 				read += header->size;
-				m_read.store(read, std::memory_order_release);
-				m_done.store(read, std::memory_order_release);
+				if ((++m_ran & 31) == 0) {
+					m_read.store(read, std::memory_order_release);
+					m_done.store(read, std::memory_order_release);
+				}
+				write = m_write.load(std::memory_order_acquire);
 			}
 			m_read.store(read, std::memory_order_release);
 			m_done.store(read, std::memory_order_release);
@@ -167,10 +172,11 @@ private:
 	std::atomic<uint64_t> m_write {0};
 	std::atomic<uint64_t> m_read {0};
 	std::atomic<uint64_t> m_done {0};
-	std::atomic<uint64_t> m_published {0};
 	std::atomic<bool>     m_sleeping {false};
 	std::atomic<DWORD>    m_thread_id {0};
+	uint64_t              m_ran = 0; // consumer only
 	uint64_t              m_write_local  = 0; // producer only
+	uint64_t              m_read_cached  = 0; // producer only
 	size_t                m_pending_size = 0; // producer only
 	std::thread           m_thread;
 };
@@ -181,18 +187,24 @@ Ring* g_ring = nullptr;
 constexpr size_t                                MaxOpen = 64;
 std::array<std::atomic<VkCommandBuffer>, MaxOpen> g_open {};
 
+std::atomic<size_t> g_open_high {0}; // slots in use are below this
+
 bool IsOpen(VkCommandBuffer buffer) noexcept {
-	for (const auto& slot: g_open) {
-		if (slot.load(std::memory_order_acquire) == buffer) {
+	const auto high = g_open_high.load(std::memory_order_acquire);
+	for (size_t i = 0; i < high; ++i) {
+		if (g_open[i].load(std::memory_order_acquire) == buffer) {
 			return true;
 		}
 	}
 	return false;
 }
 void Open(VkCommandBuffer buffer) {
-	for (auto& slot: g_open) {
+	for (size_t i = 0; i < MaxOpen; ++i) {
 		VkCommandBuffer expected = VK_NULL_HANDLE;
-		if (slot.compare_exchange_strong(expected, buffer)) {
+		if (g_open[i].compare_exchange_strong(expected, buffer)) {
+			auto high = g_open_high.load();
+			while (high < i + 1 && !g_open_high.compare_exchange_weak(high, i + 1)) {
+			}
 			return;
 		}
 	}

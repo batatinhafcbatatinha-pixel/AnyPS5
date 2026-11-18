@@ -2,6 +2,7 @@
 #define KYTY_COMMON_DEBUG_COUNTERS_H_
 
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <cstdint>
 
@@ -83,6 +84,9 @@ inline void NoteWaitSite(void* at, uint64_t ns) noexcept {
 		}
 	}
 }
+
+// AnyPS5: diagnostics of APS5_KYTY_MEMSTATS=1 (read once; off: no counter work on hot paths).
+inline const bool g_aps5_stats = std::getenv("APS5_KYTY_MEMSTATS") != nullptr;
 
 [[nodiscard]] inline bool Enabled() noexcept {
 	return Detail::g_enabled.load(std::memory_order_relaxed);

@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 
 namespace Libs::Graphics {
 
@@ -70,19 +71,19 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 // Queries take no lock: dirty words are read atomically, and a query runs on the GPU thread, which
 // alone writes GPU-dirty bits while other threads only set CPU-dirty ones, so it sees one instant.
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
-	g_cpumod_calls.fetch_add(1, std::memory_order_relaxed);
-	g_cpumod_regions.fetch_add((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) / TRACKER_REGION_SIZE, std::memory_order_relaxed);
+	if (Common::DebugCounters::g_aps5_stats) g_cpumod_calls.fetch_add(1, std::memory_order_relaxed);
+	if (Common::DebugCounters::g_aps5_stats) g_cpumod_regions.fetch_add((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) / TRACKER_REGION_SIZE, std::memory_order_relaxed);
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
 	});
 }
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
-	g_gpumod_calls.fetch_add(1, std::memory_order_relaxed);
+	if (Common::DebugCounters::g_aps5_stats) g_gpumod_calls.fetch_add(1, std::memory_order_relaxed);
 	if (size == 0 || !MayHoldGpuWrites(vaddr, size)) {
 		return false;
 	}
-	g_gpumod_regions.fetch_add((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) / TRACKER_REGION_SIZE, std::memory_order_relaxed);
+	if (Common::DebugCounters::g_aps5_stats) g_gpumod_regions.fetch_add((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) / TRACKER_REGION_SIZE, std::memory_order_relaxed);
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
 	});
