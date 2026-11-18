@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="328" viewBox="0 0 1000 328" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif">
+<rect width="1000" height="328" rx="6" fill="#0d1117" stroke="#30363d"/>
+<text x="150.0" y="28" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="middle">Game</text>
+<text x="390.0" y="28" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="middle">Status</text>
+<text x="740.0" y="28" font-size="16" font-weight="600" fill="#e6edf3" text-anchor="middle">In-game fps</text>
+<line x1="0" y1="44" x2="1000" y2="44" stroke="#30363d"/>
+<line x1="300" y1="0" x2="300" y2="328" stroke="#30363d"/>
+<line x1="480" y1="0" x2="480" y2="328" stroke="#30363d"/>
+<text x="18" y="90.0" font-size="16" font-weight="600" fill="#e6edf3">Control Ultimate Edition</text>
+<text x="18" y="112.0" font-size="12.5" fill="#e6edf3" fill-opacity=".85">PPSA01949</text>
+<rect x="320" y="68.0" width="85" height="24" rx="12" fill="#d29922"/>
+<circle cx="333" cy="80.0" r="3" fill="#fff"/>
+<text x="342" y="84.5" font-size="13" font-weight="600" fill="#fff">In-game</text>
+<text x="320" y="116.0" font-size="12.5" fill="#e6edf3" fill-opacity=".85">measured 2026-11-15</text>
+<rect x="502" y="62" width="225" height="12" rx="6" fill="#4d3a12"/>
+<rect x="502" y="62" width="44.2" height="12" rx="6" fill="#d29922"/>
+<text x="502.0" y="90" font-size="11" fill="#9198a1" text-anchor="start">0</text>
+<line x1="577.0" y1="62" x2="577.0" y2="74" stroke="#0d1117" stroke-opacity=".35"/>
+<text x="577.0" y="90" font-size="11" fill="#9198a1" text-anchor="middle">20</text>
+<line x1="652.0" y1="62" x2="652.0" y2="74" stroke="#0d1117" stroke-opacity=".35"/>
+<text x="652.0" y="90" font-size="11" fill="#9198a1" text-anchor="middle">40</text>
+<text x="727.0" y="90" font-size="11" fill="#9198a1" text-anchor="end">60</text>
+<text x="739" y="73" font-size="14" font-weight="600" fill="#d29922">11.8 fps</text>
+<text x="739" y="90" font-size="11.5" fill="#9198a1">Native 720p · old GPU engine</text>
+<text x="502" y="124" font-size="12" fill="#9198a1">Lobby · not yet measured on the new GPU engine · RTX 3050 laptop + Ryzen 5 3600</text>
+<line x1="0" y1="140" x2="1000" y2="140" stroke="#30363d"/>
+<text x="18" y="232.0" font-size="16" font-weight="600" fill="#e6edf3">Grand Theft Auto V</text>
+<text x="18" y="254.0" font-size="12.5" fill="#e6edf3" fill-opacity=".85">PPSA04264</text>
+<rect x="320" y="210.0" width="93" height="24" rx="12" fill="#2ea043"/>
+<circle cx="333" cy="222.0" r="3" fill="#fff"/>
+<text x="342" y="226.5" font-size="13" font-weight="600" fill="#fff">Playable</text>
+<text x="320" y="258.0" font-size="12.5" fill="#e6edf3" fill-opacity=".85">measured 2026-11-18</text>
+<rect x="502" y="158" width="225" height="12" rx="6" fill="#1f4d2b"/>
+<rect x="502" y="158" width="223.5" height="12" rx="6" fill="#2ea043"/>
+<text x="502.0" y="186" font-size="11" fill="#9198a1" text-anchor="start">0</text>
+<line x1="577.0" y1="158" x2="577.0" y2="170" stroke="#0d1117" stroke-opacity=".35"/>
+<text x="577.0" y="186" font-size="11" fill="#9198a1" text-anchor="middle">20</text>
+<line x1="652.0" y1="158" x2="652.0" y2="170" stroke="#0d1117" stroke-opacity=".35"/>
+<text x="652.0" y="186" font-size="11" fill="#9198a1" text-anchor="middle">40</text>
+<text x="727.0" y="186" font-size="11" fill="#9198a1" text-anchor="end">60</text>
+<text x="739" y="169" font-size="14" font-weight="600" fill="#2ea043">59.6 fps</text>
+<text x="739" y="186" font-size="11.5" fill="#9198a1">Native 1080p · new GPU engine · 60 Hz cap</text>
+<rect x="502" y="204" width="225" height="12" rx="6" fill="#1f4d2b"/>
+<rect x="502" y="204" width="223.5" height="12" rx="6" fill="#2ea043"/>
+<text x="502.0" y="232" font-size="11" fill="#9198a1" text-anchor="start">0</text>
+<line x1="577.0" y1="204" x2="577.0" y2="216" stroke="#0d1117" stroke-opacity=".35"/>
+<text x="577.0" y="232" font-size="11" fill="#9198a1" text-anchor="middle">20</text>
+<line x1="652.0" y1="204" x2="652.0" y2="216" stroke="#0d1117" stroke-opacity=".35"/>
+<text x="652.0" y="232" font-size="11" fill="#9198a1" text-anchor="middle">40</text>
+<text x="727.0" y="232" font-size="11" fill="#9198a1" text-anchor="end">60</text>
+<text x="739" y="215" font-size="14" font-weight="600" fill="#2ea043">59.6 fps</text>
+<text x="739" y="232" font-size="11.5" fill="#9198a1">Native 720p · new GPU engine</text>
+<rect x="502" y="250" width="225" height="12" rx="6" fill="#4d3a12"/>
+<rect x="502" y="250" width="30.4" height="12" rx="6" fill="#d29922"/>
+<text x="502.0" y="278" font-size="11" fill="#9198a1" text-anchor="start">0</text>
+<line x1="577.0" y1="250" x2="577.0" y2="262" stroke="#0d1117" stroke-opacity=".35"/>
+<text x="577.0" y="278" font-size="11" fill="#9198a1" text-anchor="middle">20</text>
+<line x1="652.0" y1="250" x2="652.0" y2="262" stroke="#0d1117" stroke-opacity=".35"/>
+<text x="652.0" y="278" font-size="11" fill="#9198a1" text-anchor="middle">40</text>
+<text x="727.0" y="278" font-size="11" fill="#9198a1" text-anchor="end">60</text>
+<text x="739" y="261" font-size="14" font-weight="600" fill="#d29922">8.1 fps</text>
+<text x="739" y="278" font-size="11.5" fill="#9198a1">720p · old GPU engine (broken picture)</text>
+<text x="502" y="312" font-size="12" fill="#9198a1">Prologue bank scene · RTX 3050 laptop + Ryzen 5 3600</text>
+</svg>
