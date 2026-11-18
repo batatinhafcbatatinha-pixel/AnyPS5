@@ -22,6 +22,15 @@ Resolution patches (addresses and values only, no game code) go into the port's 
 `.local/ports/<title id>/patches/`. Display-mode writes can be "held": AnyPS5 writes the patch's values again
 whenever the game writes its own (the log says `[patch] held value at ... replaced`). Remove the file to go back.
 
+## Frame rate
+
+![In-game fps of title B: 11.8 fps at native 720p](docs/fps/fps-control.svg)
+
+Lobby of title B at native 720p, measured with the old GPU engine on an RTX 3050 laptop GPU +
+Ryzen 5 3600; not measured yet with the new one.
+
+**[See more games →](docs/games.md)** (Control and title A)
+
 ## How to play a game
 
 Windows 10/11 x64 with a Vulkan GPU and a CPU with AVX2. About 1 GB free per game and a few minutes for the first
@@ -50,7 +59,7 @@ Every PS5 game takes the same generic path; there are no per-game profiles. Test
 | Game | Title ID | State |
 | --- | --- | --- |
 | title C | TITLE_ID | title menu at 60 fps; PC settings checked in game |
-| title B | TITLE_ID | reaches gameplay at about 2 fps |
+| title B | TITLE_ID | gameplay, 11.8 fps at native 720p (old GPU engine, see [Frame rate](#frame-rate)) |
 
 ## Differences from upstream
 
