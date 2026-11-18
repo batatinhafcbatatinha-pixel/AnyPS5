@@ -1,4 +1,5 @@
 #include "graphics/shader/shader.h"
+#include "common/srwLock.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -50,7 +51,7 @@ struct ShaderMapEntry {
 };
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMapEntry>> g_shader_map;
-static std::mutex                                                      g_shader_map_mutex;
+static Common::SrwMutex                                                g_shader_map_mutex;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);

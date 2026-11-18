@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 
 #include "common/abi.h"
+#include "common/srwLock.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
@@ -170,7 +171,7 @@ private:
 	friend struct PipelineCacheTestAccess;
 
 	Common::File                             m_file;
-	std::mutex                               m_mutex;
+	Common::SrwMutex                         m_mutex;
 	std::condition_variable_any              m_ready;
 	std::queue<Common::UniqueFunction<void>> m_jobs;
 	// Declared last, so it drains the queue and joins before the rest is destroyed.

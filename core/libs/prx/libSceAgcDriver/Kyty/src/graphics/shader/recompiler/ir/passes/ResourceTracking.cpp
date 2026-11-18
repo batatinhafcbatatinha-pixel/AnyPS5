@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "common/srwLock.h"
 #include "common/fastTls.h"
 
 #include "common/assert.h"
@@ -64,7 +65,7 @@ namespace {
 
 // Programs whose run-time variant is in use.
 struct LearnedPrograms {
-	std::mutex                   mutex;
+	Common::SrwMutex             mutex;
 	std::unordered_set<uint64_t> hashes;
 };
 

@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_
 
 #include "common/alignment.h"
+#include "common/srwLock.h"
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -137,7 +138,7 @@ public:
 		}
 	}
 
-	static inline std::mutex              heap_mutex; // After TextureCache::m_lock.
+	static inline Common::SrwMutex        heap_mutex; // After TextureCache::m_lock.
 	static inline std::vector<HeapChange> heap_changes;
 	static inline std::atomic<uint64_t>   serials {0};
 

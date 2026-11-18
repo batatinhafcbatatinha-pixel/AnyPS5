@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGEHEAP_H_
 
 #include "common/common.h"
+#include "common/srwLock.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -135,7 +136,7 @@ private:
 
 	RenderContext&                       m_context;
 	PageManager&                         m_page_manager;
-	std::mutex                           m_mutex; // Fault-visible Memory state and m_memories.
+	Common::SrwMutex                     m_mutex; // Fault-visible Memory state and m_memories.
 	std::vector<std::unique_ptr<Memory>> m_memories;
 	std::vector<View*>                   m_active; // Acquired since the last commit.
 	uint64_t                             m_draw         = 1;

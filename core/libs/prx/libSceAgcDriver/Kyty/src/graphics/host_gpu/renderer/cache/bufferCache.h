@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 
 #include "common/abi.h"
+#include "common/srwLock.h"
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
@@ -230,7 +231,7 @@ private:
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;
-	std::mutex                                        m_bda_sync_mutex;
+	Common::SrwMutex                                  m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
 	// Unwatched pages: no fault queues their writes, so each guest submission queues them again
 	// (guarded by m_bda_sync_mutex).
@@ -238,7 +239,7 @@ private:
 	std::atomic<bool>                                 m_bda_unwatched_any {false};
 	// Hash of the bytes each unwatched page had when it was last queued (guarded by
 	// m_bda_scan_mutex); cleared when a buffer is created, whose first bytes come from another path.
-	std::mutex                                        m_bda_scan_mutex;
+	Common::SrwMutex                                  m_bda_scan_mutex;
 	std::unordered_map<uint64_t, uint64_t>            m_bda_unwatched_hash;
 	std::atomic<uint64_t>                             m_bda_hash_generation {0};
 	uint64_t                                          m_bda_hash_seen = 0;
