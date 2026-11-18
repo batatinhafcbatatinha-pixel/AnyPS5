@@ -9,7 +9,7 @@
 //   handler replaces the value right after the instruction that wrote it, before the game reads it
 //   back. A value that the game writes and uses at once (sizes of render targets made just after)
 //   needs this: a polling thread replaces it too late. APS5_HOLD_WATCH=2,3 watches only those
-//   writes (0-based, in patch order). Off by default: in title A (render size held
+//   writes (0-based, in patch order). Off by default: in one title (render size held
 //   with watchpoints) the menu stayed black after the profile loaded, for a reason not found.
 // - A polling thread: every 3 ms (closely until each value was replaced once, for two minutes at
 //   most, when there are no watchpoints). It also arms threads created later.

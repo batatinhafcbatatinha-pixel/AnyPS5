@@ -32,7 +32,7 @@ namespace {
 
 // Backings of deleted images, kept for a moment for a new image with the same parameters: a guest
 // surface used alternately as depth and as color gets two images that replace each other every
-// frame (title A shadow maps), and creating and freeing their memory each time is slow. An image is
+// frame (shadow maps), and creating and freeing their memory each time is slow. An image is
 // deleted only after the GPU finished with it, so its backing can serve a new image at once.
 struct RecycledImage {
 	vk::ImageCreateInfo                   info;

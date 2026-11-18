@@ -183,7 +183,7 @@ public:
 			// protection changes per write.
 			// AnyPS5: only when the two writes come in the same or consecutive frames. A page
 			// the guest writes every few frames was kept unwatched too and uploaded every frame
-			// unchanged (title A: 83% of 20 MiB a frame).
+			// unchanged (83% of 20 MiB a frame in one title).
 			if (StickyPagesEnabled()) {
 				const auto frame = TrackerFrame();
 				if (frame != m_rewritten_frame) {

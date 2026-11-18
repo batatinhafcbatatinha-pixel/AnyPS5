@@ -531,7 +531,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			}
 		}
 	} else {
-		// AnyPS5: guest dispatches can exceed the host's workgroup-count limits (title A uses
+		// AnyPS5: guest dispatches can exceed the host's workgroup-count limits (some titles use
 		// millions of groups in Y); split them with a dispatch base, as the legacy driver did.
 		const auto& limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
 		if (thread_group_x > limits.maxComputeWorkGroupCount[0] ||
