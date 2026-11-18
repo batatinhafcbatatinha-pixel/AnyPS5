@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -262,13 +263,15 @@ public:
 					}
 					UpdateProtection<true, false>(watch);
 					for (const auto [first, last]: upload) {
-						uint64_t hot = 0;
-						for (auto page = first; page < last; page++) {
-							hot += m_hot.Get(page) ? 1 : 0;
+						if (Common::DebugCounters::g_aps5_stats) {
+							uint64_t hot = 0;
+							for (auto page = first; page < last; page++) {
+								hot += m_hot.Get(page) ? 1 : 0;
+							}
+							g_hot_upload_bytes.fetch_add(hot * TRACKER_PAGE_SIZE, std::memory_order_relaxed);
+							g_cold_upload_bytes.fetch_add((last - first - hot) * TRACKER_PAGE_SIZE,
+							                              std::memory_order_relaxed);
 						}
-						g_hot_upload_bytes.fetch_add(hot * TRACKER_PAGE_SIZE, std::memory_order_relaxed);
-						g_cold_upload_bytes.fetch_add((last - first - hot) * TRACKER_PAGE_SIZE,
-						                              std::memory_order_relaxed);
 						func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 					}
 					return;
@@ -286,7 +289,9 @@ public:
 		}
 		for (const auto [first, last]: mask) {
 			if constexpr (source == DirtySource::Cpu) {
-				g_cold_upload_bytes.fetch_add((last - first) * TRACKER_PAGE_SIZE, std::memory_order_relaxed);
+				if (Common::DebugCounters::g_aps5_stats) {
+					g_cold_upload_bytes.fetch_add((last - first) * TRACKER_PAGE_SIZE, std::memory_order_relaxed);
+				}
 			}
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}

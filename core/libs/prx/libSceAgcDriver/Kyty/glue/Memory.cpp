@@ -377,6 +377,9 @@ bool GuardedRead(uint64_t address, void* data, uint64_t bytes) {
 	t_guarded_read = true;
 	const bool copied = GuestArena::GuestArenaCopyOwned_nid_no_patch(address, data, bytes);
 	t_guarded_read = false;
+	if (!Common::DebugCounters::g_aps5_stats) {
+		return copied;
+	}
 	auto& stats = Stats();
 	stats.calls.fetch_add(1, std::memory_order_relaxed);
 	stats.bytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -686,7 +689,7 @@ Common::FastTls<CommittedCache*> t_committed_cache;
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	// Vertex ranges are clamped at every draw: a range known committed needs no VirtualQuery.
-	AgcDriver::VramBackend::g_clamp_calls.fetch_add(1, std::memory_order_relaxed);
+	if (Common::DebugCounters::g_aps5_stats) AgcDriver::VramBackend::g_clamp_calls.fetch_add(1, std::memory_order_relaxed);
 	const auto generation = AgcDriver::VramBackend::g_commit_generation.load(std::memory_order_acquire);
 	auto*      cache      = t_committed_cache.Get();
 	if (cache == nullptr) {
@@ -703,18 +706,18 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	for (const auto& range: t_committed) {
 		if (range.begin <= vaddr && vaddr < range.end) {
 			if (vaddr + size <= range.end) {
-				AgcDriver::VramBackend::g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
+				if (Common::DebugCounters::g_aps5_stats) AgcDriver::VramBackend::g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
 				return size;
 			}
 			if (range.bounded) {
-				AgcDriver::VramBackend::g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
+				if (Common::DebugCounters::g_aps5_stats) AgcDriver::VramBackend::g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
 				return range.end - vaddr;
 			}
 		}
 	}
 	// The renderer's map of guest mappings answers most ranges (ring buffers move every draw).
 	if (auto* renderer = Renderer(); renderer != nullptr && size != 0 && renderer->IsMapped(vaddr, size)) {
-		AgcDriver::VramBackend::g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
+		if (Common::DebugCounters::g_aps5_stats) AgcDriver::VramBackend::g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
 		return size;
 	}
 	uint64_t       committed = 0;
@@ -722,7 +725,7 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	uint64_t       address   = vaddr;
 	while (address < end) {
 		MEMORY_BASIC_INFORMATION memory {};
-		AgcDriver::VramBackend::g_clamp_queries.fetch_add(1, std::memory_order_relaxed);
+		if (Common::DebugCounters::g_aps5_stats) AgcDriver::VramBackend::g_clamp_queries.fetch_add(1, std::memory_order_relaxed);
 		if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) == 0 ||
 		    memory.State != MEM_COMMIT) {
 			break;
