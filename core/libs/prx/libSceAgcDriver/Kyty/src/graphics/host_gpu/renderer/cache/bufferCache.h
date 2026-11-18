@@ -244,7 +244,17 @@ private:
 	std::atomic<uint64_t>                             m_bda_hash_generation {0};
 	uint64_t                                          m_bda_hash_seen = 0;
 	// Small ranges streamed in the current guest submission: key (address, size, alignment) -> offset.
-	std::unordered_map<uint64_t, uint64_t>            m_stream_memo;
+	// AnyPS5: open addressing, emptied by a new generation (was an unordered_map: a heap node per
+	// streamed range and a full clear per submission).
+	struct StreamMemoEntry {
+		uint64_t key        = 0;
+		uint64_t offset     = 0;
+		uint64_t generation = 0;
+	};
+	static constexpr size_t                           STREAM_MEMO_SIZE = 16384; // power of two
+	std::vector<StreamMemoEntry>                      m_stream_memo = std::vector<StreamMemoEntry>(STREAM_MEMO_SIZE);
+	uint64_t                                          m_stream_memo_generation = 1;
+	size_t                                            m_stream_memo_count      = 0;
 	uint64_t                                          m_stream_memo_epoch = 0;
 	uint64_t                                          m_stream_memo_last  = 0; // Wraps() the memo is for.
 	// Host view: imported 32 MiB chunks of the guest backing by backing offset, the pages a GPU

@@ -579,11 +579,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		if (m_stream_memo_epoch != TrackerEpoch() || m_stream_memo_last != m_stream_buffer.Wraps()) {
 			m_stream_memo_epoch = TrackerEpoch();
 			m_stream_memo_last  = m_stream_buffer.Wraps();
-			m_stream_memo.clear();
+			++m_stream_memo_generation;
+			m_stream_memo_count = 0;
 		}
 		const auto memo_key = vaddr ^ (size << 48u) ^ (alignment << 40u);
-		if (const auto memo = m_stream_memo.find(memo_key); memo != m_stream_memo.end()) {
-			return {&m_stream_buffer, memo->second};
+		const auto memo_home = static_cast<size_t>((memo_key * 0x9E3779B97F4A7C15ull) >> 50) &
+		                       (STREAM_MEMO_SIZE - 1);
+		size_t memo_slot = STREAM_MEMO_SIZE;
+		for (size_t probe = 0; probe < 16; ++probe) {
+			auto& entry = m_stream_memo[(memo_home + probe) & (STREAM_MEMO_SIZE - 1)];
+			if (entry.generation != m_stream_memo_generation) {
+				memo_slot = (memo_home + probe) & (STREAM_MEMO_SIZE - 1);
+				break;
+			}
+			if (entry.key == memo_key) {
+				return {&m_stream_buffer, entry.offset};
+			}
 		}
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
@@ -592,7 +603,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			}
 			m_stream_buffer.Commit();
 			if (m_stream_memo_last == m_stream_buffer.Wraps()) {
-				m_stream_memo.emplace(memo_key, offset);
+				if (memo_slot != STREAM_MEMO_SIZE && m_stream_memo_count < STREAM_MEMO_SIZE / 2) {
+					m_stream_memo[memo_slot] = {memo_key, offset, m_stream_memo_generation};
+					++m_stream_memo_count;
+				}
 			}
 			return {&m_stream_buffer, offset};
 		}
