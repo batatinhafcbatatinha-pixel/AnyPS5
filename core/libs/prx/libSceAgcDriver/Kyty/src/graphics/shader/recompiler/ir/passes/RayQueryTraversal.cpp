@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <functional>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -24,8 +26,23 @@ constexpr uint32_t OddRemaps = 0x2942u;
 // Dword 3 of a BVH T# selects barycentric triangle results with bit 24.
 constexpr uint32_t Barycentrics = 1u << 24;
 
-// Byte offsets in an instance record: BLAS header, root link and flags (mask in bits 8..15).
+// Byte offsets in an instance record: BLAS header, root link and flags. Records whose BLAS is a
+// raw address at +0 hold the instance mask in flags bits 8..15; records whose BLAS is a node
+// pointer (address >> 3 under flag bits) hold it in bits 24..31.
 constexpr uint32_t InstanceBlas = 0, InstanceRoot = 56, InstanceFlags = 60;
+
+// How a BLAS address is built from two dwords of an instance record: (low, high & mask) << shift.
+// A raw address has mask ~0 and shift 0.
+struct BlasLayout {
+	uint32_t offset = InstanceBlas; // Of the low dword.
+	uint32_t mask   = ~0u;
+	uint32_t shift  = 0;
+
+	bool operator==(const BlasLayout&) const = default;
+
+	// The byte of the instance flags that holds the instance mask.
+	uint32_t MaskByte() const { return shift != 0 ? 3u : 1u; }
+};
 
 // The line of the first (innermost) condition a matcher failed on, for the log of traversals left
 // to emulation.
@@ -156,9 +173,13 @@ struct Traversal: Loop {
 	std::array<Inst*, 5> state {};
 	// A flat walk's loads of prim record words 0 and 1 and of instance flags.
 	std::array<const Inst*, 3> loads {};
-	// A nested walk's instance address and BLAS address words, defined before its loop, its prim
-	// record load and the loop's scalar loads whose address they give.
+	// A nested walk's instance address and the loads of its BLAS words, defined before its loop,
+	// its prim record load and the loop's scalar loads whose address they give.
 	std::array<Inst*, 4>    instance {};
+	BlasLayout              blas;
+	// The values the candidate's replace: the index of each in instance address low and high, BLAS
+	// address low and high, and the raw BLAS dwords.
+	std::vector<std::pair<Inst*, uint32_t>> swaps;
 	Inst*                   record = nullptr;
 	std::vector<Inst*>      scalar;
 	std::array<uint32_t, 2> tlas {};
@@ -413,9 +434,9 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	return true;
 }
 
-// The address whose bits 8..47 a BVH T#'s base holds, or nullptr; dword 3 must select barycentric
-// triangle results.
-Inst* DescriptorAddress(const Inst& descriptor) {
+// The 64-bit address whose bits 8..47 a BVH T#'s base holds, or empty; dword 3 must select
+// barycentric triangle results.
+Value DescriptorAddress(const Inst& descriptor) {
 	const auto* low   = Producer(descriptor.Arg(0), ValueOpcode::CompositeExtractU64);
 	const auto* field = low != nullptr ? Producer(low->Arg(0), ValueOpcode::BitwiseAnd64) : nullptr;
 	const auto* shift =
@@ -424,33 +445,172 @@ Inst* DescriptorAddress(const Inst& descriptor) {
 	const auto  bits  = flags != nullptr ? Immediate(flags->Arg(1)) : std::nullopt;
 	if (shift == nullptr || Immediate(low->Arg(1)) != 0u || Immediate(shift->Arg(1)) != 8u ||
 	    !bits || (*bits & Barycentrics) == 0u) {
-		return nullptr;
+		return {};
 	}
-	return Producer(shift->Arg(0), ValueOpcode::CompositeConstructU64);
+	return shift->Arg(0).Resolve();
+}
+
+// The two dwords a T#'s address is built from directly, or nulls.
+std::array<Inst*, 2> DescriptorWords(const Inst& descriptor) {
+	const auto  address = DescriptorAddress(descriptor);
+	const auto* words =
+	    address.IsEmpty() ? nullptr : Producer(address, ValueOpcode::CompositeConstructU64);
+	if (words == nullptr) return {};
+	return {words->Arg(0).Resolve().TryInstruction(), words->Arg(1).Resolve().TryInstruction()};
+}
+
+// The address resource of `load` and the guest dword offset it reads from it, if it reads one.
+std::optional<std::pair<const Inst*, uint32_t>> AddressOffset(const Program& program,
+                                                              const Inst*    load) {
+	if (load == nullptr || load->GetOpcode() != ValueOpcode::LoadAddressU32) return std::nullopt;
+	const auto& memory   = program.memory_info[load->Flags<MemoryFlags>().index];
+	const bool  based    = memory.kind == ResourceKind::ScalarAddress ||
+	                       (memory.kind == ResourceKind::Global && !memory.address_is_full);
+	const auto* resource = Producer(load->Arg(0), ValueOpcode::GetAddressResource);
+	if (!based || resource == nullptr || Immediate(load->Arg(1)) != 0u) return std::nullopt;
+	return std::pair {resource, memory.offset};
 }
 
 // The address resource of `load` if it reads the guest dword at `offset` from it, or nullptr.
 const Inst* AddressWord(const Program& program, const Inst* load, uint32_t offset) {
-	if (load == nullptr || load->GetOpcode() != ValueOpcode::LoadAddressU32) return nullptr;
-	const auto& memory = program.memory_info[load->Flags<MemoryFlags>().index];
-	const bool  based  = memory.kind == ResourceKind::ScalarAddress ||
-	                     (memory.kind == ResourceKind::Global && !memory.address_is_full);
-	if (!based || memory.offset != offset || Immediate(load->Arg(1)) != 0u) return nullptr;
-	return Producer(load->Arg(0), ValueOpcode::GetAddressResource);
+	const auto at = AddressOffset(program, load);
+	return at && at->second == offset ? at->first : nullptr;
 }
 
-// The instance mask bits a branch on (flags & mask) != 0 tests, for the flags of `instance`.
-std::optional<uint32_t> MaskTest(const Program& program, const Inst& branch, const Inst& instance) {
-	const auto* test = Producer(branch.Arg(0), ValueOpcode::INotEqual32);
-	const auto* bits = test != nullptr && Immediate(test->Arg(1)) == 0u
-	                       ? Producer(test->Arg(0), ValueOpcode::BitwiseAnd32)
-	                       : nullptr;
-	const auto  mask = bits != nullptr ? Immediate(bits->Arg(1)) : std::nullopt;
-	if (!mask || *mask == 0u || (*mask & ~0xff00u) != 0u ||
-	    AddressWord(program, bits->Arg(0).Resolve().TryInstruction(), InstanceFlags) != &instance) {
+// Whether two address resources take the same address.
+bool SameAddress(const Inst& a, const Inst& b) {
+	return a.Arg(0) == b.Arg(0) && a.Arg(1) == b.Arg(1);
+}
+
+// A BLAS address read from an instance record: the loads of its two dwords, the address resource
+// of the low one and the layout.
+struct Blas {
+	std::array<Inst*, 2> loads {};
+	const Inst*          instance = nullptr;
+	BlasLayout           layout;
+	Inst*                address = nullptr; // The 64-bit value of a node pointer's address.
+};
+
+// The BLAS of two dwords, if both load consecutive dwords of one instance.
+std::optional<Blas> BlasOfWords(const Program& program, Value low, Value high, BlasLayout layout) {
+	Blas blas;
+	blas.loads        = {Producer(low, ValueOpcode::LoadAddressU32),
+	                     Producer(high, ValueOpcode::LoadAddressU32)};
+	const auto first  = AddressOffset(program, blas.loads[0]);
+	const auto second = AddressOffset(program, blas.loads[1]);
+	if (!first || !second || first->second % 4u != 0u || second->second != first->second + 4u ||
+	    !SameAddress(*first->first, *second->first)) {
 		return std::nullopt;
 	}
-	return *mask >> 8;
+	blas.instance      = first->first;
+	blas.layout        = layout;
+	blas.layout.offset = first->second;
+	return blas;
+}
+
+// The BLAS of a 64-bit address: two instance dwords (low, high), or a node pointer
+// (low, high & mask) << shift whose mask keeps the high dword's low bits under its flags.
+std::optional<Blas> BlasOfAddress(const Program& program, Value address) {
+	auto*      value = address.Resolve().TryInstruction();
+	BlasLayout layout;
+	if (value != nullptr && value->GetOpcode() == ValueOpcode::ShiftLeftLogical64) {
+		const auto shift = Immediate(value->Arg(1));
+		if (!shift || *shift == 0u || *shift > 8u) return std::nullopt;
+		layout.shift = *shift;
+	}
+	const auto* words = layout.shift != 0u
+	                        ? Producer(value->Arg(0), ValueOpcode::CompositeConstructU64)
+	                        : Producer(address, ValueOpcode::CompositeConstructU64);
+	if (words == nullptr) return std::nullopt;
+	auto high = words->Arg(1);
+	if (const auto* field = Producer(high, ValueOpcode::BitwiseAnd32); field != nullptr) {
+		for (uint32_t side = 0; side < 2; ++side) {
+			const auto mask = Immediate(field->Arg(side));
+			if (!mask || *mask == 0u || ((*mask + 1u) & *mask) != 0u) continue;
+			layout.mask = *mask;
+			high        = field->Arg(1 - side);
+			break;
+		}
+		if (layout.mask == ~0u) return std::nullopt;
+	}
+	if ((layout.shift != 0u) != (layout.mask != ~0u)) return std::nullopt;
+	auto blas = BlasOfWords(program, words->Arg(0), high, layout);
+	if (blas && layout.shift != 0u) blas->address = value;
+	return blas;
+}
+
+// The BLAS of a 64-bit address's low and high halves: the halves of a node pointer's address, or
+// the two instance dwords themselves.
+std::optional<Blas> BlasOfHalves(const Program& program, const Inst* low, const Inst* high) {
+	if (low == nullptr || high == nullptr) return std::nullopt;
+	if (low->GetOpcode() == ValueOpcode::CompositeExtractU64 &&
+	    high->GetOpcode() == ValueOpcode::CompositeExtractU64) {
+		if (low->Arg(0) != high->Arg(0) || Immediate(low->Arg(1)) != 0u ||
+		    Immediate(high->Arg(1)) != 1u) {
+			return std::nullopt;
+		}
+		auto blas = BlasOfAddress(program, low->Arg(0));
+		return blas && blas->layout.shift != 0u ? blas : std::nullopt;
+	}
+	return BlasOfWords(program, Value(const_cast<Inst*>(low)), Value(const_cast<Inst*>(high)),
+	                   {});
+}
+
+bool SameBlas(const Blas& a, const Blas& b) {
+	return a.loads == b.loads && a.layout == b.layout;
+}
+
+// The mask M of a test (field & M) != 0 of the instance mask in byte `byte` of the flags, or empty:
+// the field is the flags shifted or extracted down to that byte, or the flags themselves with M
+// within that byte. `flags` tells the flags word.
+template <typename IsFlags>
+Value ByteMask(Value test, uint32_t byte, IsFlags&& flags) {
+	const auto* compare = Producer(test, ValueOpcode::INotEqual32);
+	const Inst* bits    = nullptr;
+	for (uint32_t side = 0; compare != nullptr && bits == nullptr && side < 2; ++side) {
+		if (Immediate(compare->Arg(1 - side)) == 0u) {
+			bits = Producer(compare->Arg(side), ValueOpcode::BitwiseAnd32);
+		}
+	}
+	const auto is = [&](Value value) {
+		const auto* inst = value.Resolve().TryInstruction();
+		return inst != nullptr && flags(*inst);
+	};
+	for (uint32_t side = 0; bits != nullptr && side < 2; ++side) {
+		const auto  mask  = bits->Arg(1 - side);
+		const auto* field = bits->Arg(side).Resolve().TryInstruction();
+		if (field == nullptr) continue;
+		if (flags(*field)) {
+			const auto immediate = Immediate(mask);
+			if (immediate && *immediate != 0u && (*immediate & ~(0xffu << (8u * byte))) == 0u) {
+				return Value(*immediate >> (8u * byte));
+			}
+			continue;
+		}
+		const auto op = field->GetOpcode();
+		if (op == ValueOpcode::ShiftRightLogical32 && Immediate(field->Arg(1)) == 8u * byte &&
+		    is(field->Arg(0))) {
+			return mask;
+		}
+		if (op == ValueOpcode::BitFieldUExtract && Immediate(field->Arg(1)) == 8u * byte &&
+		    Immediate(field->Arg(2)) == 8u && is(field->Arg(0))) {
+			return mask;
+		}
+	}
+	return {};
+}
+
+// The instance mask bits a branch on a test of the flags of `instance` checks, with the mask in
+// byte `byte` of the flags.
+std::optional<uint32_t> MaskTest(const Program& program, const Inst& branch, const Inst& instance,
+                                 uint32_t byte) {
+	const auto mask = ByteMask(branch.Arg(0), byte, [&](const Inst& inst) {
+		const auto* at = AddressWord(program, &inst, InstanceFlags);
+		return at != nullptr && SameAddress(*at, instance);
+	});
+	const auto bits = mask.IsEmpty() ? std::nullopt : Immediate(mask);
+	if (!bits || *bits == 0u || *bits > 0xffu) return std::nullopt;
+	return *bits;
 }
 
 // Whether the low instance address word, a sum, is the TLAS header's instance array, read from the
@@ -486,12 +646,25 @@ std::array<const Inst*, 2> RecordBase(Value resource) {
 	return {buffer->Arg(0).Resolve().TryInstruction(), stride->Arg(0).Resolve().TryInstruction()};
 }
 
-// Whether a header phi's value is only kept, by a select on the loop's lanes, for lanes it skips.
-bool Kept(const Inst& phi, const Inst& exec) {
+// Whether a header phi's value is never read in the loop: it is only kept, by a select on the
+// loop's lanes, for lanes the loop skips, or carried by phis, in the loop back to its header or out
+// of it.
+bool Kept(const Loop& t, const Inst& phi, const Inst& exec, std::unordered_set<const Inst*>& seen) {
+	if (!seen.insert(&phi).second) return true;
 	return std::ranges::all_of(phi.Uses(), [&](const Use& use) {
-		return use.user->GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2 &&
-		       use.user->Arg(0).Resolve().TryInstruction() == &exec;
+		const auto* user = use.user;
+		if (user->GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2 &&
+		    user->Arg(0).Resolve().TryInstruction() == &exec) {
+			return true;
+		}
+		return user->GetOpcode() == ValueOpcode::Phi &&
+		       (!Inside(t, user->Parent()) || Kept(t, *user, exec, seen));
 	});
+}
+
+bool Kept(const Loop& t, const Inst& phi, const Inst& exec) {
+	std::unordered_set<const Inst*> seen;
+	return Kept(t, phi, exec, seen);
 }
 
 // Whether `user` in the loop body takes the candidate's instance address and BLAS words in place
@@ -515,13 +688,13 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 	    !MatchLoop(program, bvh, address->Arg(1), t)) {
 		return Fail(__LINE__);
 	}
-	auto*       node = HeaderPhi(t, address->Arg(0));
-	const auto* blas = DescriptorAddress(*descriptor);
-	auto* word0 = blas != nullptr ? Producer(blas->Arg(0), ValueOpcode::LoadAddressU32) : nullptr;
-	auto* word1 = blas != nullptr ? Producer(blas->Arg(1), ValueOpcode::LoadAddressU32) : nullptr;
-	const auto* instance = AddressWord(program, word0, InstanceBlas);
-	if (node == nullptr || instance == nullptr ||
-	    AddressWord(program, word1, InstanceBlas + 4) != instance || Inside(t, word0->Parent()) ||
+	auto*       node     = HeaderPhi(t, address->Arg(0));
+	const auto  target   = DescriptorAddress(*descriptor);
+	const auto  blas     = target.IsEmpty() ? std::nullopt : BlasOfAddress(program, target);
+	auto*       word0    = blas ? blas->loads[0] : nullptr;
+	auto*       word1    = blas ? blas->loads[1] : nullptr;
+	const auto* instance = blas ? blas->instance : nullptr;
+	if (node == nullptr || instance == nullptr || Inside(t, word0->Parent()) ||
 	    Inside(t, word1->Parent())) {
 		return Fail(__LINE__);
 	}
@@ -529,6 +702,21 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 	auto* high = instance->Arg(1).Resolve().TryInstruction();
 	if (low == nullptr || high == nullptr) return Fail(__LINE__);
 	t.instance = {low, high, word0, word1};
+	t.blas     = blas->layout;
+	t.swaps    = {{low, 0u}, {high, 1u}};
+	if (blas->address == nullptr) {
+		// The BLAS address is the two dwords.
+		t.swaps.insert(t.swaps.end(), {{word0, 2u}, {word1, 3u}});
+	} else {
+		// The halves of a node pointer's address, and its dwords, which also hold flags.
+		for (const auto& use: blas->address->Uses()) {
+			const auto half = Immediate(use.user->Arg(1));
+			if (use.user->GetOpcode() == ValueOpcode::CompositeExtractU64 && half && *half < 2u) {
+				t.swaps.emplace_back(use.user, 2u + *half);
+			}
+		}
+		t.swaps.insert(t.swaps.end(), {{word0, 4u}, {word1, 5u}});
+	}
 
 	// The TLAS walk's intersection, in a loop around this one.
 	const Inst* walk = nullptr;
@@ -540,9 +728,9 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 			continue;
 		}
 		const auto* words     = Producer(other->Arg(0), ValueOpcode::CompositeConstructU32x4);
-		const auto* tlas      = words != nullptr ? DescriptorAddress(*words) : nullptr;
-		const auto  low_slot  = tlas != nullptr ? Slot(tlas->Arg(0)) : std::nullopt;
-		const auto  high_slot = tlas != nullptr ? Slot(tlas->Arg(1)) : std::nullopt;
+		const auto  tlas      = words != nullptr ? DescriptorWords(*words) : std::array<Inst*, 2> {};
+		const auto  low_slot  = tlas[0] != nullptr ? Slot(Value(tlas[0])) : std::nullopt;
+		const auto  high_slot = tlas[1] != nullptr ? Slot(Value(tlas[1])) : std::nullopt;
 		if (!low_slot || !high_slot) continue;
 		if (walk != nullptr) return Fail(__LINE__);
 		walk   = other;
@@ -582,9 +770,11 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 		if (record != nullptr && record != load) return Fail(__LINE__);
 		record = load;
 	}
-	t.record = record;
-	if (record == nullptr ||
-	    RecordBase(record->Arg(0)) != std::array<const Inst*, 2> {word0, word1} ||
+	t.record                 = record;
+	const auto record_base   = record != nullptr ? RecordBase(record->Arg(0))
+	                                             : std::array<const Inst*, 2> {};
+	const auto record_blas   = BlasOfHalves(program, record_base[0], record_base[1]);
+	if (record == nullptr || !record_blas || !SameBlas(*record_blas, *blas) ||
 	    Immediate(record->Arg(2)) != 0u || Immediate(record->Arg(3)) != 0u ||
 	    !Inside(t, record->Parent())) {
 		return Fail(__LINE__);
@@ -624,7 +814,8 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 		const auto* value = work.back();
 		work.pop_back();
 		if (!seen.insert(value).second) continue;
-		const bool swapped = std::ranges::find(t.instance, value) != t.instance.end();
+		const bool swapped = std::ranges::any_of(
+		    t.swaps, [&](const auto& swap) { return swap.first == value; });
 		for (const auto& use: value->Uses()) {
 			auto*      user = use.user;
 			const auto at   = BlockIndex(program, user->Parent());
@@ -633,10 +824,10 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 				work.push_back(user);
 			} else if (at < begin) {
 				if (mask) return Fail(__LINE__);
-				mask = MaskTest(program, *user, *instance);
+				mask = MaskTest(program, *user, *instance, t.blas.MaskByte());
 				if (!mask) return Fail(__LINE__);
 			} else if (user->Parent() == t.header) {
-				if (user != node && !Kept(*user, *t.exec)) return Fail(__LINE__);
+				if (user != node && !Kept(t, *user, *t.exec)) return Fail(__LINE__);
 			} else if (Replaced(t, *user)) {
 				if (!swapped) return Fail(__LINE__);
 				reads.emplace_back(user, use.operand);
@@ -693,6 +884,9 @@ struct Walk: Loop {
 	Inst*                commit   = nullptr;      // Whether a lane commits the hit it tests.
 	std::vector<std::pair<Inst*, Value>> commits; // The walk's exit phi and its committed value.
 	std::array<uint32_t, 2>              tlas {};
+	std::optional<BlasLayout>            blas;
+	// The walk's other loads of instance dwords, by offset.
+	std::unordered_map<const Inst*, uint32_t> words;
 };
 
 // The values the per-candidate code of a walk takes from the candidate.
@@ -744,8 +938,10 @@ bool PerLane(ValueOpcode op) {
 // What the walk's per-candidate code computes for `value`, copied to `at` from the candidate's
 // `natives`, or without `at` `value` itself; empty unless it depends, past the leaves, only on
 // values from before the walk.
+// `word` loads the candidate's instance dword at an offset.
 Value Copy(const Walk& w, Value value, std::unordered_map<const Inst*, Value>& copies,
-           const Inserter* at = nullptr, std::span<const Value> natives = {}) {
+           const Inserter* at = nullptr, std::span<const Value> natives = {},
+           const std::function<Value(uint32_t)>& word = {}) {
 	value            = value.Resolve();
 	auto* const inst = value.TryInstruction();
 	if (inst == nullptr || !Inside(w, inst->Parent())) return value;
@@ -754,12 +950,14 @@ Value Copy(const Walk& w, Value value, std::unordered_map<const Inst*, Value>& c
 	}
 	if (const auto found = copies.find(inst); found != copies.end()) return found->second;
 	Value copy;
-	if (LaneSelect(w, *inst)) {
-		copy = Copy(w, inst->Arg(1), copies, at, natives);
+	if (const auto offset = w.words.find(inst); offset != w.words.end()) {
+		copy = at != nullptr ? word(offset->second) : value;
+	} else if (LaneSelect(w, *inst)) {
+		copy = Copy(w, inst->Arg(1), copies, at, natives, word);
 	} else if (PerLane(inst->GetOpcode())) {
 		std::vector<Value> args;
 		for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-			args.push_back(Copy(w, inst->Arg(arg), copies, at, natives));
+			args.push_back(Copy(w, inst->Arg(arg), copies, at, natives, word));
 		}
 		if (std::ranges::none_of(args, &Value::IsEmpty)) {
 			copy = at != nullptr ? (*at)(*inst, args) : value;
@@ -769,28 +967,23 @@ Value Copy(const Walk& w, Value value, std::unordered_map<const Inst*, Value>& c
 	return copy;
 }
 
-// The mask M of a conjunct ((flags >> 8) & M) != 0 of `test`, M from before the walk, or 0xff.
+// The mask M of a conjunct (field & M) != 0 of `test` over the instance mask's byte of the flags,
+// M from before the walk, or 0xff.
 Value CullMask(const Walk& w, Value test) {
 	const auto* inst = test.Resolve().TryInstruction();
-	for (uint32_t arg = 0; inst != nullptr && arg < 2; ++arg) {
-		if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+	if (inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+		for (uint32_t arg = 0; arg < 2; ++arg) {
 			if (const auto mask = CullMask(w, inst->Arg(arg)); mask != Value(0xffu)) return mask;
-			continue;
 		}
-		const auto* bits =
-		    inst->GetOpcode() == ValueOpcode::INotEqual32 && Immediate(inst->Arg(1 - arg)) == 0u
-		        ? Producer(inst->Arg(arg), ValueOpcode::BitwiseAnd32)
-		        : nullptr;
-		for (uint32_t side = 0; bits != nullptr && side < 2; ++side) {
-			const auto* shift = Producer(bits->Arg(side), ValueOpcode::ShiftRightLogical32);
-			const auto* mask  = bits->Arg(1 - side).Resolve().TryInstruction();
-			if (shift != nullptr && shift->Arg(0) == Value(w.flags) &&
-			    Immediate(shift->Arg(1)) == 8u && (mask == nullptr || !Inside(w, mask->Parent()))) {
-				return bits->Arg(1 - side);
-			}
-		}
+		return Value(0xffu);
 	}
-	return Value(0xffu);
+	const auto byte = w.blas.value_or(BlasLayout {}).MaskByte();
+	const auto mask =
+	    inst != nullptr ? ByteMask(test, byte, [&](const Inst& flags) { return &flags == w.flags; })
+	                    : Value {};
+	const auto* defined = mask.IsEmpty() ? nullptr : mask.Resolve().TryInstruction();
+	if (mask.IsEmpty() || (defined != nullptr && Inside(w, defined->Parent()))) return Value(0xffu);
+	return mask;
 }
 
 bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> intersections, Walk& w) {
@@ -841,10 +1034,10 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 			continue;
 		}
 		const auto* words = Producer(other->Arg(0), ValueOpcode::CompositeConstructU32x4);
-		const auto* tlas  = words != nullptr ? DescriptorAddress(*words) : nullptr;
+		const auto  tlas  = words != nullptr ? DescriptorWords(*words) : std::array<Inst*, 2> {};
 		const auto* ray   = Producer(other->Arg(1), ValueOpcode::MakeImageAddress);
-		const auto  low   = tlas != nullptr ? Slot(tlas->Arg(0)) : std::nullopt;
-		const auto  high  = tlas != nullptr ? Slot(tlas->Arg(1)) : std::nullopt;
+		const auto  low   = tlas[0] != nullptr ? Slot(Value(tlas[0])) : std::nullopt;
+		const auto  high  = tlas[1] != nullptr ? Slot(Value(tlas[1])) : std::nullopt;
 		if (!low || !high || ray == nullptr || ++found > 1) return Fail(__LINE__);
 		w.tlas = {*low, *high};
 		for (uint32_t arg = 1; arg < 8; ++arg) {
@@ -921,31 +1114,56 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 		return Fail(__LINE__);
 	}
 
-	// Record word 1 is read at +4 of each record through a V# over the BLAS at the instance's +0.
-	const auto blas = [&](const Inst* word, uint32_t offset) {
-		const auto* at = AddressWord(program, word, offset);
-		return at != nullptr && at->Arg(0) == address->Arg(0) && at->Arg(1) == address->Arg(1);
+	// Record word 1 is read at +4 of each record through a V# over the BLAS the instance gives.
+	const auto blas = [&](const std::array<const Inst*, 2>& base) -> std::optional<BlasLayout> {
+		const auto found = BlasOfHalves(program, base[0], base[1]);
+		if (!found || !SameAddress(*found->instance, *address)) return std::nullopt;
+		return found->layout;
 	};
 	for (auto& phi: *records.header) {
 		if (phi.GetOpcode() != ValueOpcode::Phi) continue;
-		bool word1 = phi.NumArgs() != 0;
-		for (size_t arg = 0; arg < phi.NumArgs(); ++arg) {
+		bool                      word1 = phi.NumArgs() != 0;
+		std::optional<BlasLayout> layout;
+		for (size_t arg = 0; word1 && arg < phi.NumArgs(); ++arg) {
 			const auto* read = Producer(phi.Arg(arg), ValueOpcode::ReadConstBuffer);
 			const auto  base =
 			    read != nullptr ? RecordBase(read->Arg(0)) : std::array<const Inst*, 2> {};
-			word1 = word1 && blas(base[0], InstanceBlas) && blas(base[1], InstanceBlas + 4) &&
+			const auto  each = blas(base);
+			word1 = each && (!layout || *layout == *each) &&
 			        program.memory_info[read->Flags<MemoryFlags>().index].offset == 4u;
+			layout = each;
 		}
 		if (!word1) continue;
 		if (w.word1 != nullptr) return Fail(__LINE__);
 		w.word1 = &phi;
+		w.blas  = layout;
+	}
+	if (w.word1 == nullptr) return Fail(__LINE__);
+
+	// The candidate's instance gives the walk's other loads of instance dwords.
+	for (auto* block: w.loop) {
+		for (auto& inst: *block) {
+			const auto at = AddressOffset(program, &inst);
+			if (&inst != w.flags && at && SameAddress(*at->first, *address)) {
+				w.words.emplace(&inst, at->second);
+			}
+		}
 	}
 
 	std::unordered_map<const Inst*, Value> copies;
 	const auto copied = [&](Value value) { return !Copy(w, value, copies).IsEmpty(); };
-	return w.word1 != nullptr && copied(Value(w.accepted)) && copied(Value(w.commit)) &&
+	return copied(Value(w.accepted)) && copied(Value(w.commit)) &&
 	       std::ranges::all_of(w.commits,
 	                           [&](const auto& commit) { return copied(commit.second); });
+}
+
+// The BLAS address of an instance's dwords `low` and `high` in `layout`.
+Value BlasAddress(const Inserter& at, Value low, Value high, const BlasLayout& layout) {
+	using Op = ValueOpcode;
+	if (layout.mask != ~0u) high = at(Op::BitwiseAnd32, {high, Value(layout.mask)});
+	auto address = at(Op::CompositeConstructU64, {low, high});
+	if (layout.shift != 0u) address = at(Op::ShiftLeftLogical64, {address, Value(layout.shift)});
+	return address;
 }
 
 void Rewrite(Program& program, Traversal& t) {
@@ -984,25 +1202,27 @@ void Rewrite(Program& program, Traversal& t) {
 		const auto chosen = at(Op::SelectU32, {valid, native, Value(&phi)});
 		Redirect(phi, chosen, *chosen.Instruction());
 	};
-	// Per-lane loads of guest dwords 0 and 1 from an address: a flat walk's like its prim record
-	// loads, a nested walk's under new full-address memory infos.
-	const auto info = [&](uint32_t word) {
+	// Per-lane loads of guest dwords `word` 0 and 1 at `base` from an address: a flat walk's like its
+	// prim record loads, a nested walk's under new full-address memory infos.
+	const auto info = [&](uint32_t base, uint32_t word) {
 		if (t.instance[0] == nullptr) return t.loads[word]->Flags<uint64_t>();
 		const MemoryFlags flags {.index = static_cast<uint32_t>(program.memory_info.size()),
 		                         .pc    = t.instance[2]->Flags<MemoryFlags>().pc};
 		program.memory_info.push_back(
-		    {.kind = ResourceKind::Global, .offset = word * 4u, .address_is_full = true});
+		    {.kind = ResourceKind::Global, .offset = base + word * 4u, .address_is_full = true});
 		return std::bit_cast<uint64_t>(flags);
 	};
-	const std::array words {info(0), info(1)};
+	const std::array words {info(0, 0), info(0, 1)};
+	const std::array blas_words {info(t.blas.offset, 0), info(t.blas.offset, 1)};
 	const auto       load = [&](Value low, Value high, uint64_t flags) {
 		return at(Op::LoadAddressU32, {at(Op::GetAddressResource, {low, high}), low, high, current},
 		          flags);
 	};
-	// The BLAS header is instance words 0 and 1.
-	const std::array blas {load(instance_low, instance_high, words[0]),
-	                       load(instance_low, instance_high, words[1])};
-	const auto record = at(Op::IAdd64, {at(Op::CompositeConstructU64, {blas[0], blas[1]}), offset});
+	// The BLAS header is built from two instance dwords.
+	const std::array raw {load(instance_low, instance_high, blas_words[0]),
+	                      load(instance_low, instance_high, blas_words[1])};
+	const auto       blas_address = BlasAddress(at, raw[0], raw[1], t.blas);
+	const auto record = at(Op::IAdd64, {blas_address, offset});
 	const auto low    = part(Op::CompositeExtractU64, record, 0);
 	const auto high   = part(Op::CompositeExtractU64, record, 1);
 	choose(*t.state[0], load(low, high, words[0]));
@@ -1014,9 +1234,14 @@ void Rewrite(Program& program, Traversal& t) {
 	} else {
 		// The loop's own instance address and BLAS words become the candidate's, which its scalar
 		// loads read per lane. The record load only runs without the query.
-		const std::array native {instance_low, instance_high, blas[0], blas[1]};
-		for (size_t index = 0; index < native.size(); ++index) {
-			auto&      value  = *t.instance[index];
+		const std::array native {instance_low,
+		                         instance_high,
+		                         part(Op::CompositeExtractU64, blas_address, 0),
+		                         part(Op::CompositeExtractU64, blas_address, 1),
+		                         raw[0],
+		                         raw[1]};
+		for (const auto& [swapped, index]: t.swaps) {
+			auto&      value  = *swapped;
 			const auto chosen = at(Op::SelectU32, {valid, native[index], Value(&value)});
 			const auto uses   = value.Uses();
 			for (const auto& use: uses) {
@@ -1105,8 +1330,9 @@ void RewriteWalk(Program& program, Walk& w) {
 	};
 	const auto u64 = [&](Value low) { return at(Op::CompositeConstructU64, {low, Value(0u)}); };
 	const auto instance = halves(at(Op::RayQueryCandidateInstance, {current}));
-	const auto blas     = at(Op::CompositeConstructU64,
-	                         {load(instance, InstanceBlas), load(instance, InstanceBlas + 4)});
+	const auto layout   = w.blas.value_or(BlasLayout {});
+	const auto blas     = BlasAddress(at, load(instance, layout.offset),
+	                                  load(instance, layout.offset + 4u), layout);
 	const auto record =
 	    halves(at(Op::IAdd64, {blas, with(Op::ShiftLeftLogical64,
 		                                  u64(with(Op::CompositeExtractU32x4, candidate, 3)), 3)}));
@@ -1135,7 +1361,13 @@ void RewriteWalk(Program& program, Walk& w) {
 	    instance[1]};
 
 	std::unordered_map<const Inst*, Value> copies;
-	const auto copy = [&](Value value) { return Copy(w, value, copies, &at, natives); };
+	std::unordered_map<uint32_t, Value>  words;
+	const std::function<Value(uint32_t)> word = [&](uint32_t offset) {
+		auto& loaded = words[offset];
+		if (loaded.IsEmpty()) loaded = load(instance, offset);
+		return loaded;
+	};
+	const auto copy = [&](Value value) { return Copy(w, value, copies, &at, natives, word); };
 	const auto accept =
 	    at(Op::LogicalAnd,
 		   {current, at(Op::LogicalAnd, {copy(Value(w.accepted)), copy(Value(w.commit))})});
@@ -1163,6 +1395,18 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 			if (inst.GetOpcode() == ValueOpcode::BvhIntersect) intersections.push_back(&inst);
 		}
 	}
+	// The blocks of the outermost loops around rewritten traversals, and the intersections left to
+	// emulation with the lines their matchers failed on. The other intersections in a rewritten
+	// traversal's loops, such as its TLAS walk's and its box tests, are not logged.
+	std::vector<std::pair<size_t, size_t>>   rewritten;
+	std::vector<std::tuple<Inst*, int, int>> left;
+	const auto                               outermost = [&](Block* header) {
+		while (auto* up = EnclosingLoop(program, header)) {
+			header = up;
+		}
+		return std::pair {BlockIndex(program, header),
+		                  BlockIndex(program, header->terminator.continue_block)};
+	};
 	uint32_t traced = 0;
 	for (auto* bvh: intersections) {
 		Traversal   traversal;
@@ -1177,15 +1421,25 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 		const int   walk_fail = t_fail_line;
 		const auto& tlas    = walked ? walk.tlas : traversal.tlas;
 		if ((matched || walked) && (traced == 0 || tlas == program.info.ray_query_tlas)) {
+			rewritten.push_back(outermost(walked ? walk.header : traversal.header));
 			walked ? RewriteWalk(program, walk) : Rewrite(program, traversal);
 			program.info.ray_query_tlas = tlas;
 			++traced;
 		} else if (EnclosingLoop(program, bvh->Parent()) != nullptr) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("ShaderRecompiler BVH traversal left to emulation: hash=0x{:016x} nested={} "
-			                "match failed at line {}, walk at line {}\n",
-			                program.shader_hash, nested, match_fail, walk_fail));
+			left.emplace_back(bvh, match_fail, walk_fail);
 		}
+	}
+	for (const auto& [bvh, match_fail, walk_fail]: left) {
+		const auto at = BlockIndex(program, bvh->Parent());
+		if (std::ranges::any_of(rewritten, [&](const auto& loops) {
+			    return at >= loops.first && at <= loops.second;
+		    })) {
+			continue;
+		}
+		Log::WriteToConsoleAndLog(
+		    fmt::format("ShaderRecompiler BVH traversal left to emulation: hash=0x{:016x} nested={} "
+		                "match failed at line {}, walk at line {}\n",
+		                program.shader_hash, bvh->Flags<uint32_t>() == 1u, match_fail, walk_fail));
 	}
 	return traced;
 }

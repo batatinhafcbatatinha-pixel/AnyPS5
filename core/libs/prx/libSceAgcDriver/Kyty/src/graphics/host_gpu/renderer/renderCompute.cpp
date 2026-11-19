@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "gpu_blit_shaders/gpu_dispatch_clamp_spv.h"
 #include "graphics/host_gpu/renderer/gpuDiag.h"
 #include "graphics/host_gpu/renderer/gpuTime.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -581,6 +582,64 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	ResetBindings();
 }
 
+// AnyPS5: the group counts of an indirect dispatch the GPU reads pass through a one-thread copy that
+// zeroes more than 2^31 groups (counts read from bytes that are not dispatch arguments kept the
+// device busy until the driver reset it). Returns the buffer and offset the dispatch reads.
+namespace {
+struct DispatchClamp {
+	vk::PipelineLayout      layout;
+	vk::Pipeline            pipeline;
+	std::unique_ptr<Buffer> ring;
+	uint32_t                next = 0;
+};
+constexpr uint32_t DispatchClampSlots = 4096;
+} // namespace
+
+static std::pair<vk::Buffer, uint64_t> ClampIndirectCounts(RenderContext& context, CommandBuffer& buffer,
+                                                           const Buffer& args, uint64_t offset) {
+	static DispatchClamp clamp;
+	auto&                graphics = context.GetGraphics();
+	if (!clamp.pipeline) {
+		struct Push {
+			uint64_t source, target;
+		};
+		const vk::PushConstantRange  range {vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &range;
+		RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout_info, nullptr, &clamp.layout),
+		                     "create dispatch clamp pipeline layout");
+		clamp.pipeline = CreateComputePipeline(graphics.device, GPU_DISPATCH_CLAMP_SPV, clamp.layout,
+		                                       "create dispatch clamp pipeline");
+		clamp.ring = std::make_unique<Buffer>(
+		    graphics, context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer |
+		        vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    uint64_t {DispatchClampSlots} * 16u);
+	}
+	const uint64_t slot = uint64_t {clamp.next++ % DispatchClampSlots} * 16u;
+	buffer.EndRendering();
+	const auto native = buffer.Handle();
+	// The counts' writers and an earlier indirect read of the slot come first.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eIndirectCommandRead;
+	before.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eComputeShader,
+	                       {}, 1, &before, 0, nullptr, 0, nullptr);
+	native.bindPipeline(vk::PipelineBindPoint::eCompute, clamp.pipeline);
+	const struct {
+		uint64_t source, target;
+	} push {args.BufferDeviceAddress() + offset, clamp.ring->BufferDeviceAddress() + slot};
+	native.pushConstants(clamp.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+	native.dispatch(1, 1, 1);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eDrawIndirect,
+	                       {}, 1, &after, 0, nullptr, 0, nullptr);
+	return {clamp.ring->Handle(), slot};
+}
+
 void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
                                       bool async_compute) {
 	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
@@ -623,6 +682,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF((args_offset & 3u) != 0);
+	const auto [counts_buffer, counts_offset] =
+	    ClampIndirectCounts(m_context, buffer, *args_buffer, args_offset);
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -637,7 +698,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		GpuDiag::Checkpoint(m_context.GetGraphics(), vk_buffer, input_info.stage.module->info.shader_hash, 'c',
 		                    m_context.GetCommandScheduler().CurrentTick());
 	}
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	vk_buffer.dispatchIndirect(counts_buffer, counts_offset);
 	if (gpu_time) GpuTime::After(m_context, vk_buffer, input_info.stage.module->info.shader_hash,
 	                              GpuTime::Kind(input_info.stage.module->info, 'c'));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

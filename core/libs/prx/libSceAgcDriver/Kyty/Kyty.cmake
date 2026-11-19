@@ -61,6 +61,7 @@ agc_kyty_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 agc_kyty_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 agc_kyty_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 agc_kyty_blit_shader(gpu_bvh_mirror gpu_bvh_mirror.comp)
+agc_kyty_blit_shader(gpu_dispatch_clamp gpu_dispatch_clamp.comp)
 agc_kyty_blit_shader(gpu_bvh_walk gpu_bvh_mirror.comp -DWALK=1)
 agc_kyty_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 
