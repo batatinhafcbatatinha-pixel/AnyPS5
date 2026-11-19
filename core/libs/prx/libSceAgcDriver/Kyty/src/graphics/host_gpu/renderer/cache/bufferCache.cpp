@@ -187,6 +187,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+	if (Common::DebugCounters::g_aps5_stats) {
+		Common::DebugCounters::g_download_regions.Note((vaddr >> 20) << 1 | (async ? 1 : 0), total_size);
+	}
 
 	auto download = m_download_buffer.MapDownload(total_size, 64);
 	for (auto& copy: copies) {
@@ -306,6 +309,11 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// The GPU thread itself reading back, such as a descriptor walk recording a draw.
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
+	if (Common::DebugCounters::g_aps5_stats) {
+		// Faults of guest threads (not the GPU thread) count under one key.
+		Common::DebugCounters::g_readback_sites.Note(
+		    from_gpu_thread ? reinterpret_cast<uint64_t>(__builtin_return_address(0)) : 1, size);
+	}
 	if (!from_gpu_thread && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -321,6 +329,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		                                           m_eager_pending.Intersects(vaddr, size));
 		const auto wait_begin =
 		    gpu_bytes ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		// APS5_KYTY_MEMSTATS: outcome of each read-back (see ReportSites "read-back outcomes").
+		const bool stats = Common::DebugCounters::g_aps5_stats;
+		const auto stats_begin = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		const bool precise = stats && (m_gpu_modified_ranges.Intersects(vaddr, size) ||
+		                               m_eager_pending.Intersects(vaddr, size));
+		const bool eager_window = stats && m_eager_pending.Intersects(Common::AlignDown(vaddr, DownloadWindowSize),
+		                                                              DownloadWindowSize);
+		bool synced = false;
 		{
 			const auto window = Common::AlignDown(vaddr, DownloadWindowSize);
 			CompleteEagerDownloads(window,
@@ -340,7 +356,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			                          buffer.CpuAddress() + buffer.Size());
 			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+				synced = true;
 			}
+		}
+		if (stats) {
+			const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                          std::chrono::steady_clock::now() - stats_begin)
+			                                          .count());
+			Common::DebugCounters::g_readback_outcomes.Note(
+			    (from_gpu_thread ? 8u : 0u) | (precise ? 4u : 0u) | (eager_window ? 2u : 0u) | (synced ? 1u : 0u), ns);
 		}
 		if (gpu_bytes) {
 			NoteProducerWait(vaddr, size,
@@ -509,6 +533,16 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 		return;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+	if (Common::DebugCounters::g_aps5_stats) {
+		size_t first = 0;
+		for (const auto& upload: uploads) {
+			for (size_t copy = first; copy < upload.end; ++copy) {
+				Common::DebugCounters::g_upload_regions.Note(
+				    (upload.buffer->CpuAddress() + copies[copy].dstOffset) >> 20, copies[copy].size);
+			}
+			first = upload.end;
+		}
+	}
 
 	const auto source = UploadMemory(
 	    m_graphics, m_scheduler, m_staging_buffer, total_size, 4,

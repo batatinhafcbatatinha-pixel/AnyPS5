@@ -85,6 +85,37 @@ inline void NoteWaitSite(void* at, uint64_t ns) noexcept {
 	}
 }
 
+// AnyPS5: count and bytes per key (a return address or an address region), for the 10 s report.
+struct SiteSlot {
+	std::atomic<uint64_t> key {0}, count {0}, bytes {0};
+};
+template <size_t Slots>
+struct SiteTable {
+	SiteSlot slots[Slots];
+	void Note(uint64_t key, uint64_t bytes) noexcept {
+		key |= 1ull << 63; // 0 marks a free slot
+		for (size_t probe = 0; probe < Slots; ++probe) {
+			auto& slot = slots[(key / 16 + probe) % Slots];
+			auto  seen = slot.key.load(std::memory_order_relaxed);
+			if (seen == 0 && slot.key.compare_exchange_strong(seen, key)) {
+				seen = key;
+			}
+			if (seen == key) {
+				slot.count.fetch_add(1, std::memory_order_relaxed);
+				slot.bytes.fetch_add(bytes, std::memory_order_relaxed);
+				return;
+			}
+		}
+	}
+};
+inline SiteTable<64>  g_readback_sites;   // ReadMemory callers: key = return address
+inline SiteTable<128> g_download_regions; // key = (vaddr >> 20) << 1 | eager
+inline SiteTable<128> g_upload_regions;   // key = vaddr >> 20
+// key = gpu thread 8 | bytes a GPU write covers 4 | eager download in the window 2 | sync download 1; bytes = ns
+inline SiteTable<16>  g_readback_outcomes;
+inline SiteTable<128> g_fault_regions;    // key = (address >> 20) << 2 | gpu thread 2 | write 1
+inline SiteTable<64>  g_fault_rips;       // guest-thread faults: key = rip
+
 // AnyPS5: diagnostics of APS5_KYTY_MEMSTATS=1 (read once; off: no counter work on hot paths).
 inline const bool g_aps5_stats = std::getenv("APS5_KYTY_MEMSTATS") != nullptr;
 

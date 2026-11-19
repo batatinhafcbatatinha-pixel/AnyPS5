@@ -296,6 +296,43 @@ void ReportWaitSites() {
 	}
 	Log::WriteToConsoleAndLog(text + std::string(1, char(10)));
 }
+template <size_t Slots>
+void ReportSites(const char* title, Common::DebugCounters::SiteTable<Slots>& table, bool rva, bool region_flag, int mode = 0) {
+	HMODULE self = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                   reinterpret_cast<LPCWSTR>(&ReportCallers), &self);
+	struct Row {
+		uint64_t key, count, bytes;
+	};
+	std::vector<Row> rows;
+	for (auto& slot: table.slots) {
+		const auto key = slot.key.load(std::memory_order_relaxed);
+		const auto count = slot.count.exchange(0);
+		if (key != 0 && count != 0) rows.push_back({key & ~(1ull << 63), count, slot.bytes.exchange(0)});
+	}
+	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.bytes != b.bytes ? a.bytes > b.bytes : a.count > b.count; });
+	std::string text = title;
+	for (size_t index = 0; index < rows.size() && index < 12; ++index) {
+		const auto& row = rows[index];
+		if (rva && mode == 0) {
+			text += row.key == 1 ? fmt::format(" guest-fault: {} {}KiB", row.count, row.bytes >> 10)
+			                     : fmt::format(" {:#x}: {} {}KiB", row.key - reinterpret_cast<uint64_t>(self), row.count, row.bytes >> 10);
+		} else if (mode == 3) {
+			text += fmt::format(" {}{}{}{}: {} {}ms", (row.key & 8) ? "gpu" : "guest", (row.key & 4) ? "+bytes" : "",
+			                    (row.key & 2) ? "+eager" : "", (row.key & 1) ? "+sync" : "", row.count, row.bytes / 1000000);
+		} else if (mode == 4) {
+			text += fmt::format(" {:#x}{}{}: {}", (row.key >> 2) << 20, (row.key & 2) ? "g" : "c", (row.key & 1) ? "w" : "r", row.count);
+		} else if (mode == 5) {
+			const auto exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+			text += fmt::format(" app+{:#x}: {}", row.key - exe, row.count);
+		} else if (region_flag) {
+			text += fmt::format(" {:#x}{}: {} {}KiB", (row.key >> 1) << 20, (row.key & 1) ? "e" : "s", row.count, row.bytes >> 10);
+		} else {
+			text += fmt::format(" {:#x}: {} {}KiB", row.key << 20, row.count, row.bytes >> 10);
+		}
+	}
+	Log::WriteToConsoleAndLog(text + std::string(1, char(10)));
+}
 void ReportStats() {
 	static const bool enabled = [] {
 		const bool on = std::getenv("APS5_KYTY_MEMSTATS") != nullptr;
@@ -322,6 +359,12 @@ void ReportStats() {
 	    stats.slow.exchange(0), stats.slow_bytes.exchange(0) >> 20) + std::string(1, char(10)));
 	ReportCallers();
 	ReportWaitSites();
+	ReportSites("[memstats] readback sites (rva or guest-fault: count, size):", Common::DebugCounters::g_readback_sites, true, false);
+	ReportSites("[memstats] downloads per MiB (s sync, e eager: count, size):", Common::DebugCounters::g_download_regions, false, true);
+	ReportSites("[memstats] uploads per MiB (count, size):", Common::DebugCounters::g_upload_regions, false, false);
+	ReportSites("[memstats] read-back outcomes (count, time):", Common::DebugCounters::g_readback_outcomes, false, false, 3);
+	ReportSites("[memstats] faults per MiB (c guest/g gpu thread, r/w: count):", Common::DebugCounters::g_fault_regions, false, false, 4);
+	ReportSites("[memstats] guest fault rips (count):", Common::DebugCounters::g_fault_rips, false, false, 5);
 	Log::WriteToConsoleAndLog(fmt::format("[memstats] gpu-modified checks {} regions {}; cpu-modified checks {} regions {}",
 	                                      Libs::Graphics::g_gpumod_calls.exchange(0), Libs::Graphics::g_gpumod_regions.exchange(0),
 	                                      Libs::Graphics::g_cpumod_calls.exchange(0), Libs::Graphics::g_cpumod_regions.exchange(0)) +
@@ -487,6 +530,11 @@ bool Core::HandleFault(void* exception_pointers) noexcept {
 	}
 	if (!Tracked(address)) {
 		return false;
+	}
+	if (Common::DebugCounters::g_aps5_stats) {
+		const bool gpu = Libs::Graphics::GuestGpu::IsGpuThread();
+		Common::DebugCounters::g_fault_regions.Note((address >> 20) << 2 | (gpu ? 2u : 0u) | (kind == 1 ? 1u : 0u), 0);
+		if (!gpu) Common::DebugCounters::g_fault_rips.Note(context->Rip, 0);
 	}
 	const auto access = kind == 1   ? Libs::Graphics::PageFaultAccess::Write
 	                    : kind == 8 ? Libs::Graphics::PageFaultAccess::Execute

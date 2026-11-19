@@ -843,15 +843,28 @@ static void MarkWrittenTable(RenderContext& context, const Snapshot& bound, uint
 		return;
 	}
 	auto& cache = context.GetBufferCache();
-	cache.ReadMemory(address, size);
-	std::vector<uint32_t> words(size / sizeof(uint32_t));
-	if (!Libs::LibKernel::Memory::CopySparseMemory(address, words.data(), words.size() * sizeof(uint32_t))) {
-		return;
+	// Only the records matter. A table no GPU write covers is current in guest memory; one with
+	// GPU-written bytes elsewhere (a large buffer holding a few records) reads its records alone,
+	// so other bytes the GPU wrote are not read back with a wait for the GPU.
+	constexpr uint64_t MaxRecordReads = 4096;
+	const bool         dirty          = cache.HasGpuDirtyBytes(address, size);
+	const bool         per_record     = dirty && (size - offset) / stride < MaxRecordReads;
+	std::vector<uint32_t> words;
+	if (!per_record) {
+		if (dirty) cache.ReadMemory(address, size);
+		words.resize(size / sizeof(uint32_t));
+		if (!Libs::LibKernel::Memory::CopySparseMemory(address, words.data(), words.size() * sizeof(uint32_t))) {
+			return;
+		}
 	}
 	std::vector<std::pair<uint64_t, uint64_t>> ranges;
 	for (uint64_t at = offset; at + sizeof(ShaderBufferResource) <= size; at += stride) {
 		ShaderBufferResource record;
-		std::memcpy(record.fields, words.data() + at / sizeof(uint32_t), sizeof(record.fields));
+		if (per_record) {
+			if (!cache.ReadTable(address + at, sizeof(record.fields), record.fields)) continue;
+		} else {
+			std::memcpy(record.fields, words.data() + at / sizeof(uint32_t), sizeof(record.fields));
+		}
 		const auto base  = record.Base48();
 		const auto bytes = record.GetSize();
 		if (base == 0 || bytes == 0 || bytes > MaxBufferBytes || (base & 3u) != 0 ||
