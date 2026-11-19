@@ -22,6 +22,7 @@
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -520,9 +521,11 @@ bool GuestGpu::Process(Submission& submission) {
 			AdvanceTrackerEpoch();
 			// Uploaded before its first BDA draw. CPU writes made while it waited are read by
 			// its remaining commands.
-			m_renderer.GetBufferCache().QueueUnwatchedPages(
-			    submission.resumed ? m_renderer.GetBufferCache().ScanUnwatchedPages()
-			                       : std::exchange(submission.bda_pages, {}));
+			if (submission.resumed) {
+				m_renderer.GetBufferCache().RequestUnwatchedRescan();
+			} else {
+				m_renderer.GetBufferCache().QueueUnwatchedPages(std::exchange(submission.bda_pages, {}));
+			}
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
 			if (submission.execution.MadeProgress()) {
@@ -902,8 +905,14 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
-		DispatchDirect(args->x, args->y, args->z, mode);
+		// AnyPS5: the arguments may be a GPU write still in flight or held only by a cache
+		// buffer: read them through the buffer cache, as the dispatch would see them, not from
+		// guest memory (stale bytes there made dispatches of billions of groups).
+		vk::DispatchIndirectCommand args {};
+		if (!m_renderer.GetBufferCache().ReadTable(args_addr, sizeof(args), &args)) {
+			std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
+		}
+		DispatchDirect(args.x, args.y, args.z, mode);
 		return;
 	}
 	SubmitReadBackWrites(m_renderer);

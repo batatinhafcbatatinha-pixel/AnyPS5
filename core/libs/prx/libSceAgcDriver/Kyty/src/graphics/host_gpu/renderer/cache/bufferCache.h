@@ -101,6 +101,9 @@ public:
 	// queues them for the BDA upload when its processing starts.
 	[[nodiscard]] RangeSet ScanUnwatchedPages();
 	void                   QueueUnwatchedPages(const RangeSet& pages);
+	// A resumed submission rescans at its next BDA upload, not when it is retried: a retry that
+	// blocks again reads nothing.
+	void RequestUnwatchedRescan() { m_bda_rescan_pending.store(true, std::memory_order_release); }
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	// is_write: a CPU write (the host view keeps the cache-buffer copy mapped and refreshes it).
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write = false);
@@ -281,6 +284,7 @@ private:
 	std::vector<std::pair<uint64_t, vk::DeviceAddress>> m_pt_queue;
 	// Set after m_bda_sync grows, so draws with nothing queued skip SynchronizeBda.
 	std::atomic<bool>                                 m_bda_sync_pending {false};
+	std::atomic<bool>                                 m_bda_rescan_pending {false};
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

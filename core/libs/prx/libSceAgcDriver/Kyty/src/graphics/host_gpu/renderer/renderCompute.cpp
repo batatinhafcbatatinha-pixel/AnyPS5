@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuDiag.h"
 #include "graphics/host_gpu/renderer/gpuTime.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -321,6 +322,18 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		return;
 	}
 
+	// AnyPS5: more than 2^31 groups is no real dispatch but dimensions read from the wrong bytes;
+	// recorded, it keeps the GPU busy until the driver resets the device. Skipped and reported.
+	if (uint64_t {thread_group_x} * thread_group_y > (uint64_t {1} << 31u) / thread_group_z) {
+		static std::atomic<uint32_t> skipped {0};
+		if (skipped.fetch_add(1, std::memory_order_relaxed) < 16) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "[dispatch] skipped {}x{}x{} groups (more than 2^31; shader 0x{:x}, mode 0x{:x})\n",
+			    thread_group_x, thread_group_y, thread_group_z, sh_ctx.GetCs().cs_regs.data_addr, mode));
+		}
+		return;
+	}
+
 	Common::LockGuard lock(m_context.GetMutex());
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
@@ -515,6 +528,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	const bool gpu_time = GpuTime::Enabled(m_context);
 	if (gpu_time) GpuTime::Before(m_context, vk_buffer);
+	if (GpuDiag::Wanted()) {
+		GpuDiag::Checkpoint(m_context.GetGraphics(), vk_buffer, program.shader_hash, 'c',
+		                    m_context.GetCommandScheduler().CurrentTick());
+	}
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -616,6 +633,10 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	const bool gpu_time = GpuTime::Enabled(m_context);
 	if (gpu_time) GpuTime::Before(m_context, vk_buffer);
+	if (GpuDiag::Wanted()) {
+		GpuDiag::Checkpoint(m_context.GetGraphics(), vk_buffer, input_info.stage.module->info.shader_hash, 'c',
+		                    m_context.GetCommandScheduler().CurrentTick());
+	}
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	if (gpu_time) GpuTime::After(m_context, vk_buffer, input_info.stage.module->info.shader_hash,
 	                              GpuTime::Kind(input_info.stage.module->info, 'c'));

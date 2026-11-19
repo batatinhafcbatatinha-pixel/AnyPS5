@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/deviceLossReport.h"
 
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuDiag.h"
 
 #include <array>
 #include <atomic>
@@ -20,6 +21,7 @@
 namespace Libs::Graphics {
 
 void ReportDeviceLoss(const GraphicContext& graphics, const char* where, int result) {
+	GpuDiag::Report(graphics, where);
 	static std::atomic<bool> reported {false};
 	if (reported.exchange(true)) return;
 	constexpr double MiB = 1024.0 * 1024.0;

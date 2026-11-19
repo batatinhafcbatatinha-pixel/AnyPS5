@@ -95,6 +95,47 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+// APS5_KYTY_BVH_LOOP_GUARD: back edges an invocation of a program that walks a BVH may take (0: no
+// guard). A traversal over a malformed or half-written BVH can cycle forever and stall the device
+// until the driver resets it; past the limit its loops leave as if done.
+uint32_t BvhLoopGuardLimit() {
+	static const uint32_t limit = [] {
+		const char* text = std::getenv("APS5_KYTY_BVH_LOOP_GUARD");
+		return text != nullptr && *text != 0 ? static_cast<uint32_t>(std::strtoul(text, nullptr, 0)) : 32768u;
+	}();
+	return limit;
+}
+
+// A latch's back-edge condition, counted and cleared once the invocation's limit is reached. Only
+// a latch that already branches out of its loop is guarded, so no edge (or phi operand) is added.
+uint32_t EmitLoopGuard(ValueEmitContext& ctx, const IR::Block* block, uint32_t condition) {
+	auto& s = ctx.state;
+	if (s.loop_guard_variable == 0) return condition;
+	const auto& term   = block->terminator;
+	const auto  latch  = [&](const IR::Block* target) {
+		return target != nullptr && target->terminator.loop_header &&
+		       target->terminator.continue_block == block;
+	};
+	const bool back_true = latch(term.true_block), back_false = latch(term.false_block);
+	if (back_true == back_false) return condition;
+	const auto u     = TypeU32(s);
+	const auto count = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpLoad, u, count, s.loop_guard_variable);
+	const auto next = EmitAddU32(s, count, ConstantU32(s, 1));
+	s.builder.AddFunction(spv::OpStore, s.loop_guard_variable, next);
+	const auto within = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpULessThan, TypeBool(s), within, next, ConstantU32(s, BvhLoopGuardLimit()));
+	const auto guarded = s.builder.AllocateId();
+	if (back_true) {
+		s.builder.AddFunction(spv::OpLogicalAnd, TypeBool(s), guarded, condition, within);
+	} else {
+		const auto past = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpLogicalNot, TypeBool(s), past, within);
+		s.builder.AddFunction(spv::OpLogicalOr, TypeBool(s), guarded, condition, past);
+	}
+	return guarded;
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
@@ -130,7 +171,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			const auto condition = EmitLoopGuard(ctx, block, ctx.Def(block->condition));
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -709,6 +750,15 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	// APS5_KYTY_LOOP_GUARD_ALL=1 (diagnostic): every program's loops take the guard.
+	static const bool guard_all = std::getenv("APS5_KYTY_LOOP_GUARD_ALL") != nullptr;
+	if ((program.info.bvh || program.info.bvh8 || guard_all) && !state.program.dispatcher_fallback &&
+	    BvhLoopGuardLimit() != 0) {
+		state.loop_guard_variable = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_guard_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -737,6 +787,9 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.loop_guard_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_guard_variable, ConstantU32(state, 0));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);

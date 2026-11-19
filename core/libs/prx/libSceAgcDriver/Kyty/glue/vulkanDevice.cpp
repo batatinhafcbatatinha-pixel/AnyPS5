@@ -380,6 +380,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		if (available) device_extensions.push_back(name);
 		return available;
 	};
+	// APS5_KYTY_GPU_DIAG: checkpoints, driver diagnostics and fault reports for device losses.
+	const bool gpu_diag = std::getenv("APS5_KYTY_GPU_DIAG") != nullptr;
+	if (gpu_diag) {
+		graphics.diagnostic_checkpoints_enabled = add(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		graphics.device_fault_enabled            = add(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	}
+	const bool diagnostics_config = gpu_diag && add(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 	// Optional feature structs stay in the query only with their extension.
 	vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features,
 	                   vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceRobustness2FeaturesEXT,
@@ -669,7 +676,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
-	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE}};
+	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE},
+	    vk::PhysicalDeviceFaultFeaturesEXT {.deviceFault = VK_TRUE},
+	    vk::DeviceDiagnosticsConfigCreateInfoNV {
+	        .flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+	                 vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+	                 vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableAutomaticCheckpoints}};
+	if (!graphics.device_fault_enabled) create.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+	if (!diagnostics_config) create.unlink<vk::DeviceDiagnosticsConfigCreateInfoNV>();
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {
 		create.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
 	}

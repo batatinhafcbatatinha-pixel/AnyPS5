@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/gpuDiag.h"
 #include "graphics/host_gpu/renderer/gpuTime.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
@@ -1225,6 +1226,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 	const bool    gpu_time          = GpuTime::Enabled(m_context);
 	if (gpu_time) GpuTime::Before(m_context, vk_buffer);
+	if (GpuDiag::Wanted()) {
+		const auto& checked = state.ps_active ? state.ps_input_info.stage.module->info
+		                                      : state.vertex_info[0].stage.module->info;
+		GpuDiag::Checkpoint(m_context.GetGraphics(), vk_buffer, checked.shader_hash, 'd',
+		                    m_context.GetCommandScheduler().CurrentTick());
+	}
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
