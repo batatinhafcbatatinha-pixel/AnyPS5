@@ -462,30 +462,54 @@ bool CopyOpened(uint64_t address, void* data, uint64_t bytes, bool write) {
 	auto&           originals = Originals();
 	const auto      begin     = address & ~(PageBytes - 1);
 	const auto      end       = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
-	std::vector<std::pair<uint64_t, DWORD>> reduced;
-	const auto restore = [&] {
-		for (const auto& [opened, protection]: reduced) {
-			(void)Protect(opened, PageBytes, protection);
+	// Runs of pages opened together, with the protection they had: one VirtualQuery per region of
+	// equal protection and one VirtualProtect per run, not three calls per page (a 512 KiB
+	// download window was 384 system calls under this mutex).
+	struct Run {
+		uint64_t first, bytes;
+		DWORD    protection;
+	};
+	std::vector<Run> reduced;
+	const auto       restore = [&] {
+		for (const auto& run: reduced) {
+			if (!Protect(run.first, run.bytes, run.protection)) {
+				for (uint64_t page = run.first; page < run.first + run.bytes; page += PageBytes) {
+					(void)Protect(page, PageBytes, run.protection);
+				}
+			}
 		}
 	};
-	for (uint64_t page = begin; page < end; page += PageBytes) {
+	// The protection a reduced page opens to, or 0 for a page the tracker left alone.
+	const auto target = [&](uint64_t page) -> DWORD {
+		const auto found = originals.find(page);
+		return found == originals.end() ? 0 : write ? PAGE_READWRITE : found->second;
+	};
+	for (uint64_t page = begin; page < end;) {
 		MEMORY_BASIC_INFORMATION memory {};
 		if (VirtualQuery(reinterpret_cast<void*>(page), &memory, sizeof(memory)) == 0 ||
 		    memory.State != MEM_COMMIT) {
 			restore();
 			return false;
 		}
-		if (const auto found = originals.find(page); found != originals.end()) {
-			if (!Protect(page, PageBytes, write ? PAGE_READWRITE : found->second)) {
+		const auto region_end =
+		    std::min(end, reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize);
+		while (page < region_end) {
+			const DWORD opened = target(page);
+			uint64_t    last   = page + PageBytes;
+			while (last < region_end && target(last) == opened) last += PageBytes;
+			if (opened != 0) {
+				if (!Protect(page, last - page, opened)) {
+					restore();
+					return false;
+				}
+				reduced.push_back({page, last - page, memory.Protect});
+			} else if (write ? (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
+			                                      PAGE_EXECUTE_WRITECOPY)) == 0
+			                 : (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
 				restore();
 				return false;
 			}
-			reduced.emplace_back(page, memory.Protect);
-		} else if (write ? (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
-		                                      PAGE_EXECUTE_WRITECOPY)) == 0
-		                 : (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-			restore();
-			return false;
+			page = last;
 		}
 	}
 	// `data` is host memory (staging): a guest page there would fault into this mutex.
