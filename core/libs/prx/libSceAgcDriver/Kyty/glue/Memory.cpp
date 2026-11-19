@@ -322,6 +322,8 @@ void ReportSites(const char* title, Common::DebugCounters::SiteTable<Slots>& tab
 			                    (row.key & 2) ? "+eager" : "", (row.key & 1) ? "+sync" : "", row.count, row.bytes / 1000000);
 		} else if (mode == 4) {
 			text += fmt::format(" {:#x}{}{}: {}", (row.key >> 2) << 20, (row.key & 2) ? "g" : "c", (row.key & 1) ? "w" : "r", row.count);
+		} else if (mode == 6) {
+			text += fmt::format(" {}: {}", row.key, row.count);
 		} else if (mode == 5) {
 			const auto exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
 			text += fmt::format(" app+{:#x}: {}", row.key - exe, row.count);
@@ -363,6 +365,8 @@ void ReportStats() {
 	ReportSites("[memstats] downloads per MiB (s sync, e eager: count, size):", Common::DebugCounters::g_download_regions, false, true);
 	ReportSites("[memstats] uploads per MiB (count, size):", Common::DebugCounters::g_upload_regions, false, false);
 	ReportSites("[memstats] read-back outcomes (count, time):", Common::DebugCounters::g_readback_outcomes, false, false, 3);
+	ReportSites("[memstats] early compute reasons (1 off, 2 short, 3 no writer, 4 no program, 5 known, 6 counted: count):",
+	            Common::DebugCounters::g_early_reasons, false, false, 6);
 	ReportSites("[memstats] faults per MiB (c guest/g gpu thread, r/w: count):", Common::DebugCounters::g_fault_regions, false, false, 4);
 	ReportSites("[memstats] guest fault rips (count):", Common::DebugCounters::g_fault_rips, false, false, 5);
 	Log::WriteToConsoleAndLog(fmt::format("[memstats] gpu-modified checks {} regions {}; cpu-modified checks {} regions {}",

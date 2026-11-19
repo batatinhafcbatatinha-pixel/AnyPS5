@@ -6,7 +6,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <array>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -29,18 +31,22 @@ struct ImageHeapTestAccess;
 // snapshot, which each draw refreshes once; a view takes the changes when a draw first acquires
 // it. Images behind elements report their changes through Image::heap_changes. A smaller table
 // leaves at a suspend point if the frame did not acquire it, a larger one after
-// LargeTableIdleFrames such frames.
+// LargeTableIdleFrames such frames. With GPU-SRT images, the heap also keeps the global
+// descriptor map, whose image buckets select (and hold refs on) the same elements.
 class ImageHeap final: public ShaderRecompiler::IR::ImageHeapSource {
 public:
 	ImageHeap(RenderContext& context, PageManager& page_manager);
 	~ImageHeap();
 
-	// The GPU-SRT global map is not kept by this heap: every key takes the shader path.
-	uint32_t GlobalEntry(
-	    const std::array<uint32_t, ShaderRecompiler::IR::GlobalMapKeyWords>&) override {
-		return UINT32_MAX;
-	}
 	KYTY_CLASS_NO_COPY(ImageHeap);
+
+	// GPU-SRT global descriptor map (ShaderRecompiler::IR::GlobalMap*): the entry of a T# or S#
+	// key, resolved now, or UINT32_MAX when the map is off or the key finds no bucket.
+	uint32_t GlobalEntry(
+	    const std::array<uint32_t, ShaderRecompiler::IR::GlobalMapKeyWords>& key) override;
+	// At submission: reads back the keys shaders of the batch reported missing and clears the
+	// ring. Rebind resolves them once the batch has finished; Commit writes their buckets.
+	void RecordGlobalReadback(CommandBuffer& buffer);
 
 	// Starts a draw or dispatch, before its programs acquire views.
 	void BeginDraw() { ++m_draw; }
@@ -122,6 +128,7 @@ private:
 	void     UpdateProbe(View& view, uint64_t probe);
 	void     Assign(View& view, size_t slot, uint32_t entry);
 	uint32_t Intern(View& view, uint32_t kind, const Key& key);
+	uint32_t InternElement(uint32_t kind, const Key& key);
 	void     Release(uint32_t entry);
 	void     Retire();
 	void     Mark(uint32_t index, State state);
@@ -133,6 +140,30 @@ private:
 	uint32_t Allocate();
 	void     Resize(Memory& memory, uint64_t base, uint64_t size);
 	void     WriteDescriptors();
+
+	using GlobalKey = std::array<uint32_t, ShaderRecompiler::IR::GlobalMapKeyWords>;
+	// A resolved bucket of the global map. An image bucket holds a ref on its element, so the
+	// element stays while the bucket selects it.
+	struct GlobalBucket {
+		GlobalKey key {};
+		uint32_t  entry = 0; // Image: arm << ImageHeapKindShift | element; else sampler index.
+		bool      known = false;
+		bool      image = false;
+	};
+	struct GlobalReadback {
+		uint64_t                tick       = 0;
+		uint64_t                generation = 0;
+		std::unique_ptr<Buffer> buffer;
+	};
+	void     DrainGlobalMisses();
+	void     ResolveGlobalBucket(uint32_t bucket, const GlobalKey& key);
+	void     ForgetGlobalBucket(uint32_t bucket);
+	void     RepointGlobal();
+	void     ResetGlobalMap();
+	uint32_t GlobalProfile(uint32_t word);
+	uint32_t GlobalSampler(const GlobalKey& key);
+	void     ClearGlobalMap(CommandBuffer& buffer);
+	void     UploadGlobalBuckets(CommandBuffer& buffer);
 
 	RenderContext&                       m_context;
 	PageManager&                         m_page_manager;
@@ -159,6 +190,19 @@ private:
 	vk::DescriptorSetLayout                           m_layout = nullptr;
 	vk::DescriptorPool                                m_pool   = nullptr;
 	vk::DescriptorSet                                 m_set    = nullptr;
+	// Global map state; the map exists when GPU-SRT images are enabled.
+	std::unique_ptr<Buffer>                           m_global_map;
+	std::vector<GlobalBucket>                         m_global_buckets;
+	std::vector<uint32_t>                             m_global_dirty; // Buckets to upload.
+	std::deque<GlobalReadback>                        m_global_readbacks;
+	std::vector<std::unique_ptr<Buffer>>              m_global_spare;
+	std::map<std::array<uint32_t, 5>, uint32_t>       m_global_samplers; // S#, profile: index.
+	std::vector<uint32_t>                             m_global_upload;
+	uint64_t                                          m_global_generation = 0; // Map resets.
+	uint32_t                                          m_global_known      = 0; // Resolved buckets.
+	uint32_t                                          m_global_sampler_count = 0;
+	bool m_global_clear = true;  // The whole device map is zeroed at the next commit.
+	bool m_global_used  = false; // A commit since the last readback.
 
 	friend struct ImageHeapTestAccess;
 };

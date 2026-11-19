@@ -885,11 +885,18 @@ void BufferCache::NoteProducerWait(uint64_t vaddr, uint64_t size, double ms) {
 	static constexpr auto     LearnWindow = std::chrono::seconds(2);
 	static constexpr uint32_t LearnWaits  = 20;
 	static constexpr double   LearnMs     = 20.0;
-	if (!m_scheduler.EarlyComputeEnabled() || ms <= 0.05) return;
+	// APS5_KYTY_MEMSTATS: why a read-back wait teaches early compute nothing (key = reason).
+	const auto why = [](uint64_t reason) {
+		if (Common::DebugCounters::g_aps5_stats) Common::DebugCounters::g_early_reasons.Note(reason, 0);
+	};
+	if (!m_scheduler.EarlyComputeEnabled()) return why(1);
+	if (ms <= 0.05) return why(2);
 	auto it = m_readback_writers.upper_bound(vaddr + size - 1);
-	if (it == m_readback_writers.begin() || std::prev(it)->second.first <= vaddr) return;
+	if (it == m_readback_writers.begin() || std::prev(it)->second.first <= vaddr) return why(3);
 	const auto program = std::prev(it)->second.second;
-	if (program == 0 || m_early_producers.contains(program)) return;
+	if (program == 0) return why(4);
+	if (m_early_producers.contains(program)) return why(5);
+	why(6);
 	const auto now    = std::chrono::steady_clock::now();
 	auto&      window = m_producer_windows[program];
 	if (window.waits == 0 || now - window.start > LearnWindow) window = {now, 0, 0};

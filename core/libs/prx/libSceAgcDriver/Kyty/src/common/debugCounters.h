@@ -111,6 +111,7 @@ struct SiteTable {
 inline SiteTable<64>  g_readback_sites;   // ReadMemory callers: key = return address
 inline SiteTable<128> g_download_regions; // key = (vaddr >> 20) << 1 | eager
 inline SiteTable<128> g_upload_regions;   // key = vaddr >> 20
+inline SiteTable<16>  g_early_reasons;    // early compute learning: why a wait taught nothing (see NoteProducerWait)
 // key = gpu thread 8 | bytes a GPU write covers 4 | eager download in the window 2 | sync download 1; bytes = ns
 inline SiteTable<16>  g_readback_outcomes;
 inline SiteTable<128> g_fault_regions;    // key = (address >> 20) << 2 | gpu thread 2 | write 1

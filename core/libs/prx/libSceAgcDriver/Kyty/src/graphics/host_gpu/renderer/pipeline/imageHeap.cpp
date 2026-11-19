@@ -3,8 +3,10 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -12,6 +14,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <bit>
 #include <iterator>
 #include <xxhash.h>
@@ -25,6 +28,30 @@ namespace IR = ShaderRecompiler::IR;
 constexpr uint64_t MinTableBytes        = 64ull * 1024ull;
 constexpr uint32_t LargeTableIdleFrames = 32;
 constexpr uint32_t ElementMask          = (1u << IR::ImageHeapKindShift) - 1u;
+// The global map resets once this many buckets are resolved, before probes start to fail.
+constexpr uint32_t GlobalMapResetBuckets = IR::GlobalMapBucketCount / 2u;
+constexpr uint64_t GlobalRingBytes =
+    (uint64_t {IR::GlobalMapRingBase} +
+     uint64_t {IR::GlobalMapRingCapacity} * IR::GlobalMapRingEntryWords) *
+    sizeof(uint32_t);
+
+// Global map bucket of a probe of a key: the shader's FNV-1a hash and linear probes.
+uint32_t GlobalBucketOf(const std::array<uint32_t, IR::GlobalMapKeyWords>& key, uint32_t probe) {
+	uint32_t hash = 2166136261u;
+	for (const auto word: key) hash = (hash ^ word) * 16777619u;
+	hash ^= hash >> 15u;
+	return (hash + probe) & (IR::GlobalMapBucketCount - 1u);
+}
+
+void TransferBarrier(vk::CommandBuffer native, vk::PipelineStageFlags source_stages,
+                     vk::AccessFlags source, vk::PipelineStageFlags destination_stages,
+                     vk::AccessFlags destination) {
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = source;
+	barrier.dstAccessMask = destination;
+	native.pipelineBarrier(source_stages, destination_stages, {}, 1, &barrier, 0, nullptr, 0,
+	                       nullptr);
+}
 
 template <typename Pred, typename Fn>
 void ForEachRun(size_t begin, size_t end, Pred&& pred, Fn&& fn) {
@@ -90,30 +117,38 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	                               limits.maxPerStageUpdateAfterBindResources}) <
 	                     IR::ImageHeapCapacity);
 
-	const vk::DescriptorBindingFlags binding_flags =
+	// GPU-SRT global samplers sit at binding 1, next to the images.
+	// The global map is opt-in with run-time learning (APS5_KYTY_GPU_SRT_LEARN=1) until verified.
+	const bool     global        = IR::GpuSrtPartEnabled(IR::GpuSrtImages) && std::getenv("APS5_KYTY_GPU_SRT_LEARN") != nullptr;
+	const uint32_t binding_count = global ? 2u : 1u;
+	const vk::DescriptorBindingFlags flags =
 	    vk::DescriptorBindingFlagBits::ePartiallyBound |
 	    vk::DescriptorBindingFlagBits::eUpdateAfterBind |
 	    vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+	const std::array<vk::DescriptorBindingFlags, 2> binding_flags {flags, flags};
 	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
-	flags_info.bindingCount  = 1;
-	flags_info.pBindingFlags = &binding_flags;
-	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eSampledImage,
-	                                              IR::ImageHeapCapacity,
-	                                              vk::ShaderStageFlagBits::eAll, nullptr};
+	flags_info.bindingCount  = binding_count;
+	flags_info.pBindingFlags = binding_flags.data();
+	const std::array<vk::DescriptorSetLayoutBinding, 2> bindings {
+	    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, IR::ImageHeapCapacity,
+	                                    vk::ShaderStageFlagBits::eAll, nullptr},
+	    vk::DescriptorSetLayoutBinding {1, vk::DescriptorType::eSampler, IR::GlobalSamplerCapacity,
+	                                    vk::ShaderStageFlagBits::eAll, nullptr}};
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
 	layout_info.pNext        = &flags_info;
 	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
-	layout_info.bindingCount = 1;
-	layout_info.pBindings    = &binding;
+	layout_info.bindingCount = binding_count;
+	layout_info.pBindings    = bindings.data();
 	EXIT_IF(graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_layout) !=
 	        vk::Result::eSuccess);
-	const vk::DescriptorPoolSize pool_size {vk::DescriptorType::eSampledImage,
-	                                        IR::ImageHeapCapacity};
+	const std::array<vk::DescriptorPoolSize, 2> pool_sizes {
+	    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, IR::ImageHeapCapacity},
+	    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, IR::GlobalSamplerCapacity}};
 	vk::DescriptorPoolCreateInfo pool_info {};
 	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
 	pool_info.maxSets       = 1;
-	pool_info.poolSizeCount = 1;
-	pool_info.pPoolSizes    = &pool_size;
+	pool_info.poolSizeCount = binding_count;
+	pool_info.pPoolSizes    = pool_sizes.data();
 	EXIT_IF(graphics.device.createDescriptorPool(&pool_info, nullptr, &m_pool) !=
 	        vk::Result::eSuccess);
 	vk::DescriptorSetAllocateInfo allocate {};
@@ -126,9 +161,21 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	m_elements.emplace_back();
 	m_writes.push_back({0u, {nullptr, nullptr, vk::ImageLayout::eShaderReadOnlyOptimal}});
 	WriteDescriptors();
+	if (global) {
+		// The first commit zeroes it, before any shader searches it.
+		m_global_map = std::make_unique<Buffer>(
+		    graphics, context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc |
+		        vk::BufferUsageFlagBits::eStorageBuffer |
+		        vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    uint64_t {IR::GlobalMapWords} * sizeof(uint32_t));
+		IR::SetGlobalMapAddress(m_global_map->BufferDeviceAddress());
+		m_global_buckets.resize(IR::GlobalMapBucketCount);
+	}
 }
 
 ImageHeap::~ImageHeap() {
+	if (m_global_map != nullptr) IR::SetGlobalMapAddress(0u);
 	for (const auto& memory: m_memories) Unwatch(*memory);
 	auto& graphics             = m_context.GetGraphics();
 	graphics.image_heap_layout = nullptr;
@@ -334,6 +381,11 @@ uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
 		view.kind_keys.push_back(kind);
 		view.kinds.push_back(key.value);
 	}
+	return arm << IR::ImageHeapKindShift | InternElement(kind, key);
+}
+
+// The live element of a descriptor, with one more ref.
+uint32_t ImageHeap::InternElement(uint32_t kind, const Key& key) {
 	auto [found, inserted] = m_index.try_emplace(key, 0u);
 	if (inserted) {
 		found->second = Allocate();
@@ -343,7 +395,7 @@ uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
 		m_pending.push_back(found->second);
 	}
 	++m_elements[found->second].refs;
-	return arm << IR::ImageHeapKindShift | found->second;
+	return found->second;
 }
 
 void ImageHeap::Release(uint32_t entry) {
@@ -414,6 +466,7 @@ void ImageHeap::Repoint() {
 			}
 		}
 	}
+	RepointGlobal();
 }
 
 void ImageHeap::TakeChanges() {
@@ -498,6 +551,8 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 void ImageHeap::Rebind(RenderExecutor& executor) {
 	KYTY_PROFILER_FUNCTION();
 	auto& textures = m_context.GetTextureCache();
+	// Keys shaders reported in finished batches get buckets and, for images, elements.
+	DrainGlobalMisses();
 	// A changed image refreshes; one that changed identity needs new elements.
 	TakeChanges();
 	std::erase_if(m_changes, [&](const Image::HeapChange& change) {
@@ -581,6 +636,11 @@ void ImageHeap::WriteDescriptors() {
 void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
                        vk::PipelineLayout layout) {
 	KYTY_PROFILER_FUNCTION();
+	if (m_global_map != nullptr) {
+		m_global_used = true;
+		ClearGlobalMap(buffer);
+		UploadGlobalBuckets(buffer);
+	}
 	for (auto* view: m_active) {
 		if (view->dirty_begin == view->dirty_end) continue;
 		const auto slots  = std::span(view->slots).subspan(view->dirty_begin,
@@ -665,6 +725,7 @@ void ImageHeap::RunGarbageCollector() {
 		return true;
 	});
 	m_suspend_draw = m_draw;
+	if (m_global_known >= GlobalMapResetBuckets) ResetGlobalMap();
 }
 
 void ImageHeap::Drop(Memory& memory) {
@@ -679,6 +740,253 @@ void ImageHeap::Drop(Memory& memory) {
 			scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
 		}
 	}
+}
+
+// The root a global image key's profile word describes, as an index into m_profiles.
+uint32_t ImageHeap::GlobalProfile(uint32_t word) {
+	IR::ImageResource root;
+	root.resource_class         = IR::ImageResourceClass::Sampled;
+	root.read                   = true;
+	root.dimension              = static_cast<ShaderRecompiler::Decoder::ImageDimension>(word & 0xfu);
+	root.depth_compare          = (word & (1u << 4u)) != 0u;
+	root.unfiltered_access_only = (word & (1u << 5u)) != 0u;
+	root.r128                   = (word & (1u << 6u)) != 0u;
+	const auto resource = IR::ImageHeapResource(root, 0u);
+	const auto profile  = static_cast<uint32_t>(std::ranges::find(m_profiles, resource) -
+	                                            m_profiles.begin());
+	if (profile == m_profiles.size()) m_profiles.push_back(resource);
+	return profile;
+}
+
+// Index of the float sampler of an S# key in the global sampler array; its integer variant
+// follows it. Index 0 holds the default pair, which unresolved keys and a full array select.
+uint32_t ImageHeap::GlobalSampler(const GlobalKey& key) {
+	const std::array<uint32_t, 5> id {key[0], key[1], key[2], key[3], key[8]};
+	if (const auto found = m_global_samplers.find(id); found != m_global_samplers.end()) {
+		return found->second;
+	}
+	if (m_global_sampler_count + 2u > IR::GlobalSamplerCapacity) return 0u;
+	ShaderSamplerResource descriptor;
+	std::copy_n(key.begin(), 4u, descriptor.fields);
+	// Only depth-compare reads keep the S#'s compare function.
+	if ((key[8] & (1u << 4u)) == 0u) descriptor.fields[0] &= ~(0x7u << 12u);
+	auto integer = descriptor;
+	integer.SetPointFiltering();
+	auto&                                        cache = m_context.GetSamplerCache();
+	const std::array<vk::DescriptorImageInfo, 2> infos {
+	    vk::DescriptorImageInfo {cache.GetSampler(descriptor, false), nullptr,
+	                             vk::ImageLayout::eUndefined},
+	    vk::DescriptorImageInfo {cache.GetSampler(integer, true), nullptr,
+	                             vk::ImageLayout::eUndefined}};
+	const auto index = m_global_sampler_count;
+	m_global_sampler_count += 2u;
+	vk::WriteDescriptorSet write {};
+	write.dstSet          = m_set;
+	write.dstBinding      = 1u;
+	write.dstArrayElement = index;
+	write.descriptorCount = 2u;
+	write.descriptorType  = vk::DescriptorType::eSampler;
+	write.pImageInfo      = infos.data();
+	m_context.GetGraphics().device.updateDescriptorSets(1, &write, 0, nullptr);
+	m_global_samplers.emplace(id, index);
+	return index;
+}
+
+uint32_t ImageHeap::GlobalEntry(const GlobalKey& key) {
+	if (m_global_map == nullptr) return UINT32_MAX;
+	if (m_global_sampler_count == 0u) (void)GlobalSampler(GlobalKey {});
+	for (uint32_t probe = 0; probe < IR::GlobalMapProbes; ++probe) {
+		const auto  bucket = GlobalBucketOf(key, probe);
+		const auto& slot   = m_global_buckets[bucket];
+		if (!slot.known) {
+			ResolveGlobalBucket(bucket, key);
+		} else if (slot.key != key) {
+			continue;
+		}
+		return m_global_buckets[bucket].entry;
+	}
+	return UINT32_MAX;
+}
+
+// Drops a bucket's resolution and its element ref; the caller rewrites the bucket.
+void ImageHeap::ForgetGlobalBucket(uint32_t bucket) {
+	auto& slot = m_global_buckets[bucket];
+	if (!slot.known) return;
+	if (slot.image) Release(slot.entry);
+	slot = {};
+	--m_global_known;
+}
+
+void ImageHeap::ResolveGlobalBucket(uint32_t bucket, const GlobalKey& key) {
+	ForgetGlobalBucket(bucket);
+	auto& slot = m_global_buckets[bucket];
+	slot.key   = key;
+	slot.known = true;
+	++m_global_known;
+	const auto type = key[8] & (3u << 8u);
+	if (type == IR::GlobalMapImageProfile) {
+		const auto profile = GlobalProfile(key[8]);
+		Key        element_key {.value = {.dword_count = 8u}, .profile = profile};
+		std::copy_n(key.begin(), 8u, element_key.value.dwords.begin());
+		const auto kind = IR::ImageHeapKind(m_profiles[profile], element_key.value);
+		// Kinds outside the map's arms read as null.
+		if (kind >= IR::GlobalImageFirstKind &&
+		    kind < IR::GlobalImageFirstKind + IR::GlobalImageArms) {
+			slot.image = true;
+			slot.entry = (kind - IR::GlobalImageFirstKind) << IR::ImageHeapKindShift |
+			             InternElement(kind, element_key);
+		}
+	} else if (type == IR::GlobalMapSamplerProfile) {
+		slot.entry = GlobalSampler(key);
+	}
+	m_global_dirty.push_back(bucket);
+}
+
+// Image buckets follow their elements: a stale one takes a new element of its descriptor, a
+// buried one reads null until the map resets.
+void ImageHeap::RepointGlobal() {
+	if (m_global_known == 0u) return;
+	for (uint32_t bucket = 0; bucket < m_global_buckets.size(); ++bucket) {
+		auto& slot = m_global_buckets[bucket];
+		if (!slot.known || !slot.image) continue;
+		const auto& element = m_elements[slot.entry & ElementMask];
+		if (element.state == State::Live) continue;
+		const auto previous = slot.entry;
+		if (element.state == State::Buried) {
+			slot.image = false;
+			slot.entry = 0u;
+		} else {
+			const auto key  = element.key; // InternElement may grow m_elements.
+			const auto kind = element.kind;
+			slot.entry      = (previous & ~ElementMask) | InternElement(kind, key);
+		}
+		Release(previous);
+		m_global_dirty.push_back(bucket);
+	}
+}
+
+// Empties the map; draws already recorded keep their elements until their ticks end.
+void ImageHeap::ResetGlobalMap() {
+	for (uint32_t bucket = 0; bucket < m_global_buckets.size(); ++bucket) {
+		ForgetGlobalBucket(bucket);
+	}
+	m_global_dirty.clear();
+	m_global_clear = true;
+	// Misses read back before the reset name buckets of the old map.
+	++m_global_generation;
+}
+
+void ImageHeap::DrainGlobalMisses() {
+	if (m_global_map == nullptr) return;
+	if (m_global_sampler_count == 0u) (void)GlobalSampler(GlobalKey {});
+	auto& scheduler = m_context.GetCommandScheduler();
+	while (!m_global_readbacks.empty() && scheduler.IsFree(m_global_readbacks.front().tick)) {
+		auto readback = std::move(m_global_readbacks.front());
+		m_global_readbacks.pop_front();
+		auto& buffer = *readback.buffer;
+		if (readback.generation == m_global_generation) {
+			if (!buffer.IsCoherent()) buffer.Invalidate(0, buffer.Size());
+			const auto* words = reinterpret_cast<const uint32_t*>(buffer.Mapped().data());
+			const auto  count = std::min(words[0], IR::GlobalMapRingCapacity);
+			for (uint32_t index = 0; index < count; ++index) {
+				const auto* ring =
+				    words + IR::GlobalMapRingBase + index * IR::GlobalMapRingEntryWords;
+				const auto bucket = ring[0];
+				if (bucket >= IR::GlobalMapBucketCount) continue;
+				// A bucket the host resolved meanwhile is rewritten over the claim; a claim of
+				// another key is dropped, and its shader claims anew.
+				if (m_global_buckets[bucket].known) {
+					m_global_dirty.push_back(bucket);
+					continue;
+				}
+				GlobalKey key {};
+				std::copy_n(ring + 1, key.size(), key.begin());
+				ResolveGlobalBucket(bucket, key);
+			}
+		}
+		m_global_spare.push_back(std::move(readback.buffer));
+	}
+}
+
+void ImageHeap::ClearGlobalMap(CommandBuffer& buffer) {
+	if (!m_global_clear) return;
+	m_global_clear = false;
+	buffer.EndRendering();
+	const auto native = buffer.Handle();
+	TransferBarrier(native, vk::PipelineStageFlagBits::eAllCommands,
+	                vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	                vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferWrite);
+	native.fillBuffer(m_global_map->Handle(), 0, VK_WHOLE_SIZE, 0u);
+	TransferBarrier(native, vk::PipelineStageFlagBits::eTransfer,
+	                vk::AccessFlagBits::eTransferWrite, vk::PipelineStageFlagBits::eAllCommands,
+	                vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+}
+
+void ImageHeap::UploadGlobalBuckets(CommandBuffer& buffer) {
+	if (m_global_dirty.empty()) return;
+	std::ranges::sort(m_global_dirty);
+	m_global_dirty.erase(std::ranges::unique(m_global_dirty).begin(), m_global_dirty.end());
+	constexpr uint64_t record = (1u + IR::GlobalMapKeyWords) * sizeof(uint32_t);
+	auto&              words  = m_global_upload;
+	words.clear();
+	for (const auto bucket: m_global_dirty) {
+		const auto& slot = m_global_buckets[bucket];
+		words.push_back(slot.known ? slot.entry + 2u : 0u);
+		words.insert(words.end(), slot.key.begin(), slot.key.end());
+	}
+	auto&      stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	const auto offset =
+	    stream.Copy(words.data(), words.size() * sizeof(uint32_t), sizeof(uint32_t));
+	std::vector<vk::BufferCopy> regions;
+	regions.reserve(m_global_dirty.size());
+	for (size_t index = 0; index < m_global_dirty.size(); ++index) {
+		regions.push_back({offset + index * record,
+		                   (uint64_t {IR::GlobalMapBucketBase} +
+		                    uint64_t {m_global_dirty[index]} * IR::GlobalMapBucketWords) *
+		                       sizeof(uint32_t),
+		                   record});
+	}
+	m_global_dirty.clear();
+	buffer.EndRendering();
+	const auto native = buffer.Handle();
+	TransferBarrier(native, vk::PipelineStageFlagBits::eAllCommands,
+	                vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+	                vk::PipelineStageFlagBits::eTransfer, vk::AccessFlagBits::eTransferWrite);
+	native.copyBuffer(stream.Handle(), m_global_map->Handle(),
+	                  static_cast<uint32_t>(regions.size()), regions.data());
+	TransferBarrier(native, vk::PipelineStageFlagBits::eTransfer,
+	                vk::AccessFlagBits::eTransferWrite, vk::PipelineStageFlagBits::eAllCommands,
+	                vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+}
+
+void ImageHeap::RecordGlobalReadback(CommandBuffer& buffer) {
+	// Map state belongs to the GPU thread; other submissions leave the ring to its next one.
+	if (m_global_map == nullptr || !m_global_used || !GuestGpu::IsGpuThread()) return;
+	m_global_used = false;
+	std::unique_ptr<Buffer> target;
+	if (!m_global_spare.empty()) {
+		target = std::move(m_global_spare.back());
+		m_global_spare.pop_back();
+	} else {
+		target = std::make_unique<Buffer>(m_context.GetGraphics(), m_context.GetCommandScheduler(),
+		                                  MemoryUsage::Download, 0,
+		                                  vk::BufferUsageFlagBits::eTransferDst, GlobalRingBytes);
+	}
+	buffer.EndRendering();
+	const auto native = buffer.Handle();
+	TransferBarrier(native, vk::PipelineStageFlagBits::eAllCommands,
+	                vk::AccessFlagBits::eMemoryWrite, vk::PipelineStageFlagBits::eTransfer,
+	                vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
+	const vk::BufferCopy copy {0, 0, GlobalRingBytes};
+	native.copyBuffer(m_global_map->Handle(), target->Handle(), 1, &copy);
+	native.fillBuffer(m_global_map->Handle(), 0, sizeof(uint32_t), 0u);
+	TransferBarrier(native, vk::PipelineStageFlagBits::eTransfer,
+	                vk::AccessFlagBits::eTransferWrite,
+	                vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                    vk::AccessFlagBits::eHostRead);
+	m_global_readbacks.push_back({m_context.GetCommandScheduler().CurrentTick(),
+	                              m_global_generation, std::move(target)});
 }
 
 } // namespace Libs::Graphics

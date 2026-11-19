@@ -1,5 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <array>
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
@@ -351,6 +354,16 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ray == nullptr || (node_words != 1u && node_words != 2u) ||
 	    ray->NumArgs() < node_words + 10u || s.bvh_intersect_function == 0)
 		ctx.Fail(inst, "BVH intersection requires its node pointer, ray components and shared function");
+	// APS5_KYTY_RT_MISS (a test switch, off by default): every intersection misses. A box node
+	// reports four invalid children (all ones) and a triangle node an unordered t (NaN), so a
+	// traversal ends on its first node with no hit: no ray-traced contribution at the cost of one
+	// intersection per ray.
+	static const bool miss = std::getenv("APS5_KYTY_RT_MISS") != nullptr;
+	if (miss) {
+		const auto all = ConstantU32(s, 0xffffffffu);
+		const std::array<uint32_t, 4> words {all, all, all, all};
+		return Vector(s, TypeU32Vector(s, 4), words);
+	}
 	const auto vector = [&](uint32_t first) {
 		Vec3 values;
 		for (uint32_t i = 0; i < 3; ++i)

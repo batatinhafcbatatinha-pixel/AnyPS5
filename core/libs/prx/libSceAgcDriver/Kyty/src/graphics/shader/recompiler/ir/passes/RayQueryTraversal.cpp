@@ -27,6 +27,14 @@ constexpr uint32_t Barycentrics = 1u << 24;
 // Byte offsets in an instance record: BLAS header, root link and flags (mask in bits 8..15).
 constexpr uint32_t InstanceBlas = 0, InstanceRoot = 56, InstanceFlags = 60;
 
+// The line of the first (innermost) condition a matcher failed on, for the log of traversals left
+// to emulation.
+thread_local int t_fail_line = 0;
+bool             Fail(int line) {
+	if (t_fail_line == 0) t_fail_line = line;
+	return false;
+}
+
 Inst* Producer(Value value, ValueOpcode opcode) {
 	auto* inst = value.Resolve().TryInstruction();
 	return inst != nullptr && inst->GetOpcode() == opcode ? inst : nullptr;
@@ -176,7 +184,7 @@ bool Inside(const Loop& t, const Block* block) {
 
 // Whether `header` heads a loop entered from one preheader, which `l` then holds.
 bool Enter(const Program& program, Block* header, Loop& l) {
-	if (header == nullptr || header->ImmPredecessors().size() != 2) return false;
+	if (header == nullptr || header->ImmPredecessors().size() != 2) return Fail(__LINE__);
 	const auto entries = header->ImmPredecessors();
 	l.header           = header;
 	l.latch            = header->terminator.continue_block;
@@ -195,17 +203,17 @@ bool MatchLoop(const Program& program, Inst& bvh, Value extent, Traversal& t) {
 		    return use.user->GetOpcode() == ValueOpcode::CompositeExtractU32x4 &&
 			       Immediate(use.user->Arg(1)) < 4u;
 	    })) {
-		return false;
+		return Fail(__LINE__);
 	}
 	if (!Enter(program, EnclosingLoop(program, bvh.Parent()), t) ||
 	    t.header->terminator.kind != CFG::TerminatorKind::Branch ||
 	    t.header->terminator.true_block == nullptr) {
-		return false;
+		return Fail(__LINE__);
 	}
 	t.bvh    = &bvh;
 	t.exec   = HeaderPhi(t, bvh.Arg(2));
 	t.extent = HeaderPhi(t, extent);
-	if (t.exec == nullptr || t.extent == nullptr) return false;
+	if (t.exec == nullptr || t.extent == nullptr) return Fail(__LINE__);
 
 	// The latch's code goes before the vote, which must follow what the back edge carries.
 	const auto lanes = Entry(t, *t.exec);
@@ -215,7 +223,7 @@ bool MatchLoop(const Program& program, Inst& bvh, Value extent, Traversal& t) {
 		    Back(t, inst) != alive) {
 			continue;
 		}
-		if (Entry(t, inst) != lanes) return false;
+		if (Entry(t, inst) != lanes) return Fail(__LINE__);
 		t.lanes.push_back(&inst);
 	}
 	const auto& term = t.latch->terminator;
@@ -223,39 +231,39 @@ bool MatchLoop(const Program& program, Inst& bvh, Value extent, Traversal& t) {
 	if (term.kind != CFG::TerminatorKind::ConditionalBranch || term.true_block != t.header ||
 	    t.vote == nullptr || t.vote->Arg(0) != alive ||
 	    t.vote->Flags<CFG::BranchCondition>() != CFG::BranchCondition::ExecNonZero) {
-		return false;
+		return Fail(__LINE__);
 	}
 	auto* voting = t.vote->Parent();
 	if (voting != t.latch &&
 	    (t.latch->ImmPredecessors().size() != 1 || t.latch->ImmPredecessors()[0] != voting)) {
-		return false;
+		return Fail(__LINE__);
 	}
 	const auto* moved = Back(t, *t.extent).Resolve().TryInstruction();
 	for (auto it = Position(*t.vote); it != voting->end(); ++it) {
-		if (&*it == moved) return false;
+		if (&*it == moved) return Fail(__LINE__);
 	}
-	if (voting != t.latch && moved != nullptr && moved->Parent() == t.latch) return false;
+	if (voting != t.latch && moved != nullptr && moved->Parent() == t.latch) return Fail(__LINE__);
 
 	const auto exec   = Value(t.exec);
 	const auto inside = [&](const Block* block) { return Inside(t, block); };
 	for (const auto* block: t.loop) {
 		if (block->terminator.kind == CFG::TerminatorKind::Return ||
 		    (block != t.latch && !std::ranges::all_of(block->ImmSuccessors(), inside))) {
-			return false;
+			return Fail(__LINE__);
 		}
 		for (const auto& inst: *block) {
 			const auto op = inst.GetOpcode();
-			if (op == ValueOpcode::BvhIntersect && &inst != &bvh) return false;
+			if (op == ValueOpcode::BvhIntersect && &inst != &bvh) return Fail(__LINE__);
 			if (!HasSideEffects(op) || op == ValueOpcode::Reference) continue;
 			uint32_t data = 3;
 			if (op == ValueOpcode::WriteSharedU32) {
 				data = 1;
 			} else if (op != ValueOpcode::StoreAddressU32) {
-				return false;
+				return Fail(__LINE__);
 			}
 			const auto* pushed = Producer(ResolveActiveU32(inst.Arg(data), exec),
 			                              ValueOpcode::CompositeExtractU32x4);
-			if (pushed == nullptr || pushed->Arg(0) != Value(&bvh)) return false;
+			if (pushed == nullptr || pushed->Arg(0) != Value(&bvh)) return Fail(__LINE__);
 		}
 	}
 	return true;
@@ -267,16 +275,16 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	const auto* address    = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
 	if (descriptor == nullptr || address == nullptr || bvh.Flags<uint32_t>() != 2u ||
 	    !MatchLoop(program, bvh, address->Arg(2), t)) {
-		return false;
+		return Fail(__LINE__);
 	}
 	for (uint32_t word = 0; word < 4; ++word) {
-		if (Immediate(descriptor->Arg(word)) != TraversalDescriptor[word]) return false;
+		if (Immediate(descriptor->Arg(word)) != TraversalDescriptor[word]) return Fail(__LINE__);
 	}
 
 	// The ray: extent, origin and direction phis start as the world ray and its t_max.
 	for (uint32_t arg = 2; arg < 9; ++arg) {
 		const auto* ray = HeaderPhi(t, address->Arg(arg));
-		if (ray == nullptr) return false;
+		if (ray == nullptr) return Fail(__LINE__);
 		t.ray[(arg + 4) % 7] = Entry(t, *ray);
 	}
 
@@ -285,7 +293,7 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	const auto  exec  = Value(t.exec);
 	const auto  lanes = Entry(t, *t.exec);
 	const auto* sum   = Producer(ResolveActiveU32(address->Arg(0), exec), ValueOpcode::IAdd32);
-	if (sum == nullptr) return false;
+	if (sum == nullptr) return Fail(__LINE__);
 	auto* node      = HeaderPhi(t, sum->Arg(0));
 	auto  base_part = sum->Arg(1);
 	if (node == nullptr) {
@@ -299,13 +307,13 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	    shift != nullptr ? Producer(shift->Arg(0), ValueOpcode::CompositeConstructU64) : nullptr;
 	if (node == nullptr || base == nullptr || Immediate(low->Arg(1)) != 0u ||
 	    Immediate(shift->Arg(1)) != 3u) {
-		return false;
+		return Fail(__LINE__);
 	}
 	for (uint32_t word = 0; word < 2; ++word) {
 		const auto* header = HeaderPhi(t, base->Arg(word));
 		const auto  slot =
 		    header != nullptr ? Slot(ResolveActiveU32(Entry(t, *header), lanes)) : std::nullopt;
-		if (!slot) return false;
+		if (!slot) return Fail(__LINE__);
 		t.tlas[word] = *slot;
 	}
 
@@ -318,11 +326,11 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	for (const auto* inst: nodes) {
 		for (auto [load, offset]: {std::pair {&root, InstanceRoot}, std::pair {&word0, 0u}}) {
 			if (!GlobalLoad(program, *inst, offset)) continue;
-			if (*load != nullptr) return false;
+			if (*load != nullptr) return Fail(__LINE__);
 			*load = inst;
 		}
 	}
-	if (root == nullptr || word0 == nullptr) return false;
+	if (root == nullptr || word0 == nullptr) return Fail(__LINE__);
 
 	// Prim record word 1 and the instance flags and BLAS are each loaded once in the loop.
 	const std::array<std::pair<const Inst*, uint32_t>, 3> wanted {
@@ -336,13 +344,13 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 				    inst.Arg(2) != like->Arg(2)) {
 					continue;
 				}
-				if (found[load] != nullptr) return false;
+				if (found[load] != nullptr) return Fail(__LINE__);
 				found[load] = &inst;
 			}
 		}
 	}
 	const auto [word1, flags, blas] = found;
-	if (word1 == nullptr || flags == nullptr || blas == nullptr) return false;
+	if (word1 == nullptr || flags == nullptr || blas == nullptr) return Fail(__LINE__);
 	t.loads = {word0, word1, flags};
 
 	// The phi the iteration's code reads for each of them.
@@ -360,13 +368,13 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 	for (uint32_t role = 1; role < targets.size(); ++role) {
 		for (auto& [carrier, values]: carried) {
 			if (!values.contains(targets[role])) continue;
-			if (t.state[role] != nullptr) return false;
+			if (t.state[role] != nullptr) return Fail(__LINE__);
 			t.state[role] = carrier;
 		}
 		if (t.state[role] == nullptr ||
 		    std::ranges::find(t.state.begin(), t.state.begin() + role, t.state[role]) !=
 		        t.state.begin() + role) {
-			return false;
+			return Fail(__LINE__);
 		}
 	}
 
@@ -400,7 +408,7 @@ bool Match(const Program& program, Inst& bvh, Traversal& t) {
 			}
 		}
 	}
-	if (!bit) return false;
+	if (!bit) return Fail(__LINE__);
 	t.cull_mask = 1u << (23u - *bit);
 	return true;
 }
@@ -465,7 +473,7 @@ bool InstanceArray(const Inst& low, uint32_t slot) {
 			return true;
 		}
 	}
-	return false;
+	return Fail(__LINE__);
 }
 
 // The BLAS address words 0 and 1 of a V# over the BLAS's prim records (stride 8), or nulls.
@@ -505,7 +513,7 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 	const auto* address    = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
 	if (descriptor == nullptr || address == nullptr ||
 	    !MatchLoop(program, bvh, address->Arg(1), t)) {
-		return false;
+		return Fail(__LINE__);
 	}
 	auto*       node = HeaderPhi(t, address->Arg(0));
 	const auto* blas = DescriptorAddress(*descriptor);
@@ -515,11 +523,11 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 	if (node == nullptr || instance == nullptr ||
 	    AddressWord(program, word1, InstanceBlas + 4) != instance || Inside(t, word0->Parent()) ||
 	    Inside(t, word1->Parent())) {
-		return false;
+		return Fail(__LINE__);
 	}
 	auto* low  = Producer(instance->Arg(0), ValueOpcode::IAdd32);
 	auto* high = instance->Arg(1).Resolve().TryInstruction();
-	if (low == nullptr || high == nullptr) return false;
+	if (low == nullptr || high == nullptr) return Fail(__LINE__);
 	t.instance = {low, high, word0, word1};
 
 	// The TLAS walk's intersection, in a loop around this one.
@@ -536,11 +544,11 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 		const auto  low_slot  = tlas != nullptr ? Slot(tlas->Arg(0)) : std::nullopt;
 		const auto  high_slot = tlas != nullptr ? Slot(tlas->Arg(1)) : std::nullopt;
 		if (!low_slot || !high_slot) continue;
-		if (walk != nullptr) return false;
+		if (walk != nullptr) return Fail(__LINE__);
 		walk   = other;
 		t.tlas = {*low_slot, *high_slot};
 	}
-	if (walk == nullptr) return false;
+	if (walk == nullptr) return Fail(__LINE__);
 
 	// Its world ray is defined before the outermost loop around it; t_max is this loop's extent.
 	const auto* ray   = Producer(walk->Arg(1), ValueOpcode::MakeImageAddress);
@@ -548,18 +556,18 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 	while (auto* up = EnclosingLoop(program, outer)) {
 		outer = up;
 	}
-	if (ray == nullptr) return false;
+	if (ray == nullptr) return Fail(__LINE__);
 	for (uint32_t arg = 2; arg < 8; ++arg) {
 		const auto* value = ray->Arg(arg).Resolve().TryInstruction();
 		if (value != nullptr &&
 		    BlockIndex(program, value->Parent()) >= BlockIndex(program, outer)) {
-			return false;
+			return Fail(__LINE__);
 		}
 		t.ray[arg - 2] = ray->Arg(arg);
 	}
 	t.ray[6] = Entry(t, *t.extent);
 
-	if (!InstanceArray(*low, t.tlas[0])) return false;
+	if (!InstanceArray(*low, t.tlas[0])) return Fail(__LINE__);
 
 	// The prim record load whose word 0 is the next node, and the phi that keeps word 1.
 	std::unordered_set<const Inst*> next;
@@ -571,7 +579,7 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 		        ? Producer(inst->Arg(0), ValueOpcode::LoadBufferU32x2)
 		        : nullptr;
 		if (load == nullptr) continue;
-		if (record != nullptr && record != load) return false;
+		if (record != nullptr && record != load) return Fail(__LINE__);
 		record = load;
 	}
 	t.record = record;
@@ -579,16 +587,16 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 	    RecordBase(record->Arg(0)) != std::array<const Inst*, 2> {word0, word1} ||
 	    Immediate(record->Arg(2)) != 0u || Immediate(record->Arg(3)) != 0u ||
 	    !Inside(t, record->Parent())) {
-		return false;
+		return Fail(__LINE__);
 	}
 	const auto& memory = program.memory_info[record->Flags<MemoryFlags>().index];
-	if (!memory.idxen || memory.offen || memory.offset != 0u) return false;
+	if (!memory.idxen || memory.offen || memory.offset != 0u) return Fail(__LINE__);
 	const auto record_uses = record->Uses();
 	const auto second      = std::ranges::find_if(record_uses, [](const Use& use) {
 		return use.user->GetOpcode() == ValueOpcode::CompositeExtractU32x2 &&
 		       Immediate(use.user->Arg(1)) == 1u;
 	});
-	if (second == record_uses.end()) return false;
+	if (second == record_uses.end()) return Fail(__LINE__);
 	for (auto& inst: *t.header) {
 		std::unordered_set<const Inst*> values;
 		if (inst.GetOpcode() == ValueOpcode::Phi && inst.GetType() == Type::U32 && &inst != node &&
@@ -596,10 +604,10 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 			Collect(Back(t, inst), t.header, values);
 		}
 		if (!values.contains(second->user)) continue;
-		if (t.state[1] != nullptr) return false;
+		if (t.state[1] != nullptr) return Fail(__LINE__);
 		t.state[1] = &inst;
 	}
-	if (t.state[1] == nullptr) return false;
+	if (t.state[1] == nullptr) return Fail(__LINE__);
 	t.state[0] = node;
 
 	// Of what the loop reads of the instance, the candidate's address and BLAS words replace its
@@ -624,13 +632,13 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 			if (at < begin && user->GetOpcode() != ValueOpcode::ConditionRef) {
 				work.push_back(user);
 			} else if (at < begin) {
-				if (mask) return false;
+				if (mask) return Fail(__LINE__);
 				mask = MaskTest(program, *user, *instance);
-				if (!mask) return false;
+				if (!mask) return Fail(__LINE__);
 			} else if (user->Parent() == t.header) {
-				if (user != node && !Kept(*user, *t.exec)) return false;
+				if (user != node && !Kept(*user, *t.exec)) return Fail(__LINE__);
 			} else if (Replaced(t, *user)) {
-				if (!swapped) return false;
+				if (!swapped) return Fail(__LINE__);
 				reads.emplace_back(user, use.operand);
 			}
 		}
@@ -648,7 +656,7 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 		if (op == ValueOpcode::ReadConstBuffer || op == ValueOpcode::GetBufferResource ||
 		    op == ValueOpcode::GetImageResource || op == ValueOpcode::GetSamplerResource ||
 		    ((op == ValueOpcode::ReadLane || op == ValueOpcode::WriteLane) && operand != 0)) {
-			return false;
+			return Fail(__LINE__);
 		}
 		if (op == ValueOpcode::Ballot || op == ValueOpcode::ReadFirstLane ||
 		    op == ValueOpcode::ReadLane || op == ValueOpcode::WriteLane ||
@@ -725,10 +733,10 @@ bool PerLane(ValueOpcode op) {
 	if (!plain(TypeOf(op)) || NumArgsOf(op) == 0 || HasSideEffects(op) ||
 	    SharedAccessOf(op) != SharedAccess::None ||
 	    std::ranges::find(excluded, op) != excluded.end()) {
-		return false;
+		return Fail(__LINE__);
 	}
 	for (size_t arg = 0; arg < NumArgsOf(op); ++arg) {
-		if (!plain(ArgTypeOf(op, arg))) return false;
+		if (!plain(ArgTypeOf(op, arg))) return Fail(__LINE__);
 	}
 	return true;
 }
@@ -792,7 +800,7 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 	    !Enter(program, EnclosingLoop(program, blases.header), w) ||
 	    w.header->terminator.kind != CFG::TerminatorKind::Branch ||
 	    w.header->terminator.true_block == nullptr || w.latch->ImmPredecessors().size() != 1) {
-		return false;
+		return Fail(__LINE__);
 	}
 	// The body runs from a vote after the header; a vote before the latch leaves.
 	auto* enter = w.header->terminator.true_block;
@@ -804,14 +812,14 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 	    enter->terminator.false_block != vote ||
 	    vote->terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
 	    vote->terminator.false_block != w.latch || Inside(w, vote->terminator.true_block)) {
-		return false;
+		return Fail(__LINE__);
 	}
 	const auto inside = [&](const Block* block) { return Inside(w, block); };
 	for (const auto* block: w.loop) {
-		if (block != vote && !std::ranges::all_of(block->ImmSuccessors(), inside)) return false;
+		if (block != vote && !std::ranges::all_of(block->ImmSuccessors(), inside)) return Fail(__LINE__);
 		for (const auto& inst: *block) {
 			if (HasSideEffects(inst.GetOpcode()) && inst.GetOpcode() != ValueOpcode::Reference) {
-				return false;
+				return Fail(__LINE__);
 			}
 		}
 	}
@@ -821,7 +829,7 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 		if (lanes != nullptr && !Inside(w, lanes->Parent())) w.lanes = body->Arg(arg);
 	}
 	auto* exec = HeaderPhi(records, bvh.Arg(2));
-	if (w.lanes.IsEmpty() || exec == nullptr) return false;
+	if (w.lanes.IsEmpty() || exec == nullptr) return Fail(__LINE__);
 	w.bvh      = &bvh;
 	w.lanes_in = {w.skip->Arg(0).Resolve().TryInstruction(), exec,
 	              Entry(records, *exec).Resolve().TryInstruction()};
@@ -837,18 +845,18 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 		const auto* ray   = Producer(other->Arg(1), ValueOpcode::MakeImageAddress);
 		const auto  low   = tlas != nullptr ? Slot(tlas->Arg(0)) : std::nullopt;
 		const auto  high  = tlas != nullptr ? Slot(tlas->Arg(1)) : std::nullopt;
-		if (!low || !high || ray == nullptr || ++found > 1) return false;
+		if (!low || !high || ray == nullptr || ++found > 1) return Fail(__LINE__);
 		w.tlas = {*low, *high};
 		for (uint32_t arg = 1; arg < 8; ++arg) {
 			const auto* value = ray->Arg(arg).Resolve().TryInstruction();
 			if (value != nullptr &&
 			    BlockIndex(program, value->Parent()) >= BlockIndex(program, w.header)) {
-				return false;
+				return Fail(__LINE__);
 			}
 			w.ray[(arg + 5) % 7] = ray->Arg(arg);
 		}
 	}
-	if (found == 0) return false;
+	if (found == 0) return Fail(__LINE__);
 
 	// The record loop's commit: a branch on whether a lane commits into selects of the committed
 	// values over record loop phis, which the BLAS loop's phis start from the walk's header phis;
@@ -868,33 +876,33 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 			selects.emplace_back(old, inst.Arg(1));
 		}
 		if (selects.empty() || !kept) continue;
-		if (w.commit != nullptr) return false;
+		if (w.commit != nullptr) return Fail(__LINE__);
 		w.commit = ref->Arg(0).Resolve().TryInstruction();
 		for (const auto& [old, committed]: selects) {
 			const auto* outer = HeaderPhi(blases, Entry(records, *old));
 			auto*       value = outer != nullptr ? HeaderPhi(w, Entry(blases, *outer)) : nullptr;
-			if (value == nullptr) return false;
+			if (value == nullptr) return Fail(__LINE__);
 			Inst* exit = nullptr;
 			for (auto& inst: *vote) {
 				if (inst.GetOpcode() != ValueOpcode::Phi ||
 				    inst.Arg(Incoming(inst, enter)) != Value(value)) {
 					continue;
 				}
-				if (exit != nullptr) return false;
+				if (exit != nullptr) return Fail(__LINE__);
 				exit = &inst;
 			}
-			if (exit == nullptr) return false;
+			if (exit == nullptr) return Fail(__LINE__);
 			w.commits.emplace_back(exit, committed);
 		}
 	}
-	if (w.commit == nullptr) return false;
+	if (w.commit == nullptr) return Fail(__LINE__);
 
 	// The instance flags load reads the instance the TLAS leaf names, and its block's branch into
 	// the BLAS loop is whether a lane tests the instance's records.
 	for (auto* block: w.loop) {
 		for (auto& inst: *block) {
 			if (AddressWord(program, &inst, InstanceFlags) == nullptr) continue;
-			if (w.flags != nullptr) return false;
+			if (w.flags != nullptr) return Fail(__LINE__);
 			w.flags = &inst;
 		}
 	}
@@ -903,14 +911,14 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 	                          ? Producer(w.flags->Parent()->condition, ValueOpcode::ConditionRef)
 	                          : nullptr;
 	if (ref == nullptr || w.flags->Parent()->terminator.true_block != blases.preheader) {
-		return false;
+		return Fail(__LINE__);
 	}
 	w.instance = {Producer(address->Arg(0), ValueOpcode::IAdd32),
 	              address->Arg(1).Resolve().TryInstruction()};
 	w.accepted = ref->Arg(0).Resolve().TryInstruction();
 	if (w.instance[0] == nullptr || w.instance[1] == nullptr || w.accepted == nullptr ||
 	    !InstanceArray(*w.instance[0], w.tlas[0])) {
-		return false;
+		return Fail(__LINE__);
 	}
 
 	// Record word 1 is read at +4 of each record through a V# over the BLAS at the instance's +0.
@@ -929,7 +937,7 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 			        program.memory_info[read->Flags<MemoryFlags>().index].offset == 4u;
 		}
 		if (!word1) continue;
-		if (w.word1 != nullptr) return false;
+		if (w.word1 != nullptr) return Fail(__LINE__);
 		w.word1 = &phi;
 	}
 
@@ -1160,9 +1168,13 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 		Traversal   traversal;
 		Walk        walk;
 		const bool  nested  = bvh->Flags<uint32_t>() == 1u;
+		t_fail_line         = 0;
 		const bool  matched = nested ? MatchNested(program, *bvh, intersections, traversal)
 		                             : Match(program, *bvh, traversal);
+		const int   match_fail = t_fail_line;
+		t_fail_line         = 0;
 		const bool  walked  = !matched && nested && MatchWalk(program, *bvh, intersections, walk);
+		const int   walk_fail = t_fail_line;
 		const auto& tlas    = walked ? walk.tlas : traversal.tlas;
 		if ((matched || walked) && (traced == 0 || tlas == program.info.ray_query_tlas)) {
 			walked ? RewriteWalk(program, walk) : Rewrite(program, traversal);
@@ -1170,8 +1182,9 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 			++traced;
 		} else if (EnclosingLoop(program, bvh->Parent()) != nullptr) {
 			Log::WriteToConsoleAndLog(
-			    fmt::format("ShaderRecompiler BVH traversal left to emulation: hash=0x{:016x}\n",
-				            program.shader_hash));
+			    fmt::format("ShaderRecompiler BVH traversal left to emulation: hash=0x{:016x} nested={} "
+			                "match failed at line {}, walk at line {}\n",
+			                program.shader_hash, nested, match_fail, walk_fail));
 		}
 	}
 	return traced;

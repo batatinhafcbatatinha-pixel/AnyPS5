@@ -1,8 +1,10 @@
 #include "common/emulatorConfig.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 // Settings of the KytyPS5 GPU backend. Defaults follow the KytyPS5 runs Control was measured with
 // (shader cache on, read-backs and tessellation off); APS5_KYTY_<NAME>=0/1 overrides.
@@ -97,6 +99,22 @@ bool ShaderCacheEnabled() {
 LogDirection GetShaderLogDirection() {
 	static const bool enabled = Flag("APS5_KYTY_SHADER_LOG", false);
 	return enabled ? LogDirection::File : LogDirection::Silent;
+}
+
+bool ShaderLogWanted(uint64_t hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		const char*           text = std::getenv("APS5_KYTY_SHADER_LOG_HASHES");
+		while (text != nullptr && *text != 0) {
+			char*      end   = nullptr;
+			const auto value = std::strtoull(text, &end, 16);
+			if (end == text) break;
+			list.push_back(value);
+			text = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	return hashes.empty() || std::find(hashes.begin(), hashes.end(), hash) != hashes.end();
 }
 
 std::filesystem::path GetShaderLogFolder() {
