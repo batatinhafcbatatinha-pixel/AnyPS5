@@ -1,0 +1,27 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// Copies the group counts of an indirect dispatch the GPU reads, zeroing a dispatch of more than
+// 2^31 groups: such counts are bytes that are not dispatch arguments, and executing them keeps the
+// device busy until the driver resets it.
+
+layout(local_size_x = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Counts { uint value[3]; };
+
+layout(push_constant) uniform Push {
+	uint64_t source;
+	uint64_t target;
+}
+push;
+
+void main() {
+	Counts source = Counts(push.source);
+	Counts target = Counts(push.target);
+	const uint x = source.value[0], y = source.value[1], z = source.value[2];
+	const bool skip = uint64_t(x) * uint64_t(y) > (1ul << 31) / max(uint64_t(z), 1ul);
+	target.value[0] = skip ? 0u : x;
+	target.value[1] = skip ? 0u : y;
+	target.value[2] = skip ? 0u : z;
+}

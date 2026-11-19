@@ -353,6 +353,23 @@ public:
             if (within >= found->second.viewBytes) return false;
             const auto count = std::min(bytes, found->second.viewBytes - within);
             auto& section = *found->second.section;
+            // One host view per 2 MiB chunk of the section, not one per guest page.
+            constexpr std::uint64_t hostChunkBytes = 0x200000u;
+            const auto chunkOffset = found->second.offset & ~(hostChunkBytes - 1);
+            auto chunk = section.hostChunks.find(chunkOffset);
+            if (chunk == section.hostChunks.end()) {
+                auto* view = static_cast<unsigned char*>(map(section.handle, GetCurrentProcess(), nullptr, chunkOffset, hostChunkBytes, 0, PAGE_READWRITE, nullptr, 0));
+                chunk = section.hostChunks.emplace(chunkOffset, view).first;
+            }
+            if (chunk->second != nullptr) {
+                auto* target = chunk->second + (found->second.offset - chunkOffset) + within;
+                if (write) std::memcpy(target, cursor, count);
+                else std::memcpy(cursor, target, count);
+                cursor += count;
+                address += count;
+                bytes -= count;
+                continue;
+            }
             auto host = section.hostViews.find(found->second.offset);
             if (host == section.hostViews.end()) {
                 const auto lead = found->second.offset % 0x10000u;
@@ -1122,11 +1139,17 @@ private:
     struct Section {
         HANDLE handle;
         std::map<std::uint64_t, std::pair<unsigned char*, std::size_t>> hostViews;
+        // Host views of whole aligned chunks (BackingCopy), or null where the chunk does not map
+        // (past the end of the section): those pages take a view of their own.
+        std::map<std::uint64_t, unsigned char*> hostChunks;
         explicit Section(HANDLE handle) : handle(handle) {}
         Section(const Section&) = delete;
         Section& operator=(const Section&) = delete;
         ~Section() {
             for (const auto& [offset, view] : hostViews) UnmapViewOfFile(view.first - offset % 0x10000u);
+            for (const auto& [offset, view] : hostChunks) {
+                if (view != nullptr) UnmapViewOfFile(view);
+            }
             CloseHandle(handle);
         }
     };
