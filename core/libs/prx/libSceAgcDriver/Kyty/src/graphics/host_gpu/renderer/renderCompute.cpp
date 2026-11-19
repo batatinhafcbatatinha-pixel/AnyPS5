@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuTime.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -512,6 +513,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const bool gpu_time = GpuTime::Enabled(m_context);
+	if (gpu_time) GpuTime::Before(m_context, vk_buffer);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -548,6 +551,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
+	if (gpu_time) GpuTime::After(m_context, vk_buffer, program.shader_hash, GpuTime::Kind(program, 'c'));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
@@ -610,7 +614,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const bool gpu_time = GpuTime::Enabled(m_context);
+	if (gpu_time) GpuTime::Before(m_context, vk_buffer);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	if (gpu_time) GpuTime::After(m_context, vk_buffer, input_info.stage.module->info.shader_hash,
+	                              GpuTime::Kind(input_info.stage.module->info, 'c'));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

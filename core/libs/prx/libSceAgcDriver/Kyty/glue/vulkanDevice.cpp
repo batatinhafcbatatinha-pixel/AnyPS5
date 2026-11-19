@@ -595,7 +595,18 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    Config::OcclusionQueriesEnabled() && supported12.hostQueryReset;
 	graphics.occlusion_query_precise_enabled =
 	    graphics.occlusion_queries_enabled && supported2.features.occlusionQueryPrecise;
-	features12.hostQueryReset             = graphics.occlusion_queries_enabled;
+	// APS5_KYTY_GPUTIME: timestamps around draws and dispatches, reset from the host as well.
+	{
+		uint32_t family_count = 0;
+		graphics.physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		graphics.physical_device.getQueueFamilyProperties(&family_count, families.data());
+		graphics.timestamp_valid_bits =
+		    graphics.queue_family < family_count ? families[graphics.queue_family].timestampValidBits : 0;
+	}
+	graphics.gpu_time_enabled = std::getenv("APS5_KYTY_GPUTIME") != nullptr && supported12.hostQueryReset &&
+	                            graphics.timestamp_valid_bits != 0;
+	features12.hostQueryReset             = graphics.occlusion_queries_enabled || graphics.gpu_time_enabled;
 	device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
 	LOGF("Vulkan ray query: %s\n", ray_query_enabled ? "true" : "false");
 	LOGF("Vulkan occlusion queries: %s, precise: %s\n",

@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/gpuTime.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -1222,6 +1223,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	const bool    gpu_time          = GpuTime::Enabled(m_context);
+	if (gpu_time) GpuTime::Before(m_context, vk_buffer);
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
@@ -1234,6 +1237,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	} else {
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
+	}
+	if (gpu_time) {
+		const auto& timed = state.ps_active ? state.ps_input_info.stage.module->info
+		                                    : state.vertex_info[0].stage.module->info;
+		GpuTime::After(m_context, vk_buffer, timed.shader_hash, GpuTime::Kind(timed, 'd'));
 	}
 	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
