@@ -120,3 +120,10 @@ cookies.txt
 # port launcher configuration of this fork
 !/launcher.json
 !/docs/screenshots/*.jpg
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*

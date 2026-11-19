@@ -55,6 +55,9 @@ inline constexpr std::uint32_t MirrorUnnormalizedBase = 57536u;
 inline constexpr std::uint32_t MinLodBase = 57600u;
 inline constexpr std::uint32_t SamplerLodBiasBase = 57728u;
 inline constexpr float SamplerLodBiasShaderThreshold = 15.0f;
+inline constexpr std::uint32_t GatherLodBase = 57792u;
+inline constexpr std::uint32_t GatherLodBiasBase = 57856u;
+inline constexpr std::uint32_t GatherImageMinLodBase = 57920u;
 inline constexpr std::uint32_t FmaskFormatBase = 58048u;
 inline constexpr std::uint32_t VolumeGatherBase = 58176u;
 inline constexpr std::uint32_t GuestExtentBase = 58304u;
@@ -63,6 +66,7 @@ inline constexpr std::uint32_t FragmentScaleBase = 58496u;
 inline constexpr std::uint32_t FragmentScaleWords = 2u;
 inline constexpr std::uint32_t GridScaleBase = 58498u;
 inline constexpr std::uint32_t GridScaleWords = 4u;
+inline constexpr std::uint32_t GatherImageShapeBase = 58560u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;
