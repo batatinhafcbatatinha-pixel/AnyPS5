@@ -46,6 +46,8 @@ struct GraphicContext {
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               gpu_time_enabled                      = false; // APS5_KYTY_GPUTIME
+	bool                               diagnostic_checkpoints_enabled        = false; // APS5_KYTY_GPU_DIAG
+	bool                               device_fault_enabled                  = false; // APS5_KYTY_GPU_DIAG
 	uint32_t                           timestamp_valid_bits                  = 0;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;

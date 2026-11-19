@@ -1249,6 +1249,9 @@ void BufferCache::QueueUnwatchedPages(const RangeSet& pages) {
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+	if (m_bda_rescan_pending.exchange(false, std::memory_order_acq_rel)) {
+		QueueUnwatchedPages(ScanUnwatchedPages());
+	}
 	if (!m_bda_sync_pending.exchange(false, std::memory_order_acq_rel)) {
 		return;
 	}

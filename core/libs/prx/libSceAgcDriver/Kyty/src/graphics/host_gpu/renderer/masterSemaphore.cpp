@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/gpuDiag.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/deviceLossReport.h"
 
@@ -73,6 +74,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	for (uint32_t slices = 1; result == vk::Result::eTimeout; ++slices) {
 		uint64_t counter = 0;
 		(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+		if (slices == 2) GpuDiag::Report(m_graphics, "a GPU wait of 10 s");
 		if (slices <= 3) {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "[gpu-wait] semaphore {} waits for tick {} for {} s: counter {}, next tick {}\n",

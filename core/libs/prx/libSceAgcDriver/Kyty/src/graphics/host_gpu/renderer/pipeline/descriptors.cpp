@@ -849,15 +849,47 @@ static void MarkWrittenTable(RenderContext& context, const Snapshot& bound, uint
 	constexpr uint64_t MaxRecordReads = 4096;
 	const bool         dirty          = cache.HasGpuDirtyBytes(address, size);
 	const bool         per_record     = dirty && (size - offset) / stride < MaxRecordReads;
-	std::vector<uint32_t> words;
+	// The table's buffers come from its bytes and the mapped ranges: a walk of a whole table is
+	// reused while neither changes.
+	struct Walked {
+		uint64_t                                   address = 0, size = 0, hash = 0, generation = 0;
+		uint32_t                                   offset = 0, stride = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	};
+	static thread_local std::vector<Walked>   walked;
+	static thread_local std::vector<uint32_t> words;
+	std::vector<std::pair<uint64_t, uint64_t>> record_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>>* ranges = &record_ranges;
+	const auto mark = [&](const std::vector<std::pair<uint64_t, uint64_t>>& spans) {
+		for (const auto [base, bytes]: spans) {
+			(void)cache.ObtainBuffer(base, bytes, true);
+			context.GetTextureCache().InvalidateMemoryFromGPU(base, bytes);
+		}
+	};
 	if (!per_record) {
 		if (dirty) cache.ReadMemory(address, size);
 		words.resize(size / sizeof(uint32_t));
 		if (!Libs::LibKernel::Memory::CopySparseMemory(address, words.data(), words.size() * sizeof(uint32_t))) {
 			return;
 		}
+		const auto hash       = XXH3_64bits(words.data(), words.size() * sizeof(uint32_t));
+		const auto generation = context.MapGeneration();
+		auto       entry      = std::ranges::find_if(walked, [&](const Walked& w) {
+			return w.address == address && w.size == size && w.offset == offset && w.stride == stride;
+		});
+		if (entry != walked.end() && entry->hash == hash && entry->generation == generation) {
+			mark(entry->ranges);
+			return;
+		}
+		if (entry == walked.end()) {
+			if (walked.size() >= 8) walked.erase(walked.begin());
+			entry = walked.insert(walked.end(), Walked {address, size, 0, 0, offset, stride, {}});
+		}
+		entry->hash       = hash;
+		entry->generation = generation;
+		entry->ranges.clear();
+		ranges = &entry->ranges;
 	}
-	std::vector<std::pair<uint64_t, uint64_t>> ranges;
 	for (uint64_t at = offset; at + sizeof(ShaderBufferResource) <= size; at += stride) {
 		ShaderBufferResource record;
 		if (per_record) {
@@ -871,22 +903,37 @@ static void MarkWrittenTable(RenderContext& context, const Snapshot& bound, uint
 		    !GuestRange {base, bytes}.Valid() || !context.IsMapped(base, bytes)) {
 			continue;
 		}
-		ranges.emplace_back(base, bytes);
+		ranges->emplace_back(base, bytes);
 	}
-	std::ranges::sort(ranges);
-	ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
+	std::ranges::sort(*ranges);
+	ranges->erase(std::unique(ranges->begin(), ranges->end()), ranges->end());
+	// Written state is kept per tracker page: buffers within or next to one page mark the same
+	// pages as one span does, in one cache lookup.
+	if (!ranges->empty()) {
+		constexpr uint64_t MaxSpanBytes = uint64_t {64} << 20u;
+		size_t             out          = 0;
+		for (size_t i = 1; i < ranges->size(); i++) {
+			auto&      span     = (*ranges)[out];
+			const auto span_end = span.first + span.second;
+			const auto end      = std::max(span_end, (*ranges)[i].first + (*ranges)[i].second);
+			if ((*ranges)[i].first <= Common::AlignUp(span_end, TRACKER_PAGE_SIZE) &&
+			    end - span.first <= MaxSpanBytes) {
+				span.second = end - span.first;
+			} else {
+				(*ranges)[++out] = (*ranges)[i];
+			}
+		}
+		ranges->resize(out + 1);
+	}
 	static std::atomic<uint32_t> logged {0};
 	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
 		uint64_t total = 0;
-		for (const auto& range: ranges) total += range.second;
-		std::printf("Run-time descriptor writes: table 0x%016" PRIx64 " size 0x%" PRIx64 " stride %u, %zu buffers, "
-		     "0x%" PRIx64 " bytes marked written\n", address, size, stride, ranges.size(), total);
+		for (const auto& range: *ranges) total += range.second;
+		std::printf("Run-time descriptor writes: table 0x%016" PRIx64 " size 0x%" PRIx64 " stride %u, %zu spans, "
+		     "0x%" PRIx64 " bytes marked written\n", address, size, stride, ranges->size(), total);
 		std::fflush(stdout);
 	}
-	for (const auto [base, bytes]: ranges) {
-		(void)cache.ObtainBuffer(base, bytes, true);
-		context.GetTextureCache().InvalidateMemoryFromGPU(base, bytes);
-	}
+	mark(*ranges);
 }
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {

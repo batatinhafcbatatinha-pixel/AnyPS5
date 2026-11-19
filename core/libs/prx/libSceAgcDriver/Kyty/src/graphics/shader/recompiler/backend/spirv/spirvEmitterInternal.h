@@ -157,6 +157,8 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	// Back edges taken by this invocation in a program that walks a BVH (see EmitLoopGuard).
+	uint32_t                   loop_guard_variable                   = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   helper_invocation_variable            = 0;
 	uint32_t                   per_vertex_variable                   = 0;
