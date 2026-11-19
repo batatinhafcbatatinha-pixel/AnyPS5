@@ -88,9 +88,10 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
     : m_master(graphics), m_side(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_side_pool(graphics, m_master), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
-	// Run-time descriptor variants need the image heap's global map, which the heap no longer has
-	// since upstream made heap elements shared across tables: no program is learned.
-	ShaderRecompiler::IR::SetRuntimeLearning(false);
+	// Run-time descriptor variants resolve images and samplers through the image heap's global
+	// map, which the heap keeps when GPU-SRT images are enabled. Learning which programs take them
+	// is opt-in (APS5_KYTY_GPU_SRT_LEARN=1) until it has been verified in a run.
+	ShaderRecompiler::IR::SetRuntimeLearning(std::getenv("APS5_KYTY_GPU_SRT_LEARN") != nullptr);
 	const char* async_submit = std::getenv("KYTY_ASYNC_SUBMIT");
 	m_async_submit           = async_submit == nullptr || async_submit[0] != '0';
 }
@@ -497,6 +498,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_IF(m_command.IsInvalid());
 
+	// GPU-SRT: the global map's misses of this batch reach the host with it.
+	m_context.GetImageHeap().RecordGlobalReadback(m_command);
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -21,6 +22,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <fmt/format.h>
 #include <map>
 #include <span>
@@ -695,6 +698,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(translated.cfg_dump, ir);
 		LOGF("ShaderRecompiler %s native IR:\n%s", stage, ir_dump.c_str());
+		// The log is silent unless APS5_KYTY_LOG is set: the dumps also go to the shader log folder.
+		const auto folder = ::Config::GetShaderLogFolder();
+		std::error_code error;
+		std::filesystem::create_directories(folder, error);
+		const auto name = fmt::format("{}_{:016x}", stage, ir.shader_hash);
+		std::ofstream(folder / (name + ".decoded.txt")) << translated.decoded_dump;
+		std::ofstream(folder / (name + ".ir.txt")) << ir_dump;
 	}
 
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,

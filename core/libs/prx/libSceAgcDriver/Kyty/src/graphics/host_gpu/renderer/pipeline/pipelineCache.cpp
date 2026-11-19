@@ -432,7 +432,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.runtime_srt     = m_lookup_key.runtime_srt;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
-	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent &&
+	                          Config::ShaderLogWanted(params.hash);
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {

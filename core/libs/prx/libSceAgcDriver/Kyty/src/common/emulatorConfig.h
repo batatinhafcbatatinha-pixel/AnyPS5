@@ -32,6 +32,8 @@ bool ShaderValidationEnabled();
 bool ShaderCacheEnabled();
 LogDirection GetShaderLogDirection();
 std::filesystem::path GetShaderLogFolder();
+// APS5_KYTY_SHADER_LOG_HASHES: comma-separated hexadecimal shader hashes the shader log keeps (all when unset).
+bool ShaderLogWanted(uint64_t hash);
 bool GraphicsDebugDumpEnabled();
 LogDirection GetPrintfDirection();
 bool SpirvDebugPrintfEnabled();

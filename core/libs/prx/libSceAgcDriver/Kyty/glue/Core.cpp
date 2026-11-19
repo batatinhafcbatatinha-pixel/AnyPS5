@@ -1,6 +1,7 @@
 // Lifecycle of the KytyPS5 GPU stack inside AnyPS5's libSceAgcDriver: device creation, the guest
 // GPU thread, command submission and the video-out bridge the stack calls at flips.
 
+#include "common/frameClock.h"
 #include "glue/Core.hpp"
 #include "glue/CoreInternal.hpp"
 #include "glue/VulkanDevice.hpp"
@@ -300,6 +301,8 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
 	// expire after a number of them (regionManager.h HotPageLifetime). Without it they never
 	// expire and every page the CPU ever rewrote is uploaded again on every submission.
 	Graphics::AdvanceTrackerFrame();
+	// Kyty's own video-out also counts flips for the learning that compares frame rates.
+	Common::FrameClock::NoteFlip();
 	AgcDriver::VramBackend::Host::CompleteFlip(request_id);
 }
 
