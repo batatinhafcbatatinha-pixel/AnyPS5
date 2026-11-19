@@ -65,6 +65,21 @@ std::optional<AgcDriver::FramePacer>& framePacer() {
     return pacer;
 }
 
+// ANYPS5_FLIP_VBLANKS: vblanks a flip waits for since the previous one, in place of the guest's flip
+// rate (rate + 1). 0 presents as soon as the frame is ready; unset keeps the guest's pacing.
+std::optional<std::uint64_t> flipVblanksOverride() {
+    static const std::optional<std::uint64_t> value = []() -> std::optional<std::uint64_t> {
+        const char* text = std::getenv("ANYPS5_FLIP_VBLANKS");
+        if (text == nullptr || *text == 0) return std::nullopt;
+        if (text[1] != 0 || text[0] < '0' || text[0] > '3') {
+            throw std::runtime_error(std::string("ANYPS5_FLIP_VBLANKS must be 0, 1, 2 or 3, not '") + text + "'");
+        }
+        std::fprintf(stderr, "[videoout] flips wait %c vblank(s) instead of the guest's flip rate\n", text[0]);
+        return static_cast<std::uint64_t>(text[0] - '0');
+    }();
+    return value;
+}
+
 bool paceFlip(FlipRequest& req) {
     auto& pacer = framePacer();
     if (!pacer) return true;
@@ -691,7 +706,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             std::fprintf(stderr, "[videoout] display no longer supports 119.88 Hz; fell back to 59.94 Hz\n");
         }
         require(req.ready && !req.terminal && req.generation == req.cfg->generation, "stale or incomplete flip request");
-        const auto interval = static_cast<uint64_t>(req.flipRate + 1);
+        const auto interval = flipVblanksOverride().value_or(static_cast<uint64_t>(req.flipRate + 1));
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
         const auto target = req.cfg->lastFlipVblank + interval;
         timing.Mark("validate");

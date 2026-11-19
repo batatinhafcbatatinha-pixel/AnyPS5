@@ -90,6 +90,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
+| `APS5_KYTY_MEMSTATS` | presence | `core/libs/prx/libSceAgcDriver/Kyty/glue/Memory.cpp` |  | every 10 s, the VRAM-resident (Kyty) backend logs `[memstats]` and `[counters]` lines: guarded reads and their callers, GPU waits per calling place, read-back sites, downloads and uploads per MiB of guest memory, read-back outcomes (guest or GPU thread, whether a GPU write covers the read bytes, eager or synchronous download, time spent), faults per MiB and guest fault addresses; unset keeps these counters off the hot paths |
 | `ANYPS5_FPS_LIMIT` | string | `core/libs/prx/libSceAgcDriver/Execution/include/FrameLimit.hpp` | 0 | the most frames per second the window presents, from 0.5 to 1000000 with at most three decimals; 0, empty or unset is no limit, and any other value is refused |
 | `ANYPS5_FSR_SHARPNESS` | string | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` | 0.2 | RCAS sharpness in stops under `ANYPS5_UPSCALE=fsr`, from 0.0 (sharpest) to 2.0 (weakest); a value outside that range or not a number is refused |
 | `ANYPS5_GPU` | string | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | restricts physical device selection to device names containing this case-insensitive substring |
@@ -741,6 +742,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
 | `ANYPS5_DISPLAY_INDEX` | integer | `core/libs/prx/libSceVideoOut/src/DisplayWindow.cpp` | 0 | SDL display index used for the initial window size and centered position; invalid or unavailable indices fail window creation; selection does not guarantee the window will not activate |
+| `ANYPS5_FLIP_VBLANKS` | integer | `core/libs/prx/libSceVideoOut/src/VideoOutDriver.cpp` |  | vblanks (59.94 Hz) a flip waits for after the previous flip, in place of the guest's flip rate (rate + 1): `0` presents each frame as soon as it is ready, `1` to `3` fix the interval; unset or empty keeps the guest's pacing, and any other value fails the flip with an error naming the variable |
 | `ANYPS5_FULLSCREEN` | string | `core/libs/prx/libSceVideoOut/src/DisplayWindow.cpp` | windowed | `1` or `borderless` opens the display window fullscreen at the desktop resolution, `0` or `windowed` (or empty) keeps it windowed; any other non-empty value opens it fullscreen as before and prints a warning naming the value; F11 switches in either case |
 | `ANYPS5_INPUT_CONFIG` | string | `core/libs/prx/libSceVideoOut/src/InputMapping.cpp` |  | path of the input mapping file that binds host keys and mouse to guest pad actions |
 | `ANYPS5_AUDIO_DEVICE` | string | `core/libs/prx/libSceAudioOut/src/AudioOut.cpp` |  | the exact name of a host output device to play the title's audio on; a name that is not listed is refused with the list of output devices in the log, and the default device is used |
