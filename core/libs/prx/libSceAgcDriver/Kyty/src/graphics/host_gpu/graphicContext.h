@@ -45,6 +45,8 @@ struct GraphicContext {
 	bool                               sampler_filter_minmax_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
+	bool                               gpu_time_enabled                      = false; // APS5_KYTY_GPUTIME
+	uint32_t                           timestamp_valid_bits                  = 0;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};

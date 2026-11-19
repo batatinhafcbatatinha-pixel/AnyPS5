@@ -357,6 +357,7 @@ struct Real {
 	APS5_REAL(vkCmdSetViewport)
 	APS5_REAL(vkCmdSetViewportWithCount)
 	APS5_REAL(vkCmdUpdateBuffer)
+	APS5_REAL(vkCmdWriteTimestamp)
 #undef APS5_REAL
 };
 Real g_real;
@@ -452,6 +453,9 @@ APS5_SCALAR(CmdBeginQuery, APS5_P(VkCommandBuffer buffer, VkQueryPool pool, uint
 APS5_SCALAR(CmdEndQuery, APS5_P(VkCommandBuffer buffer, VkQueryPool pool, uint32_t query), APS5_P(buffer, pool, query),
             APS5_C(buffer, pool, query))
 APS5_SCALAR(CmdEndRendering, APS5_P(VkCommandBuffer buffer), APS5_P(buffer), APS5_C(buffer))
+APS5_SCALAR(CmdWriteTimestamp,
+            APS5_P(VkCommandBuffer buffer, VkPipelineStageFlagBits stage, VkQueryPool pool, uint32_t query),
+            APS5_P(buffer, stage, pool, query), APS5_C(buffer, stage, pool, query))
 APS5_SCALAR(CmdBindIndexBuffer, APS5_P(VkCommandBuffer buffer, VkBuffer index, VkDeviceSize offset, VkIndexType type),
             APS5_P(buffer, index, offset, type), APS5_C(buffer, index, offset, type))
 APS5_SCALAR(CmdBindPipeline, APS5_P(VkCommandBuffer buffer, VkPipelineBindPoint point, VkPipeline pipeline),
@@ -956,6 +960,7 @@ void Install() {
 	APS5_HOOK_OPTIONAL(CmdEndConditionalRenderingEXT)
 	APS5_HOOK(CmdBeginQuery)
 	APS5_HOOK(CmdEndQuery)
+	APS5_HOOK(CmdWriteTimestamp)
 	APS5_HOOK(CmdBeginRendering)
 	APS5_HOOK(CmdEndRendering)
 	APS5_HOOK(CmdBindDescriptorSets)
@@ -1038,6 +1043,7 @@ void Install() {
 	APS5_SET_OPTIONAL(CmdEndConditionalRenderingEXT)
 	APS5_SET(CmdBeginQuery)
 	APS5_SET(CmdEndQuery)
+	APS5_SET(CmdWriteTimestamp)
 	APS5_SET(CmdBeginRendering)
 	APS5_SET(CmdEndRendering)
 	APS5_SET(CmdBindDescriptorSets)
