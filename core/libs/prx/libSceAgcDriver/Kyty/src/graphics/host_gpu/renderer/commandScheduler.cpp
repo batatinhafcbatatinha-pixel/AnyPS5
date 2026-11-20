@@ -180,6 +180,37 @@ void CommandScheduler::Finish() {
 	PopPendingOperations();
 }
 
+namespace BatchLatency {
+// Per tick (ring): when its recording ended, when vkQueueSubmit returned, when it was seen done.
+constexpr size_t Ring = 8192;
+inline std::atomic<int64_t> g_end[Ring], g_submit[Ring];
+inline std::atomic<int64_t> g_sum_wait {0}, g_sum_gpu {0}, g_count {0}, g_last_print {0};
+inline int64_t Now() {
+	return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace BatchLatency
+
+void NoteBatchesDone(uint64_t from, uint64_t to) {
+	if (!Common::DebugCounters::g_aps5_stats || to <= from) return;
+	const auto now = BatchLatency::Now();
+	for (auto tick = from + 1; tick <= to && tick > to - 64; ++tick) {
+		const auto end    = BatchLatency::g_end[tick % BatchLatency::Ring].load();
+		const auto submit = BatchLatency::g_submit[tick % BatchLatency::Ring].load();
+		if (end == 0 || submit < end) continue;
+		BatchLatency::g_sum_wait += submit - end;
+		BatchLatency::g_sum_gpu += now - submit;
+		BatchLatency::g_count++;
+	}
+	auto last = BatchLatency::g_last_print.load();
+	if (now - last > 10'000'000 && BatchLatency::g_last_print.compare_exchange_strong(last, now)) {
+		const auto count = std::max<int64_t>(BatchLatency::g_count.exchange(0), 1);
+		std::printf("[latency] %lld batches: record end -> vkQueueSubmit %.3f ms, vkQueueSubmit -> seen done %.3f ms (mean)\n",
+		            static_cast<long long>(count), BatchLatency::g_sum_wait.exchange(0) / 1000.0 / count,
+		            BatchLatency::g_sum_gpu.exchange(0) / 1000.0 / count);
+		std::fflush(stdout);
+	}
+}
+
 void CommandScheduler::SubmitToQueue(const SubmitInfo& submit, vk::CommandBuffer buffer, uint64_t tick) {
 	vk::TimelineSemaphoreSubmitInfo timeline_info {};
 	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
@@ -202,6 +233,7 @@ void CommandScheduler::SubmitToQueue(const SubmitInfo& submit, vk::CommandBuffer
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		result = m_graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	if (Common::DebugCounters::g_aps5_stats) BatchLatency::g_submit[tick % BatchLatency::Ring] = BatchLatency::Now();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 	if (result != vk::Result::eSuccess) {
 		ReportDeviceLoss(m_graphics, "submit", static_cast<int>(result));
@@ -528,6 +560,10 @@ uint64_t CommandScheduler::SubmitSide() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_in_side);
+	if (Common::DebugCounters::g_aps5_stats) {
+		BatchLatency::g_end[CurrentTick() % BatchLatency::Ring] = BatchLatency::Now();
+		BatchLatency::g_submit[CurrentTick() % BatchLatency::Ring] = 0;
+	}
 	if (m_side_wait != 0) {
 		submit.AddWait(m_side.Handle(), m_side_wait, vk::PipelineStageFlagBits::eAllCommands);
 		m_side_wait = 0;
