@@ -64,6 +64,11 @@ public:
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			// Lock-free like the queries (see IsRegionGpuModified): a range without GPU-dirty pages
+			// has nothing to download, and need not wait for a write fault holding the region.
+			if (!manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+				return;
+			}
 			std::scoped_lock lock(manager->lock);
 			manager->ForEachModifiedRange<DirtySource::Gpu, false>(offset, bytes, func);
 			if constexpr (clear) {
