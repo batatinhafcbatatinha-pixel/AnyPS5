@@ -80,7 +80,11 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 // Guest command submissions processed so far: CPU writes to memory a submission reads land
 // before it is submitted, so a page uploaded during one submission stays current for it.
 inline std::atomic<uint64_t> g_tracker_epoch {1};
-inline std::atomic<bool>     g_sticky_pages {true};
+// Pages the guest rewrites every frame stay write-watched. APS5_KYTY_STICKY_PAGES=1 (diagnostic)
+// leaves them unwatched and uploads them once per submission (see ForEachModifiedRange): that
+// trusts every CPU write a submission reads to land before it is submitted, which one title
+// breaks (stale bytes reach the GPU), and it was slower there (15.5 vs 17.6 fps).
+inline std::atomic<bool>     g_sticky_pages {std::getenv("APS5_KYTY_STICKY_PAGES") != nullptr};
 // Frames the guest has submitted for display so far.
 inline std::atomic<uint64_t> g_tracker_frame {1};
 
