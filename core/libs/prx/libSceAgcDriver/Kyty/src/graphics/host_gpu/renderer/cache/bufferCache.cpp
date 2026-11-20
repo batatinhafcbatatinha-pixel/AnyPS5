@@ -339,12 +339,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const bool eager_window = stats && m_eager_pending.Intersects(Common::AlignDown(vaddr, DownloadWindowSize),
 		                                                              DownloadWindowSize);
 		bool synced = false;
-		{
-			const auto window = Common::AlignDown(vaddr, DownloadWindowSize);
-			CompleteEagerDownloads(window,
-			                       std::max(window + DownloadWindowSize, vaddr + size) - window,
-			                       false);
-		}
+		// Only the touched pages wait for their queued downloads: a page is made accessible once its
+		// own GPU writes are in guest memory. Waiting for the whole download window held guest
+		// threads on downloads of newer GPU work in pages they did not touch.
+		const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		CompleteEagerDownloads(page_begin, page_end - page_begin, false);
 		// Only small reads, such as faults and descriptor loads, predict later read-backs.
 		if (size <= 16 * TRACKER_PAGE_SIZE && IsRegionGpuModified(vaddr, size)) {
 			const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
@@ -352,13 +352,30 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 		if (IsRegionGpuModified(vaddr, size)) {
-			const auto start =
-			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
-			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
-			                          buffer.CpuAddress() + buffer.Size());
+			auto start = std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
+			auto end   = std::min(std::max(start + DownloadWindowSize, vaddr + size),
+			                      buffer.CpuAddress() + buffer.Size());
+			// A queued download publishes later than this one: within its pages it would put back
+			// older bytes. With one left in the window, only the touched pages are read back.
+			if (m_eager_pending.Intersects(start, end - start)) {
+				start = std::max(page_begin, buffer.CpuAddress());
+				end   = std::min(std::max(page_end, vaddr + size), buffer.CpuAddress() + buffer.Size());
+			}
+			const auto writer = !stats ? 0u
+			                    : m_scheduler.IsFree(buffer.last_write_tick)       ? 0u
+			                    : buffer.last_write_tick < m_scheduler.CurrentTick() ? 1u
+			                                                                       : 2u;
+			const auto sync_begin = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
 				synced = true;
+			}
+			if (stats) {
+				Common::DebugCounters::g_sync_downloads.Note(
+				    (vaddr >> 20) << 5 | (from_gpu_thread ? 16u : 0u) | (precise ? 8u : 0u) | (is_write ? 4u : 0u) | writer,
+				    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                              std::chrono::steady_clock::now() - sync_begin)
+				                              .count()));
 			}
 		}
 		if (stats) {

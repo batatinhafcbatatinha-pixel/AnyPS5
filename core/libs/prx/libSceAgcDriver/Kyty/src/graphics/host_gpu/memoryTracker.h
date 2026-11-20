@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
+#include "common/fastTls.h"
 #include "common/assert.h"
 #include "common/srwLock.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -153,18 +154,20 @@ private:
 	};
 	static constexpr size_t   UPLOAD_MEMO_SLOTS     = 4096;
 	static constexpr uint64_t UPLOAD_MEMO_NO_STICKY = ~uint64_t {0};
-	// A raw pointer (constant-initialised, kept for the thread's life): MinGW emits a TLS init
-	// function per object file for an inline thread_local with a constructor, and the link fails.
-	inline static thread_local std::array<UploadMemo, UPLOAD_MEMO_SLOTS>* s_upload_memo = nullptr;
+	// Per thread, in a Windows TLS slot: MinGW's thread_local is emulated (pthread_getspecific on
+	// every access), which showed up in the GPU thread's per-draw buffer lookups.
+	inline static Common::FastTls<std::array<UploadMemo, UPLOAD_MEMO_SLOTS>*> s_upload_memo;
 	inline static std::atomic<uint64_t> s_next_id {1};
 
 	[[nodiscard]] static UploadMemo& UploadMemoSlot(uint64_t vaddr, uint64_t size, bool written) {
-		if (s_upload_memo == nullptr) {
-			s_upload_memo = new std::array<UploadMemo, UPLOAD_MEMO_SLOTS>();
+		auto* memo = s_upload_memo.Get();
+		if (memo == nullptr) {
+			memo = new std::array<UploadMemo, UPLOAD_MEMO_SLOTS>();
+			s_upload_memo.Set(memo);
 		}
 		auto hash = (vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull) ^ (written ? 1u : 0u);
 		hash ^= hash >> 29u;
-		return (*s_upload_memo)[hash % UPLOAD_MEMO_SLOTS];
+		return (*memo)[hash % UPLOAD_MEMO_SLOTS];
 	}
 
 	// Sum of the generations of the regions the range touches, without their locks; 0 when one
