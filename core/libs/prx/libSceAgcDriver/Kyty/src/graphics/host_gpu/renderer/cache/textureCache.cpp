@@ -36,6 +36,12 @@ namespace {
 constexpr uint64_t NumFramesBeforeRemoval = 16;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
+// Color clear codes are a key shifted left by ColorClearKeyShift. Every code DecodeColorClear
+// accepts has the bits below the shift clear, while the steady state code 0xff has them set.
+constexpr uint32_t ColorClearKeyShift    = 5;
+constexpr uint8_t  ColorClearCodeLowBits = (1u << ColorClearKeyShift) - 1u;
+// Views with up to this many slices read their clear codes into the stack.
+constexpr uint32_t ColorClearCodesOnStack = 128;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -1054,19 +1060,24 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                         slice_size * (count - 1) + mip.size};
 	const auto run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
 	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
-		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t keys = 0;
-		for (uint32_t key = 0; key < clears.size(); key++) {
-			clears[key].aspectMask = vk::ImageAspectFlagBits::eColor;
-			if (DecodeColorClear(desc, static_cast<uint8_t>(key << 5u),
-			                     clears[key].clearValue.color)) {
+		for (uint32_t key = 0; key < TileManager::ColorClearSlots; key++) {
+			vk::ClearColorValue unused {};
+			if (DecodeColorClear(desc, static_cast<uint8_t>(key << ColorClearKeyShift), unused)) {
 				keys |= 1u << key;
 			}
 		}
+		// Checked ranges merge when they touch and are only split by gaps, so when the slices
+		// tile the viewed range one lookup and one mark stand for all of them.
+		const bool contiguous = count >= 2 && mip.size == slice_size;
 		// No selected key to clear, or none left since the last check.
 		bool checked = true;
-		for (uint32_t slice = 0; slice < count && checked; slice++) {
-			checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
+		if (contiguous) {
+			checked = m_buffer_cache.IsColorMetadataChecked(viewed.address, viewed.size, keys);
+		} else {
+			for (uint32_t slice = 0; slice < count && checked; slice++) {
+				checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
+			}
 		}
 		if (checked) {
 			return;
@@ -1093,8 +1104,17 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
 				const auto predicates = m_tiler.CheckColorClear(
 				    {buffer->Handle(), offset, viewed.size}, slice_size, count, keys, expand);
-				for (uint32_t slice = 0; slice < count && expand; slice++) {
+				if (expand && contiguous) {
+					m_buffer_cache.MarkColorMetadataChecked(viewed.address, viewed.size, keys);
+				}
+				for (uint32_t slice = 0; slice < count && expand && !contiguous; slice++) {
 					m_buffer_cache.MarkColorMetadataChecked(run(slice), mip.size, keys);
+				}
+				std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
+				for (uint32_t key = 0; key < clears.size(); key++) {
+					clears[key].aspectMask = vk::ImageAspectFlagBits::eColor;
+					(void)DecodeColorClear(desc, static_cast<uint8_t>(key << ColorClearKeyShift),
+					                       clears[key].clearValue.color);
 				}
 				const auto command = m_scheduler.Current().Handle();
 				const auto area    = BeginColorRendering(image, view.format, view.base_level,
@@ -1126,11 +1146,22 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
+	// Every slice's code in one pass: a slice's clear write-back below covers its own bytes only.
+	std::array<uint8_t, ColorClearCodesOnStack> stack_codes;
+	std::vector<uint8_t>                        heap_codes;
+	uint8_t*                                    codes = stack_codes.data();
+	if (count > stack_codes.size()) {
+		heap_codes.resize(count);
+		codes = heap_codes.data();
+	}
+	if (!LibKernel::Memory::TryReadBackingStrided(run(0), slice_size, count, codes)) {
+		EXIT("TextureCache: failed to read color metadata backing\n");
+	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
-		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read color metadata backing\n");
+		const auto code    = codes[slice];
+		if ((code & ColorClearCodeLowBits) != 0) {
+			continue; // Selects no clear, like the steady state code 0xff.
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
@@ -1876,17 +1907,19 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool unlocked_copy) {
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
-	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
-	                                    trapped = m_readback_storage_images] {
-		download.buffer->Invalidate(download.offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
-		if (trapped) {
-			m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
-			// Priority operations run in queue order, so this write-back is the oldest.
-			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.erase(m_write_backs.begin());
-		}
-	});
+	// The write-back touches the image's guest range only.
+	m_scheduler.DeferPriorityOperation(
+	    [this, download = std::move(download), range, trapped = m_readback_storage_images] {
+		    download.buffer->Invalidate(download.offset, range.size);
+		    LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		    if (trapped) {
+			    m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
+			    // Priority operations run in queue order, so this write-back is the oldest.
+			    std::scoped_lock write_back_lock {m_write_back_mutex};
+			    m_write_backs.erase(m_write_backs.begin());
+		    }
+	    },
+	    range);
 	return true;
 }
 

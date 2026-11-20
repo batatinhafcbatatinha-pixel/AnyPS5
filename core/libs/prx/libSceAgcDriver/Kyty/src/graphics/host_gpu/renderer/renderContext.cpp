@@ -134,11 +134,15 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		// access a range with no cached data, so they must finish before it is unmapped.
 		// AnyPS5: guest releases arrive through libc's release observer for ranges the caches may
 		// still use under another registration (validation saw images destroyed in use), so
-		// every unmap drains the recorded work first.
+		// every unmap drains the recorded work first. Priority callbacks are only waited for
+		// when one of them may touch the range: host-only ones (flips, interrupts) do not
+		// access guest memory.
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
+			if (m_command_scheduler.HasPendingPriorityOperations({vaddr, size})) {
+				m_command_scheduler.WaitPriorityOperations(tick);
+			}
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);

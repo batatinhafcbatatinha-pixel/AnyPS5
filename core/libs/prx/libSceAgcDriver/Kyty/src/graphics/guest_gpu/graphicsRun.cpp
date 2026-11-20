@@ -538,8 +538,9 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
+			// Only releases a host semaphore: no guest memory access.
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			    [ready = m_suspend_point_ready] { ready->release(); }, GuestRange {});
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -1002,10 +1003,12 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
 	if (interrupt) {
+		// Signals host event queues only: no guest memory access.
 		GetScheduler().DeferPriorityOperation(
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
-		    });
+		    },
+		    GuestRange {});
 	}
 }
 
@@ -1103,8 +1106,10 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
+	// Flip completion updates host flip state only: no guest memory access.
 	GetScheduler().DeferPriorityOperation(
-	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+	    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
+	    GuestRange {});
 	GetScheduler().Flush();
 }
 
@@ -1152,7 +1157,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	auto& command = CurrentBuffer();
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
-	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, GuestRange {});
 	GetScheduler().Flush();
 }
 

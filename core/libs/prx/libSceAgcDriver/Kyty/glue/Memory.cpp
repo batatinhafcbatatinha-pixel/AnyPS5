@@ -740,6 +740,35 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return AgcDriver::VramBackend::CopyOpened(vaddr, data, size, false);
 }
 
+bool TryReadBackingStrided(uint64_t first, uint64_t stride, uint32_t count, uint8_t* out) {
+	const uint64_t last_index = count - 1u;
+	if (out == nullptr || count == 0 || first == UINT64_MAX ||
+	    (stride != 0 && last_index > (UINT64_MAX - 1u - first) / stride)) {
+		return false;
+	}
+	AgcDriver::VramBackend::NoteCaller(__builtin_return_address(0), count);
+	// A short span is read in one copy and the bytes picked from it. The span may hold unbacked
+	// bytes between the addresses, so a failed copy falls back to one read per address.
+	constexpr uint64_t SpanLimit = 64 * 1024;
+	const uint64_t     span      = stride * last_index + 1u;
+	if (span <= SpanLimit) {
+		thread_local std::vector<uint8_t> bytes;
+		bytes.resize(span);
+		if (AgcDriver::VramBackend::GuardedRead(first, bytes.data(), span)) {
+			for (uint32_t index = 0; index < count; ++index) {
+				out[index] = bytes[stride * index];
+			}
+			return true;
+		}
+	}
+	for (uint32_t index = 0; index < count; ++index) {
+		if (!TryReadBacking(first + stride * index, out + index, 1)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	auto* renderer = Renderer();
 	if (renderer != nullptr && Graphics::GuestRange {vaddr, size}.Valid()) {
