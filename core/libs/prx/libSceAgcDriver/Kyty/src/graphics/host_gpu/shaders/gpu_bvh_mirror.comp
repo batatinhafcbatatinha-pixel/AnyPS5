@@ -152,8 +152,11 @@ uint64_t Load64(uint64_t address) {
 // count and record bounds 8 bytes higher. Format 10 is read only in its base layout: not Trinity
 // (property 0x40000), BVH8 (0x80000), three-level (0x100000) or depopulated (0x20000000), nor a
 // GPU-sized TLAS (0x80000000), whose count covers slots the build leaves unwritten.
+// Format 9 headers have format 10's layout (instance offset at +0x30, count at +0x70, instance
+// records with the BLAS node pointer at +48): read as format 10.
 uint Format(uint64_t header, bool blas) {
-	const uint version    = Load(header + 0xfcul);
+	const uint stored     = Load(header + 0xfcul);
+	const uint version    = stored == 9u ? 10u : stored;
 	const uint properties = Load(header + 0x18ul);
 	const bool known      = version == 1u || version == 3u || version == 6u ||
 	                        (version == 10u && (properties & 0xa01c0000u) == 0u);
