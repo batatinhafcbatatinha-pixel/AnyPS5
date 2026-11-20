@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -872,7 +873,24 @@ static void MarkWrittenTable(RenderContext& context, const Snapshot& bound, uint
 	std::vector<std::pair<uint64_t, uint64_t>>* ranges = &record_ranges;
 	const auto mark = [&](const std::vector<std::pair<uint64_t, uint64_t>>& spans) {
 		for (const auto [base, bytes]: spans) {
-			(void)cache.ObtainBuffer(base, bytes, true);
+			// A span every byte of which still holds an earlier GPU write keeps its marking: the
+			// table's writers run every frame over buffers the CPU mostly leaves alone.
+			const bool repeated = cache.RepeatGpuWrite(base, bytes);
+			if (!repeated) (void)cache.ObtainBuffer(base, bytes, true);
+			if (Common::DebugCounters::g_aps5_stats) {
+				static uint64_t hits = 0, misses = 0, miss_bytes = 0, partial = 0;
+				(repeated ? hits : misses)++;
+				if (!repeated) {
+					miss_bytes += bytes;
+					partial += cache.HasGpuDirtyBytes(base, bytes) ? 1 : 0;
+				}
+				if (((hits + misses) & 0xffffu) == 0) {
+					std::printf("[memstats] run-time table spans: %llu kept, %llu marked (%llu MiB, %llu of them partly GPU-written)\n",
+					            (unsigned long long)hits, (unsigned long long)misses, (unsigned long long)(miss_bytes >> 20),
+					            (unsigned long long)partial);
+					std::fflush(stdout);
+				}
+			}
 			context.GetTextureCache().InvalidateMemoryFromGPU(base, bytes);
 		}
 	};

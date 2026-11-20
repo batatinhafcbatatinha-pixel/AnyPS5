@@ -823,9 +823,26 @@ bool BufferCache::IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t
 	return true;
 }
 
+bool BufferCache::RepeatGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (HostViewEnabled() || !m_gpu_modified_ranges.Contains(vaddr, size)) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(PageIndex(vaddr));
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size)) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	TouchBuffer(buffer);
+	buffer.last_write_tick = m_scheduler.CurrentTick();
+	ForgetColorMetadataChecks(vaddr, size);
+	return true;
+}
+
 void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
 	for (auto& checked: m_checked_color_metadata) {
-		checked.Subtract(vaddr, size);
+		if (!checked.Empty() && checked.Intersects(vaddr, size)) {
+			checked.Subtract(vaddr, size);
+		}
 	}
 }
 

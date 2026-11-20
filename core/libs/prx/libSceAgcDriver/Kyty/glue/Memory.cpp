@@ -115,8 +115,20 @@ void ProtectByRegion(uint64_t begin, uint64_t end, DWORD protection) {
 
 // Applies `mode` to [begin, end), page by page in runs of equal protection. Mutex held.
 std::atomic<uint64_t> g_apply_calls[3] {}, g_apply_pages[3] {}; // no access, reduced, restored
+// VirtualProtect calls made by the tracker (ApplyLocked) and by opened copies (CopyOpened).
+std::atomic<uint64_t> g_apply_protects {0}, g_opened_protects {0}, g_opened_copies {0};
+struct ProtectDelta {
+	std::atomic<uint64_t>& sum;
+	uint64_t               before = g_protect_calls.load(std::memory_order_relaxed);
+	~ProtectDelta() {
+		if (Common::DebugCounters::g_aps5_stats) {
+			sum.fetch_add(g_protect_calls.load(std::memory_order_relaxed) - before, std::memory_order_relaxed);
+		}
+	}
+};
 
 void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode) {
+	ProtectDelta delta {g_apply_protects};
 	if (Common::DebugCounters::g_aps5_stats) {
 		const int kind = mode == Common::VirtualMemory::Mode::NoAccess    ? 0
 		                 : mode == Common::VirtualMemory::Mode::ReadWrite ? 2
@@ -400,10 +412,13 @@ void ReportStats() {
 	ReportWaitSites();
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "[memstats] VirtualProtect: {} calls, {} pages; tracker changes (calls/pages): no access {}/{}, "
-	    "write-watched {}/{}, restored {}/{}; runs split by mapping {}\n",
+	    "write-watched {}/{}, restored {}/{}; runs split by mapping {}; VirtualProtect calls by the tracker {}, "
+	    "by {} opened copies {}\n",
 	    g_protect_calls.exchange(0), g_protect_pages.exchange(0), g_apply_calls[0].exchange(0),
 	    g_apply_pages[0].exchange(0), g_apply_calls[1].exchange(0), g_apply_pages[1].exchange(0),
-	    g_apply_calls[2].exchange(0), g_apply_pages[2].exchange(0), g_split_runs.exchange(0)));
+	    g_apply_calls[2].exchange(0), g_apply_pages[2].exchange(0), g_split_runs.exchange(0),
+	    g_apply_protects.exchange(0), g_opened_copies.exchange(0), g_opened_protects.exchange(0)));
+	ReportSites("[memstats] opened copies per MiB (e write: count, size):", Common::DebugCounters::g_opened_regions, false, true);
 	ReportSites("[memstats] readback sites (rva or guest-fault: count, size):", Common::DebugCounters::g_readback_sites, true, false);
 	ReportSites("[memstats] downloads per MiB (s sync, e eager: count, size):", Common::DebugCounters::g_download_regions, false, true);
 	ReportSites("[memstats] uploads per MiB (count, size):", Common::DebugCounters::g_upload_regions, false, false);
@@ -504,6 +519,11 @@ bool Readable(uint64_t address, uint64_t bytes) {
 // no shared backing to go through). A guest store racing on these pages escapes the tracker.
 bool CopyOpened(uint64_t address, void* data, uint64_t bytes, bool write) {
 	std::lock_guard lock(ProtectionMutex());
+	ProtectDelta    delta {g_opened_protects};
+	if (Common::DebugCounters::g_aps5_stats) {
+		g_opened_copies.fetch_add(1, std::memory_order_relaxed);
+		Common::DebugCounters::g_opened_regions.Note((address >> 20) << 1 | (write ? 1u : 0u), bytes);
+	}
 	auto&           originals = Originals();
 	const auto      begin     = address & ~(PageBytes - 1);
 	const auto      end       = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);

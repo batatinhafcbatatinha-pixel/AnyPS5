@@ -119,6 +119,7 @@ inline SiteTable<64>  g_fault_rips;       // guest-thread faults: key = rip
 // read-back sync downloads: key = (address >> 20) << 5 | gpu thread 16 | GPU bytes 8 | write 4 | writer
 // (0 done, 1 submitted, 2 in the open batch); bytes = ns
 inline SiteTable<128> g_sync_downloads;
+inline SiteTable<128> g_opened_regions; // CopyOpened: key = (address >> 20) << 1 | write
 
 // AnyPS5: diagnostics of APS5_KYTY_MEMSTATS=1 (read once; off: no counter work on hot paths).
 inline const bool g_aps5_stats = std::getenv("APS5_KYTY_MEMSTATS") != nullptr;
