@@ -1022,27 +1022,127 @@ void BufferCache::RecordEagerDownloads() {
 	// Pages whose downloads have landed become readable without a fault.
 	CompleteEagerDownloads(0, UINT64_MAX, true);
 	if (!m_eager_writes.Empty()) {
-		const auto writes = std::exchange(m_eager_writes, {});
-		writes.ForEach([&](uint64_t begin, uint64_t end) {
-			for (auto address = begin; address < end;) {
-				const auto* owner = m_page_table.Find(PageIndex(address));
-				if (owner == nullptr || !*owner) {
-					address = std::min(end, Common::AlignDown(address, CACHING_PAGESIZE) +
-					                            CACHING_PAGESIZE);
-					continue;
-				}
-				auto&      buffer = m_slot_buffers[*owner];
-				const auto last   = std::min(end, buffer.CpuAddress() + buffer.Size());
-				// A stream-buffer wrap can submit while recording: the copy's batch is current after.
-				if (DownloadBufferMemory<true>(buffer, address, last - address)) {
-					m_eager_downloads.push_back({address, last, m_scheduler.CurrentTick()});
-					m_eager_pending.Add(address, last - address);
-				}
-				address = last;
-			}
-		});
+		RecordEagerBatch(std::exchange(m_eager_writes, {}));
 	}
 	m_recording_eager = false;
+}
+
+// The downloads of the queued read-back writes, as DownloadBufferMemory records them one range at
+// a time, in one download range: one barrier pair, one copy per source buffer and one publication
+// per source buffer (after KytyPS5 1d8ee25d).
+void BufferCache::RecordEagerBatch(const RangeSet& writes) {
+	struct Piece {
+		BufferId id;
+		uint64_t begin, end;
+		size_t   first_copy, last_copy;
+	};
+	std::vector<Piece>          pieces;
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	writes.ForEach([&](uint64_t begin, uint64_t end) {
+		for (auto address = begin; address < end;) {
+			const auto* owner = m_page_table.Find(PageIndex(address));
+			if (owner == nullptr || !*owner) {
+				address = std::min(end, Common::AlignDown(address, CACHING_PAGESIZE) + CACHING_PAGESIZE);
+				continue;
+			}
+			const auto& buffer         = m_slot_buffers[*owner];
+			const auto  last           = std::min(end, buffer.CpuAddress() + buffer.Size());
+			const auto  buffer_address = buffer.CpuAddress();
+			const auto  first_copy     = copies.size();
+			uint64_t    piece_bytes    = 0;
+			m_memory_tracker.ForEachDownloadRange<false>(
+			    address, last - address, [&](uint64_t start, uint64_t bytes) noexcept {
+				    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, start, bytes,
+				                                           "buffer download");
+				    m_gpu_modified_ranges.ForEachInRange(start, bytes, [&](uint64_t from, uint64_t to) {
+					    copies.emplace_back(from - buffer_address, total_size, to - from);
+					    piece_bytes += to - from;
+					    // Start each packed range on its own 64-byte cache line.
+					    total_size += Common::AlignUp(to - from, 64);
+				    });
+				    m_gpu_modified_ranges.Subtract(start, bytes);
+				    ForgetColorMetadataChecks(start, bytes);
+			    });
+			if (copies.size() != first_copy) {
+				pieces.push_back({*owner, address, last, first_copy, copies.size()});
+				if (Common::DebugCounters::g_aps5_stats) {
+					Common::DebugCounters::g_download_regions.Note((address >> 20) << 1 | 1, piece_bytes);
+				}
+			}
+			address = last;
+		}
+	});
+	if (copies.empty()) {
+		return;
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+	// A stream-buffer wrap can submit while mapping: the copies' batch is current after.
+	auto download =
+	    std::make_shared<StreamBuffer::Download>(m_download_buffer.MapDownload(total_size, 64));
+	for (auto& copy: copies) {
+		copy.dstOffset += download->offset;
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       {}, 1, &before, 0, nullptr, 0, nullptr);
+	const auto group_end = [&](size_t first) {
+		auto last = first + 1;
+		while (last < pieces.size() && pieces[last].id == pieces[first].id) {
+			++last;
+		}
+		return last;
+	};
+	for (size_t first = 0; first < pieces.size();) {
+		const auto last = group_end(first);
+		native.copyBuffer(m_slot_buffers[pieces[first].id].Handle(), download->buffer->Handle(),
+		                  static_cast<uint32_t>(pieces[last - 1].last_copy - pieces[first].first_copy),
+		                  copies.data() + pieces[first].first_copy);
+		first = last;
+	}
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = download->buffer->Handle();
+	after.offset              = download->offset;
+	after.size                = total_size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	const auto tick = m_scheduler.CurrentTick();
+	for (size_t first = 0; first < pieces.size();) {
+		const auto  last           = group_end(first);
+		const auto& buffer         = m_slot_buffers[pieces[first].id];
+		const auto  buffer_address = buffer.CpuAddress();
+		std::vector<vk::BufferCopy> own(
+		    copies.begin() + static_cast<ptrdiff_t>(pieces[first].first_copy),
+		    copies.begin() + static_cast<ptrdiff_t>(pieces[last - 1].last_copy));
+		// Every packed copy lies inside the source buffer's guest range.
+		m_scheduler.DeferPriorityOperation(
+		    [download, buffer_address, own = std::move(own)] {
+			    const auto begin = own.front().dstOffset;
+			    const auto end   = own.back().dstOffset + own.back().size;
+			    download->buffer->Invalidate(begin, end - begin);
+			    for (const auto& copy: own) {
+				    LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+				                                    download->mapped + (copy.dstOffset - download->offset),
+				                                    copy.size);
+			    }
+		    },
+		    GuestRange {buffer_address, buffer.Size()});
+		for (auto piece = first; piece < last; ++piece) {
+			m_eager_downloads.push_back({pieces[piece].begin, pieces[piece].end, tick});
+			m_eager_pending.Add(pieces[piece].begin, pieces[piece].end - pieces[piece].begin);
+		}
+		first = last;
+	}
 }
 
 void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool finished_only,
@@ -1054,8 +1154,13 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 	if (!m_eager_pending.Intersects(vaddr, std::max<uint64_t>(end - vaddr, 1))) {
 		return;
 	}
-	m_scheduler.GetMasterSemaphore().Refresh();
+	m_scheduler.GetMasterSemaphore().Refresh(true);
 	RangeSet released;
+	// Sorted and merged before entering the set: one insertion per run of released pages.
+	std::vector<std::pair<uint64_t, uint64_t>> freed;
+	// A wait for a tick covers every earlier one: each tick is waited for once.
+	uint64_t waited = 0;
+	auto&    master = m_scheduler.GetMasterSemaphore();
 	std::erase_if(m_eager_downloads, [&](const EagerDownload& download) {
 		if (download.end <= vaddr || end <= download.begin) {
 			return false;
@@ -1069,19 +1174,31 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 				(*download.publish)();
 			}
 			const auto first = Common::AlignDown(download.begin, TRACKER_PAGE_SIZE);
-			released.Add(first, Common::AlignUp(download.end, TRACKER_PAGE_SIZE) - first);
+			freed.emplace_back(first, Common::AlignUp(download.end, TRACKER_PAGE_SIZE));
 			return true;
 		}
-		if (side_only || (finished_only && !m_scheduler.IsFree(download.tick))) {
+		// The timeline was read above; a download finishing since is released by a later call.
+		if (side_only || (finished_only && !master.IsFree(download.tick))) {
 			return false;
 		}
-		// The download was recorded before its batch was submitted, so no flush is needed.
-		m_scheduler.Wait(download.tick);
-		m_scheduler.WaitPriorityOperations(download.tick);
+		if (download.tick > waited) {
+			// The download was recorded before its batch was submitted, so no flush is needed.
+			m_scheduler.Wait(download.tick);
+			m_scheduler.WaitPriorityOperations(download.tick);
+			waited = download.tick;
+		}
 		const auto first = Common::AlignDown(download.begin, TRACKER_PAGE_SIZE);
-		released.Add(first, Common::AlignUp(download.end, TRACKER_PAGE_SIZE) - first);
+		freed.emplace_back(first, Common::AlignUp(download.end, TRACKER_PAGE_SIZE));
 		return true;
 	});
+	std::sort(freed.begin(), freed.end());
+	for (size_t index = 0; index < freed.size();) {
+		auto [first, last] = freed[index++];
+		while (index < freed.size() && freed[index].first <= last) {
+			last = std::max(last, freed[index++].second);
+		}
+		released.Add(first, last - first);
+	}
 	if (released.Empty()) {
 		return;
 	}

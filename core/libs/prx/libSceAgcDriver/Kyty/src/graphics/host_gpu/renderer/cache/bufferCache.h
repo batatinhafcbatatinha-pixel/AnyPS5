@@ -181,6 +181,8 @@ private:
 	template <bool insert>
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
+	// Records the downloads of read-back writes (RecordEagerDownloads) in one batch.
+	void RecordEagerBatch(const RangeSet& writes);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
