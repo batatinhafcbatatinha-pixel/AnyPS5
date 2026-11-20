@@ -354,6 +354,11 @@ void ReportSites(const char* title, Common::DebugCounters::SiteTable<Slots>& tab
 			                    (row.key & 2) ? "+eager" : "", (row.key & 1) ? "+sync" : "", row.count, row.bytes / 1000000);
 		} else if (mode == 4) {
 			text += fmt::format(" {:#x}{}{}: {}", (row.key >> 2) << 20, (row.key & 2) ? "g" : "c", (row.key & 1) ? "w" : "r", row.count);
+		} else if (mode == 7) {
+			constexpr const char* writer[] = {"done", "submitted", "open", "?"};
+			text += fmt::format(" {:#x}{}{}{}/{}: {} {}ms", (row.key >> 5) << 20, (row.key & 16) ? "g" : "c",
+			                    (row.key & 8) ? "+bytes" : "", (row.key & 4) ? "w" : "r", writer[row.key & 3],
+			                    row.count, row.bytes / 1000000);
 		} else if (mode == 6) {
 			text += fmt::format(" {}: {}", row.key, row.count);
 		} else if (mode == 5) {
@@ -407,6 +412,8 @@ void ReportStats() {
 	            Common::DebugCounters::g_early_reasons, false, false, 6);
 	ReportSites("[memstats] faults per MiB (c guest/g gpu thread, r/w: count):", Common::DebugCounters::g_fault_regions, false, false, 4);
 	ReportSites("[memstats] guest fault rips (count):", Common::DebugCounters::g_fault_rips, false, false, 5);
+	ReportSites("[memstats] read-back sync downloads (MiB, c guest/g gpu thread, +bytes, r/w, writer: count, time):",
+	            Common::DebugCounters::g_sync_downloads, false, false, 7);
 	Log::WriteToConsoleAndLog(fmt::format("[memstats] gpu-modified checks {} regions {}; cpu-modified checks {} regions {}",
 	                                      Libs::Graphics::g_gpumod_calls.exchange(0), Libs::Graphics::g_gpumod_regions.exchange(0),
 	                                      Libs::Graphics::g_cpumod_calls.exchange(0), Libs::Graphics::g_cpumod_regions.exchange(0)) +

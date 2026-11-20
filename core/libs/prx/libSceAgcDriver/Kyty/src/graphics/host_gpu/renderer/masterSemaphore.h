@@ -28,7 +28,9 @@ public:
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
-	void Refresh();
+	// Reads the GPU's timeline value. Opportunistic polls (force false) reuse a read less than
+	// RefreshIntervalNs old: the known tick only trails the GPU a little longer, never leads it.
+	void Refresh(bool force = false);
 	void Wait(uint64_t tick);
 
 private:
@@ -36,6 +38,7 @@ private:
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::atomic<int64_t>  m_last_refresh_ns {0};
 };
 
 } // namespace Libs::Graphics

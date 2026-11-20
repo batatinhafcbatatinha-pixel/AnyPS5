@@ -7,6 +7,8 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <chrono>
+
 namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
@@ -25,7 +27,17 @@ MasterSemaphore::~MasterSemaphore() {
 	m_graphics.device.destroySemaphore(m_semaphore, nullptr);
 }
 
-void MasterSemaphore::Refresh() {
+void MasterSemaphore::Refresh(bool force) {
+	// AnyPS5: a timeline read is a driver call costing microseconds; the GPU thread polled it
+	// for every eager-download check (8.9% of its time in one title).
+	constexpr int64_t RefreshIntervalNs = 50'000;
+	const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch())
+	                     .count();
+	if (!force && now - m_last_refresh_ns.load(std::memory_order_relaxed) < RefreshIntervalNs) {
+		return;
+	}
+	m_last_refresh_ns.store(now, std::memory_order_relaxed);
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {
@@ -44,7 +56,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
-	Refresh();
+	Refresh(true);
 	if (IsFree(tick)) {
 		return;
 	}
@@ -86,7 +98,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		ReportDeviceLoss(m_graphics, "semaphore wait", static_cast<int>(result));
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	Refresh();
+	Refresh(true);
 }
 
 } // namespace Libs::Graphics

@@ -116,6 +116,9 @@ inline SiteTable<16>  g_early_reasons;    // early compute learning: why a wait 
 inline SiteTable<16>  g_readback_outcomes;
 inline SiteTable<128> g_fault_regions;    // key = (address >> 20) << 2 | gpu thread 2 | write 1
 inline SiteTable<64>  g_fault_rips;       // guest-thread faults: key = rip
+// read-back sync downloads: key = (address >> 20) << 5 | gpu thread 16 | GPU bytes 8 | write 4 | writer
+// (0 done, 1 submitted, 2 in the open batch); bytes = ns
+inline SiteTable<128> g_sync_downloads;
 
 // AnyPS5: diagnostics of APS5_KYTY_MEMSTATS=1 (read once; off: no counter work on hot paths).
 inline const bool g_aps5_stats = std::getenv("APS5_KYTY_MEMSTATS") != nullptr;
