@@ -751,14 +751,23 @@ bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* pro
 }
 
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
+    // Without write watching (the VRAM-resident GPU backend) guest writes are not collected: the
+    // caller treats false as "unknown" instead of GetWriteWatch failing on unwatched memory.
+    if (!Arena::Get().WriteWatched()) return false;
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear);
 }
 
 bool GuestArenaCollectArmedWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
+    // Without write watching (the VRAM-resident GPU backend) guest writes are not collected: the
+    // caller treats false as "unknown" instead of GetWriteWatch failing on unwatched memory.
+    if (!Arena::Get().WriteWatched()) return false;
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear, WindowsMappings::Collection::Armed);
 }
 
 bool GuestArenaCollectFreshWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
+    // Without write watching (the VRAM-resident GPU backend) guest writes are not collected: the
+    // caller treats false as "unknown" instead of GetWriteWatch failing on unwatched memory.
+    if (!Arena::Get().WriteWatched()) return false;
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear, WindowsMappings::Collection::Fresh);
 }
 

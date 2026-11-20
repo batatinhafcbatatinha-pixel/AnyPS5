@@ -2635,6 +2635,8 @@ if(BUILD_TESTING)
         target_compile_definitions(guest_memory_tests PRIVATE GUEST_MEMORY_ELF0_MODULE="$<TARGET_FILE:guest_memory_elf0_module>")
     endif()
     add_test(NAME guest_memory COMMAND guest_memory_tests)
+    # Resident direct mappings and write-watch collection: the legacy GPU backend's memory model.
+    set_tests_properties(guest_memory PROPERTIES ENVIRONMENT "APS5_GPU_BACKEND=legacy;APS5_DIRECT_SHARED=0")
     add_test(NAME guest_mmap_fixed_anonymous COMMAND guest_memory_tests fixed-anonymous)
     if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_test(NAME guest_mmap_executable COMMAND guest_memory_tests executable-mappings)

@@ -7,6 +7,8 @@ if(BUILD_TESTING)
     set_tests_properties(guest_owned_memory PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(guest_owned_memory PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        # Ownership proofs use write watching, which only the legacy GPU backend turns on.
+        set_tests_properties(guest_owned_memory PROPERTIES ENVIRONMENT "APS5_GPU_BACKEND=legacy")
     endif()
 
     if(WIN32)
