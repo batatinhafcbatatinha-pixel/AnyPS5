@@ -856,8 +856,18 @@ static void MarkWrittenTable(RenderContext& context, const Snapshot& bound, uint
 		uint32_t                                   offset = 0, stride = 0;
 		std::vector<std::pair<uint64_t, uint64_t>> ranges;
 	};
-	static thread_local std::vector<Walked>   walked;
-	static thread_local std::vector<uint32_t> words;
+	struct WalkState {
+		std::vector<Walked>   walked;
+		std::vector<uint32_t> words;
+	};
+	static Common::FastTls<WalkState*> walk_slot;
+	auto* walk_state = walk_slot.Get();
+	if (walk_state == nullptr) {
+		walk_state = new WalkState();
+		walk_slot.Set(walk_state);
+	}
+	auto& walked = walk_state->walked;
+	auto& words  = walk_state->words;
 	std::vector<std::pair<uint64_t, uint64_t>> record_ranges;
 	std::vector<std::pair<uint64_t, uint64_t>>* ranges = &record_ranges;
 	const auto mark = [&](const std::vector<std::pair<uint64_t, uint64_t>>& spans) {
@@ -987,7 +997,10 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 			}
 			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
-			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
+			// The clamp needs a base inside the guest windows (one title binds a V# based at 2^48 - 1,
+			// which the check below binds as null).
+			if ((size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) &&
+			    GuestRange {address, 1}.Valid()) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
 			// AnyPS5: an address outside the guest windows (host memory, or a stale descriptor) is
@@ -1005,12 +1018,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 		for (const auto& table: program.info.written_tables) {
-			// APS5_KYTY_NO_RUNTIME_TABLE_MARK (per title, off by default): the buffers of run-time
-			// selected V# tables are not marked written. Marking them all (one title: 205 MB per
-			// dispatch) made the tracker protect and restore those pages all frame long; a title whose
-			// CPU never reads what such stores write can leave it off (13.7 -> 19.2 fps there).
-			static const bool no_mark = std::getenv("APS5_KYTY_NO_RUNTIME_TABLE_MARK") != nullptr;
-			if (!no_mark) MarkWrittenTable(m_context, snapshot.buffers[table.buffer], table.offset, table.stride);
+			MarkWrittenTable(m_context, snapshot.buffers[table.buffer], table.offset, table.stride);
 		}
 	}
 }
