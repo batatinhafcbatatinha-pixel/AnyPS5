@@ -1049,10 +1049,9 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 	if (released.Empty()) {
 		return;
 	}
-	m_eager_pending = {};
-	for (const auto& download: m_eager_downloads) {
-		m_eager_pending.Add(download.begin, download.end - download.begin);
-	}
+	// Only the released pages change: the pending set loses them and gets back the remaining
+	// downloads that share them, which are also the only ones that keep a released page.
+	released.ForEach([&](uint64_t begin, uint64_t last) { m_eager_pending.Subtract(begin, last - begin); });
 	// A page keeps its protection while it holds GPU writes guest memory lacks.
 	RangeSet keep;
 	released.ForEach([&](uint64_t begin, uint64_t last) {
@@ -1063,7 +1062,10 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 	});
 	for (const auto& download: m_eager_downloads) {
 		const auto first = Common::AlignDown(download.begin, TRACKER_PAGE_SIZE);
-		keep.Add(first, Common::AlignUp(download.end, TRACKER_PAGE_SIZE) - first);
+		const auto bytes = Common::AlignUp(download.end, TRACKER_PAGE_SIZE) - first;
+		if (!released.Intersects(first, bytes)) continue;
+		m_eager_pending.Add(download.begin, download.end - download.begin);
+		keep.Add(first, bytes);
 	}
 	released.ForEach([&](uint64_t begin, uint64_t last) {
 		RangeSet clean;
