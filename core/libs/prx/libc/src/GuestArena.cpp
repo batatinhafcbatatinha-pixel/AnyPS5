@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/mman.h>
 #endif
 #ifdef __APPLE__
@@ -822,10 +823,13 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;
     std::exception_ptr failure;
     try {
-        // APS5_DIRECT_SHARED=1: direct memory is mapped as views of its section rather than as
-        // private resident copies, so the host can write it through a second view of the section
-        // (GuestArenaBackingCopy) without changing the guest view's protection.
-        static const bool shared = std::getenv("APS5_DIRECT_SHARED") != nullptr;
+        // Direct memory is mapped as views of its section rather than as private resident copies,
+        // so the host can write it through a second view of the section (GuestArenaBackingCopy)
+        // without changing the guest view's protection. APS5_DIRECT_SHARED=0 keeps the copies.
+        static const bool shared = [] {
+            const char* value = std::getenv("APS5_DIRECT_SHARED");
+            return value == nullptr || std::string_view(value) != "0";
+        }();
         WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), !shared, PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
     } catch (...) {
         failure = std::current_exception();
