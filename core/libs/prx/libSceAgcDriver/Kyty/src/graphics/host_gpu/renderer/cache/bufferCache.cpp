@@ -1002,9 +1002,14 @@ void BufferCache::RecordSideDownloads(std::span<const EarlyRange> ranges, uint64
 				const bool recorded = DownloadBufferMemory<true>(buffer, address, last - address);
 				m_capture_publish = nullptr;
 				if (recorded) {
-					m_eager_downloads.push_back(
-					    {address, last, m_scheduler.CurrentTick(), side_value,
-					     std::make_shared<Common::UniqueFunction<void>>(std::move(publish))});
+					// Queued with the main-queue publications, so overlapping bytes land in recording
+					// order even when no reader waits for this one (the main batch of this tick waits
+					// for the side batch, so it has finished when the operation runs).
+					auto once = std::make_shared<OncePublish>();
+					once->run = std::move(publish);
+					m_scheduler.DeferPriorityOperation([once] { once->Run(); },
+					                                   GuestRange {address, last - address});
+					m_eager_downloads.push_back({address, last, m_scheduler.CurrentTick(), side_value, once});
 					m_eager_pending.Add(address, last - address);
 				}
 				m_eager_writes.Subtract(address, last - address);
@@ -1161,18 +1166,49 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 	// A wait for a tick covers every earlier one: each tick is waited for once.
 	uint64_t waited = 0;
 	auto&    master = m_scheduler.GetMasterSemaphore();
+	// A side download published here, ahead of the priority thread, goes after every older download
+	// of overlapping bytes: those land first (or the side one waits for a later call), so an older
+	// copy never overwrites a newer one.
+	std::vector<uint8_t> side_ready(m_eager_downloads.size(), 0);
+	for (size_t index = 0; index < m_eager_downloads.size(); ++index) {
+		const auto& side = m_eager_downloads[index];
+		if (side.side == 0 || side.end <= vaddr || end <= side.begin ||
+		    (finished_only && !m_scheduler.IsSideFree(side.side))) {
+			continue;
+		}
+		bool ready = true;
+		for (size_t older = 0; older < index && ready; ++older) {
+			const auto& before = m_eager_downloads[older];
+			if (before.end <= side.begin || side.end <= before.begin) continue;
+			if (before.side != 0) {
+				if (finished_only && !m_scheduler.IsSideFree(before.side)) {
+					ready = false;
+					continue;
+				}
+				m_scheduler.WaitSide(before.side);
+				before.publish->Run();
+			} else if (finished_only && !master.IsFree(before.tick)) {
+				ready = false;
+			} else if (before.tick > waited) {
+				m_scheduler.Wait(before.tick);
+				m_scheduler.WaitPriorityOperations(before.tick);
+				waited = before.tick;
+			}
+		}
+		side_ready[index] = ready ? 1 : 0;
+	}
+	size_t position = 0;
 	std::erase_if(m_eager_downloads, [&](const EagerDownload& download) {
+		const auto index = position++;
 		if (download.end <= vaddr || end <= download.begin) {
 			return false;
 		}
 		if (download.side != 0) {
-			if (finished_only && !m_scheduler.IsSideFree(download.side)) {
+			if (side_ready[index] == 0) {
 				return false;
 			}
 			m_scheduler.WaitSide(download.side);
-			if (download.publish && *download.publish) {
-				(*download.publish)();
-			}
+			download.publish->Run();
 			const auto first = Common::AlignDown(download.begin, TRACKER_PAGE_SIZE);
 			freed.emplace_back(first, Common::AlignUp(download.end, TRACKER_PAGE_SIZE));
 			return true;

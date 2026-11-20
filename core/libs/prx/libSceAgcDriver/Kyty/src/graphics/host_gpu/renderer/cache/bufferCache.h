@@ -200,12 +200,26 @@ private:
 	void               NoteProducerWait(uint64_t vaddr, uint64_t size, double ms);
 	[[nodiscard]] bool HasEagerDownloads(uint64_t vaddr, uint64_t size) const;
 
+	// A publication that runs once: on the priority thread in recording order, or earlier on a
+	// thread that waits for it (after every older publication of overlapping bytes).
+	struct OncePublish {
+		std::mutex                   mutex;
+		bool                         done = false;
+		Common::UniqueFunction<void> run;
+		void                         Run() {
+			std::lock_guard lock(mutex);
+			if (!done) {
+				run();
+				done = true;
+			}
+		}
+	};
 	struct EagerDownload {
 		uint64_t begin;
 		uint64_t end;
 		uint64_t tick;
 		uint64_t side = 0; // Recorded on the side queue: wait for this side value, then publish.
-		std::shared_ptr<Common::UniqueFunction<void>> publish;
+		std::shared_ptr<OncePublish> publish;
 	};
 	struct ProducerWindow {
 		std::chrono::steady_clock::time_point start;
