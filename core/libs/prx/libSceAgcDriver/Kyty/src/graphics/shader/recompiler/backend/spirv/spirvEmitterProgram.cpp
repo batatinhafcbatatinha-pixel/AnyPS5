@@ -124,7 +124,7 @@ uint32_t EmitLoopGuard(ValueEmitContext& ctx, const IR::Block* block, uint32_t c
 	const auto next = EmitAddU32(s, count, ConstantU32(s, 1));
 	s.builder.AddFunction(spv::OpStore, s.loop_guard_variable, next);
 	const auto within = s.builder.AllocateId();
-	s.builder.AddFunction(spv::OpULessThan, TypeBool(s), within, next, ConstantU32(s, BvhLoopGuardLimit()));
+	s.builder.AddFunction(spv::OpULessThan, TypeBool(s), within, next, ConstantU32(s, s.loop_guard_limit));
 	const auto guarded = s.builder.AllocateId();
 	if (back_true) {
 		s.builder.AddFunction(spv::OpLogicalAnd, TypeBool(s), guarded, condition, within);
@@ -750,10 +750,18 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
-	// APS5_KYTY_LOOP_GUARD_ALL=1 (diagnostic): every program's loops take the guard.
+	// A compute loop over data the program reads (a BVH, a list, a count) can cycle forever on stale
+	// or malformed data and keep the device busy until the OS resets it: compute programs leave their
+	// loops as if done after APS5_KYTY_BVH_LOOP_GUARD back edges per invocation when they walk a BVH,
+	// 2^16 otherwise (after KytyPS5 67d310a0). Programs using GDS (ordered-append spin waits) are not
+	// guarded. APS5_KYTY_LOOP_GUARD_ALL=1 (diagnostic) guards every program; a limit of 0 none.
 	static const bool guard_all = std::getenv("APS5_KYTY_LOOP_GUARD_ALL") != nullptr;
-	if ((program.info.bvh || program.info.bvh8 || guard_all) && !state.program.dispatcher_fallback &&
-	    BvhLoopGuardLimit() != 0) {
+	const bool        bvh       = program.info.bvh || program.info.bvh8;
+	// Other compute programs only with APS5_KYTY_LOOP_GUARD_ALL: a 2^16 bound on every compute loop
+	// ended a run with a CPU read of an invalid address (a legitimate long loop cut short).
+	const bool        guarded   = guard_all || (bvh && state.program.stage == ShaderType::Compute && !program.info.uses_gds);
+	if (guarded && !state.program.dispatcher_fallback && BvhLoopGuardLimit() != 0) {
+		state.loop_guard_limit    = bvh ? BvhLoopGuardLimit() : (1u << 16u);
 		state.loop_guard_variable = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
