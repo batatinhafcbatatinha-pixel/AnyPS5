@@ -352,20 +352,26 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	QueueOperation(std::move(operation), false);
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), true);
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                              std::optional<GuestRange>      range) {
+	if (range && !range->ValidOrEmpty()) {
+		range.reset(); // Not a guest range the unmap check understands: alias all memory.
+	}
+	QueueOperation(std::move(operation), true, range);
 }
 
-void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+                                      std::optional<GuestRange> range) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		queue.push({std::move(operation), CurrentTick()});
-		lock.unlock();
 		if (priority) {
+			m_priority_operations.push_back({std::move(operation), CurrentTick(), range});
+			lock.unlock();
 			m_operation_available.notify_one();
+		} else {
+			m_pending_operations.push({std::move(operation), CurrentTick()});
 		}
 		return;
 	}
@@ -382,6 +388,22 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 	return !m_priority_operations.empty() || m_priority_active_tick != 0;
 }
 
+bool CommandScheduler::HasPendingPriorityOperations(GuestRange range) {
+	if (!range.Valid()) {
+		return HasPendingPriorityOperations();
+	}
+	// Unannotated callbacks may access any guest memory; host-only ones none.
+	const auto overlaps = [range](const std::optional<GuestRange>& pending) {
+		return !pending || (!pending->Empty() && range.address < pending->End() &&
+		                    pending->address < range.End());
+	};
+	std::lock_guard lock(m_operation_mutex);
+	// The running callback stays a hazard until it returns, even after its tick completed.
+	return (m_priority_active_tick != 0 && overlaps(m_priority_active_range)) ||
+	       std::any_of(m_priority_operations.begin(), m_priority_operations.end(),
+	                   [&](const PendingOperation& operation) { return overlaps(operation.range); });
+}
+
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
@@ -394,8 +416,9 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 				return;
 			}
 			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
-			m_priority_active_tick = operation.tick;
+			m_priority_operations.pop_front();
+			m_priority_active_tick  = operation.tick;
+			m_priority_active_range = operation.range;
 		}
 		m_master.Wait(operation.tick);
 		if (!stop.stop_requested()) {
@@ -404,6 +427,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		{
 			std::lock_guard lock(m_operation_mutex);
 			m_priority_active_tick = 0;
+			m_priority_active_range.reset();
 		}
 		m_operation_available.notify_all();
 	}

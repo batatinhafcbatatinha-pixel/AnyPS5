@@ -236,7 +236,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		if (m_capture_publish != nullptr) {
 			*m_capture_publish = std::move(publish);
 		} else {
-			m_scheduler.DeferPriorityOperation(std::move(publish));
+			// Every packed copy lies inside the source buffer's guest range.
+			m_scheduler.DeferPriorityOperation(std::move(publish),
+			                                   GuestRange {buffer_address, buffer.Size()});
 		}
 	} else {
 		const auto tick = m_scheduler.CurrentTick();

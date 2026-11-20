@@ -20,6 +20,9 @@ constexpr uint64_t kExtendedMemorySize = 512ull * 1024 * 1024 * 1024;
 // the range has no shared backing (private memory) and is not readable or writable as mapped.
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// One byte from each of count addresses stride apart, equal to count one-byte TryReadBacking
+// calls. Returns false if any address is unbacked; out is unspecified then.
+bool TryReadBackingStrided(uint64_t first, uint64_t stride, uint32_t count, uint8_t* out);
 // TryReadBacking after the GPU-modified bytes of the range were read back (GPU thread only).
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);

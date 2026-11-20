@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -10,6 +11,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <thread>
 #include <vector>
@@ -38,8 +40,13 @@ public:
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// range covers every guest access of the callback: an empty range declares a host-only
+	// callback, an omitted one conservatively aliases all guest memory.
+	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+	                                                 std::optional<GuestRange> range = std::nullopt);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
+	// Queued or running priority callbacks that may access the range. A snapshot, not a barrier.
+	[[nodiscard]] bool        HasPendingPriorityOperations(GuestRange range);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -100,6 +107,7 @@ private:
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
+		std::optional<GuestRange>    range; // Priority callbacks only, see DeferPriorityOperation.
 	};
 
 	void BeginNext();
@@ -114,7 +122,8 @@ private:
 	void SubmitToQueue(const SubmitInfo& submit, vk::CommandBuffer buffer, uint64_t tick);
 	void DrainSubmits();
 	void SubmitQueuedUpTo(uint64_t tick);
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+	                    std::optional<GuestRange> range = std::nullopt);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
@@ -129,11 +138,12 @@ private:
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
-	std::queue<PendingOperation> m_priority_operations;
+	std::deque<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
+	std::optional<GuestRange>    m_priority_active_range;    // of the running callback
 	OperationState               m_operation_state      = OperationState::Open;
 	std::deque<QueuedSubmit>     m_submits;
 	std::mutex                   m_submit_mutex;
