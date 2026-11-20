@@ -261,7 +261,10 @@ static void PrepareRayQuery(RenderContext& context, const ShaderStageRuntime& st
 	if (dword == ShaderRecompiler::IR::PushData::NoStart) return;
 	const auto& flat       = stage.resources->flattened_srt;
 	const auto [low, high] = program.info.ray_query_tlas;
+	const bool gpu_time = GpuTime::Enabled(context);
+	if (gpu_time) GpuTime::Before(context, context.GetCommandScheduler().Current().Handle());
 	const auto address = context.GetRayTracing()->Prepare(flat[low] | uint64_t {flat[high]} << 32u);
+	if (gpu_time) GpuTime::After(context, context.GetCommandScheduler().Current().Handle(), 0x7274707265700000ull, 'r');
 	bindings.shader_data[dword]     = static_cast<uint32_t>(address);
 	bindings.shader_data[dword + 1] = static_cast<uint32_t>(address >> 32u);
 }

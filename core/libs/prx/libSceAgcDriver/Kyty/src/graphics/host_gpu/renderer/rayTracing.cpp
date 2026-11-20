@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/rayTracing.h"
 
 #include "common/alignment.h"
+#include "common/logging/log.h"
 #include "gpu_blit_shaders/gpu_bvh_mirror_spv.h"
 #include "gpu_blit_shaders/gpu_bvh_walk_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -12,6 +13,10 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <chrono>
+#include <fmt/format.h>
 #include <bit>
 #include <cstddef>
 #include <cstring>
@@ -19,6 +24,28 @@
 
 namespace Libs::Graphics {
 namespace {
+
+// APS5_KYTY_GPUTIME: what the native ray-query mirror does, per 10 s.
+struct MirrorStats {
+	uint64_t calls = 0, builds = 0, updates = 0, triangle_chunks = 0, box_chunks = 0, walks = 0;
+	uint64_t valid = 0, invalid = 0;
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+MirrorStats& Stats() {
+	static MirrorStats stats;
+	return stats;
+}
+void ReportStats() {
+	static const bool enabled = std::getenv("APS5_KYTY_GPUTIME") != nullptr;
+	auto&             stats   = Stats();
+	if (!enabled || std::chrono::steady_clock::now() - stats.last < std::chrono::seconds(10)) return;
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[rt-mirror] 10 s: {} prepares, {} BLAS builds, {} BLAS updates, {} triangle chunks, {} box chunks, "
+	    "{} walks; mirror valid {} / invalid {}\n",
+	    stats.calls, stats.builds, stats.updates, stats.triangle_chunks, stats.box_chunks, stats.walks,
+	    stats.valid, stats.invalid));
+	stats = {};
+}
 
 enum Mode : uint32_t { Walk, Triangles, Boxes, Instances };
 
@@ -303,6 +330,7 @@ void RayTracing::Apply(Area& area) {
 	const auto* data = area.buffer->Mapped().data();
 	Context     context {};
 	std::memcpy(&context, data, sizeof(context));
+	(context.valid != 0 ? Stats().valid : Stats().invalid)++;
 	// Instance counts past the device limit keep the mirror invalid.
 	const auto it = m_tlases.find(area.tlas);
 	if (it != m_tlases.end() && context.instances > it->second.instance_slots &&
@@ -392,6 +420,20 @@ void RayTracing::Apply(Area& area) {
 }
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
+	// APS5_KYTY_GPUTIME: the header words the mirror's format check reads, for the first TLASes.
+	static const bool log_headers = std::getenv("APS5_KYTY_GPUTIME") != nullptr;
+	static uint32_t   logged      = 0;
+	if (log_headers && logged < 4 && tlas != 0 && m_tlases.find(tlas) == m_tlases.end()) {
+		std::array<uint32_t, 64> words {};
+		if (m_buffer_cache.ReadTable(tlas, sizeof(words), words.data())) {
+			++logged;
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "[rt-mirror] TLAS 0x{:x}: magic {:08x} {:08x}, properties(+0x18) {:08x}, version(+0xfc) {}, "
+			    "+0x28 {:08x}{:08x} +0x30 {:08x}{:08x} +0x70 {} +0x74 {}\n",
+			    tlas, words[0], words[1], words[6], words[63], words[11], words[10], words[13], words[12],
+			    words[28], words[29]));
+		}
+	}
 	Collect();
 	// A TLAS with no readback in flight waits for an area, so calls over other TLASes cannot take
 	// every area from it.
@@ -633,6 +675,17 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	const auto scratch = Common::AlignUp(m_scratch->BufferDeviceAddress(), m_scratch_alignment);
 	for (auto& info: builds) {
 		info.scratchData.deviceAddress += scratch;
+	}
+	{
+		auto& stats = Stats();
+		stats.calls++;
+		for (const auto& build: builds) {
+			(build.mode == vk::BuildAccelerationStructureModeKHR::eUpdate ? stats.updates : stats.builds)++;
+		}
+		stats.triangle_chunks += triangle_chunks.size();
+		stats.box_chunks += box_chunks.size();
+		stats.walks += area.walks.size();
+		ReportStats();
 	}
 	if (!builds.empty()) {
 		command.buildAccelerationStructuresKHR(static_cast<uint32_t>(builds.size()), builds.data(),
