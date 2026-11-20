@@ -11,6 +11,8 @@
 
 namespace Libs::Graphics {
 
+void NoteBatchesDone(uint64_t from, uint64_t to);
+
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
 	vk::SemaphoreTypeCreateInfo type_info {};
 	type_info.semaphoreType = vk::SemaphoreType::eTimeline;
@@ -46,6 +48,7 @@ void MasterSemaphore::Refresh(bool force) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
+	if (known < counter) NoteBatchesDone(known, counter);
 	while (known < counter &&
 	       !m_gpu_tick.compare_exchange_weak(known, counter, std::memory_order_release,
 	                                         std::memory_order_relaxed)) {
