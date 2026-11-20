@@ -81,7 +81,13 @@ DWORD Reduce(DWORD original, Common::VirtualMemory::Mode mode) {
 	}
 }
 
+std::atomic<uint64_t> g_protect_calls {0}, g_protect_pages {0};
+
 bool Protect(uint64_t address, uint64_t bytes, DWORD protection) {
+	if (Common::DebugCounters::g_aps5_stats) {
+		g_protect_calls.fetch_add(1, std::memory_order_relaxed);
+		g_protect_pages.fetch_add(bytes / PageBytes, std::memory_order_relaxed);
+	}
 	DWORD previous = 0;
 	return VirtualProtect(reinterpret_cast<void*>(address), bytes, protection, &previous) != 0;
 }
@@ -361,6 +367,8 @@ void ReportStats() {
 	    stats.slow.exchange(0), stats.slow_bytes.exchange(0) >> 20) + std::string(1, char(10)));
 	ReportCallers();
 	ReportWaitSites();
+	Log::WriteToConsoleAndLog(fmt::format("[memstats] VirtualProtect: {} calls, {} pages\n",
+	                                      g_protect_calls.exchange(0), g_protect_pages.exchange(0)));
 	ReportSites("[memstats] readback sites (rva or guest-fault: count, size):", Common::DebugCounters::g_readback_sites, true, false);
 	ReportSites("[memstats] downloads per MiB (s sync, e eager: count, size):", Common::DebugCounters::g_download_regions, false, true);
 	ReportSites("[memstats] uploads per MiB (count, size):", Common::DebugCounters::g_upload_regions, false, false);
