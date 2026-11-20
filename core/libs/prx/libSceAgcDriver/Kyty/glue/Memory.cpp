@@ -93,7 +93,16 @@ bool Protect(uint64_t address, uint64_t bytes, DWORD protection) {
 }
 
 // Applies `mode` to [begin, end), page by page in runs of equal protection. Mutex held.
+std::atomic<uint64_t> g_apply_calls[3] {}, g_apply_pages[3] {}; // no access, reduced, restored
+
 void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode) {
+	if (Common::DebugCounters::g_aps5_stats) {
+		const int kind = mode == Common::VirtualMemory::Mode::NoAccess    ? 0
+		                 : mode == Common::VirtualMemory::Mode::ReadWrite ? 2
+		                                                                  : 1;
+		g_apply_calls[kind].fetch_add(1, std::memory_order_relaxed);
+		g_apply_pages[kind].fetch_add((end - begin) / PageBytes, std::memory_order_relaxed);
+	}
 	auto& originals = Originals();
 	if (mode == Common::VirtualMemory::Mode::ReadWrite) {
 		// Restoring: exactly the pages this map holds get their guest protection back (released
@@ -367,8 +376,12 @@ void ReportStats() {
 	    stats.slow.exchange(0), stats.slow_bytes.exchange(0) >> 20) + std::string(1, char(10)));
 	ReportCallers();
 	ReportWaitSites();
-	Log::WriteToConsoleAndLog(fmt::format("[memstats] VirtualProtect: {} calls, {} pages\n",
-	                                      g_protect_calls.exchange(0), g_protect_pages.exchange(0)));
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[memstats] VirtualProtect: {} calls, {} pages; tracker changes (calls/pages): no access {}/{}, "
+	    "write-watched {}/{}, restored {}/{}\n",
+	    g_protect_calls.exchange(0), g_protect_pages.exchange(0), g_apply_calls[0].exchange(0),
+	    g_apply_pages[0].exchange(0), g_apply_calls[1].exchange(0), g_apply_pages[1].exchange(0),
+	    g_apply_calls[2].exchange(0), g_apply_pages[2].exchange(0)));
 	ReportSites("[memstats] readback sites (rva or guest-fault: count, size):", Common::DebugCounters::g_readback_sites, true, false);
 	ReportSites("[memstats] downloads per MiB (s sync, e eager: count, size):", Common::DebugCounters::g_download_regions, false, true);
 	ReportSites("[memstats] uploads per MiB (count, size):", Common::DebugCounters::g_upload_regions, false, false);
