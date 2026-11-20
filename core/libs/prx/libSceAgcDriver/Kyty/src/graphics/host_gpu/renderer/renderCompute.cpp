@@ -309,6 +309,25 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 	       });
 }
 
+// APS5_KYTY_SKIP_CS=hash,hash (diagnostic, for comparisons with KytyPS5's KYTY_SKIP_CS): dispatches
+// of these compute programs are not run at all (the picture changes).
+static bool SkippedCompute(uint64_t hash) {
+	static const std::vector<uint64_t> skipped = [] {
+		std::vector<uint64_t> list;
+		if (const char* value = std::getenv("APS5_KYTY_SKIP_CS")) {
+			for (const char* at = value; *at != 0;) {
+				char* end = nullptr;
+				const auto parsed = std::strtoull(at, &end, 16);
+				if (end == at) break;
+				list.push_back(parsed);
+				at = *end == ',' ? end + 1 : end;
+			}
+		}
+		return list;
+	}();
+	return !skipped.empty() && std::find(skipped.begin(), skipped.end(), hash) != skipped.end();
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
@@ -384,6 +403,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	if (SkippedCompute(input_info.stage.module->info.shader_hash)) return;
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -664,6 +684,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	input_info.indirect_args_address = args_addr;
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	if (SkippedCompute(input_info.stage.module->info.shader_hash)) return;
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
 	auto& bindings = m_compute_bindings;
