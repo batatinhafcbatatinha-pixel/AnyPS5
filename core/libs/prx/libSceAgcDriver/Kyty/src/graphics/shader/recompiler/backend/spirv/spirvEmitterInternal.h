@@ -160,6 +160,8 @@ struct EmitterState {
 	// Back edges taken by this invocation in a program that walks a BVH (see EmitLoopGuard).
 	uint32_t                   loop_guard_variable                   = 0;
 	uint32_t                   loop_guard_limit                      = 0;
+	// For each block inside a loop, the merge blocks of the loops it is in (loop exits).
+	std::unordered_map<const IR::Block*, std::vector<const IR::Block*>> loop_guard_exits;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   helper_invocation_variable            = 0;
 	uint32_t                   per_vertex_variable                   = 0;
