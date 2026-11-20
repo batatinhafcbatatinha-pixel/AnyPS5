@@ -68,6 +68,12 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	}
 
 	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
+	// The known GPU tick is only refreshed on demand, so poll it here when the oldest retired
+	// pool may already be complete (its tick is submitted but not yet known free).
+	if (const auto oldest = m_pending_pools.front().second;
+	    !m_master_semaphore.IsFree(oldest) && oldest < m_master_semaphore.CurrentTick()) {
+		m_master_semaphore.Refresh();
+	}
 	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
 		m_current_pool = pool;
 		m_pending_pools.pop_front();

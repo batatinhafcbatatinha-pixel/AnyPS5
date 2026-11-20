@@ -105,6 +105,10 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		// Nothing to clear in a GPU-clean range; checked without the lock like the queries.
+		if (!manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+			return;
+		}
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, false>(offset, bytes);
 	});

@@ -15,6 +15,8 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <map>
 #include <mutex>
@@ -135,6 +137,24 @@ private:
 	static_assert(sizeof(Bucket) == 64);
 
 	using ImagePageTable = MultiLevelPageTable<Bucket, 20, 44, 14>;
+
+	// Registered images per page of the image page table. Written under m_lock, read without it.
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts() = default;
+		~RegisteredPageCounts();
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void               Add(size_t page, int32_t delta);
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept;
+
+	private:
+		static constexpr size_t LeafBits = 14;
+		static constexpr size_t LeafSize = size_t {1} << LeafBits;
+		using Leaf                       = std::array<std::atomic<uint32_t>, LeafSize>;
+
+		std::array<std::atomic<Leaf*>, ImagePageTable::kPageCount / LeafSize> m_leaves {};
+	};
 
 	// Callers pass a nonempty, valid guest range.
 	template <typename Func>
@@ -264,7 +284,10 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// Caller holds m_lock. With unlocked_copy, m_lock is released while the guest bytes are copied
+	// and the download is dropped if the image changed meanwhile, so the caller must not keep
+	// references or iterators into the cache across the call.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool unlocked_copy = false);
 	[[nodiscard]] bool DownloadQueuedImages();
 
 	GraphicContext&                                   m_graphics;
@@ -276,6 +299,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	RegisteredPageCounts                              m_registered_pages;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	Common::SrwMutex                                  m_write_back_mutex;

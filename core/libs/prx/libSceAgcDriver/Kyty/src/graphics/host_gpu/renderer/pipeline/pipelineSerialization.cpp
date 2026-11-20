@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <ranges>
@@ -44,6 +45,14 @@ struct Frame {
 // Changes with every build, so records never meet code that encodes them differently. Zero when
 // the executable cannot be found.
 uint64_t BuildStamp() {
+	// Developer knob: KYTY_SHADER_CACHE_STAMP=N (N != 0) replaces the executable's time, so a
+	// rebuild that does not change shader translation keeps the store. N must change whenever the
+	// shader recompiler or the record encoding changes, or stored programs no longer match the code.
+	if (const char* env = std::getenv("KYTY_SHADER_CACHE_STAMP"); env != nullptr && env[0] != 0) {
+		if (const auto value = std::strtoull(env, nullptr, 10); value != 0) {
+			return value;
+		}
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::array<wchar_t, 32768> name {};
 	GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
@@ -156,10 +165,18 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
 		bytes.resize(read);
 	}
+	// Creating pipelines from several threads at once crashes inside NVIDIA's Linux SPIR-V
+	// compiler (libnvidia-glvkspirv), so that driver warms up serially. Elsewhere the work stays
+	// spread over the pool.
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	const bool serial = m_graphics.physical_device_properties.vendorID == 0x10DEu;
+#else
+	const bool serial = false;
+#endif
+	const size_t threads = serial ? 1u : Common::ParallelThreads();
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
-	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
-	    Common::ParallelThreads()));
+	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0, threads));
 	auto       records = std::span<const uint8_t>(bytes);
 	const bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
@@ -187,7 +204,13 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			});
 		}
 	}
-	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	if (serial) {
+		for (auto& job: jobs) {
+			job();
+		}
+	} else {
+		Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	}
 	// A key with a stage missing from the store keeps no pipeline.
 	std::erase_if(m_graphics_pipelines,
 	              [](const auto& entry) { return entry.second.pipeline == nullptr; });

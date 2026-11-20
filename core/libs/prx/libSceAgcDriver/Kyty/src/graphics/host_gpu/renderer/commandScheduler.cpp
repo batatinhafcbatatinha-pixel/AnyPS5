@@ -319,17 +319,29 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	// The timeline is polled lazily: not at all for an empty queue or for an operation of the
+	// open (unsubmitted) tick, and at most once per call otherwise. A skipped poll releases a
+	// subset of what a poll would, and a later poll releases the rest in the same order.
+	bool polled = false;
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
 				return;
 			}
-			operation = std::move(m_pending_operations.front());
-			m_pending_operations.pop();
+			const auto tick = m_pending_operations.front().tick;
+			if (m_master.IsFree(tick)) {
+				operation = std::move(m_pending_operations.front());
+				m_pending_operations.pop();
+			} else if (polled || tick >= CurrentTick()) {
+				return;
+			}
+		}
+		if (!operation.callback) {
+			m_master.Refresh();
+			polled = true;
+			continue;
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
