@@ -1005,7 +1005,12 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 		for (const auto& table: program.info.written_tables) {
-			MarkWrittenTable(m_context, snapshot.buffers[table.buffer], table.offset, table.stride);
+			// APS5_KYTY_NO_RUNTIME_TABLE_MARK (per title, off by default): the buffers of run-time
+			// selected V# tables are not marked written. Marking them all (one title: 205 MB per
+			// dispatch) made the tracker protect and restore those pages all frame long; a title whose
+			// CPU never reads what such stores write can leave it off (13.7 -> 19.2 fps there).
+			static const bool no_mark = std::getenv("APS5_KYTY_NO_RUNTIME_TABLE_MARK") != nullptr;
+			if (!no_mark) MarkWrittenTable(m_context, snapshot.buffers[table.buffer], table.offset, table.stride);
 		}
 	}
 }
