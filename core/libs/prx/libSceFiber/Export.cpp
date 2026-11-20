@@ -121,7 +121,7 @@ static void CompletePendingSuspend() {
 
 #ifdef _WIN32
 
-extern "C" void Aps5FiberSwitchStack_nid_no_patch(void** save, void** load, Fiber* start);
+extern "C" void Aps5FiberSwitchStack_nid_no_patch(void** save, void** load, Fiber* start, const StackBounds* bounds);
 extern "C" void Aps5FiberTrampoline_nid_no_patch();
 
 asm(R"(
@@ -150,8 +150,14 @@ Aps5FiberSwitchStack_nid_no_patch:
     movaps %xmm15, 0x90(%rsp)
     stmxcsr 0xa0(%rsp)
     fnstcw 0xa4(%rsp)
+    mov 0x00(%r9), %rax
+    mov 0x08(%r9), %r10
+    mov 0x10(%r9), %r11
     mov %rsp, (%rcx)
     mov (%rdx), %rsp
+    mov %rax, %gs:0x08
+    mov %r10, %gs:0x10
+    mov %r11, %gs:0x1478
     test %r8, %r8
     jz 1f
     mov %r8, %r12
@@ -227,7 +233,7 @@ static void UnpinStack(const void* context, std::uint64_t bytes) {
 
 #else
 
-extern "C" void Aps5FiberSwitchStack_nid_no_patch(void** save, void** load, Fiber* start);
+extern "C" void Aps5FiberSwitchStack_nid_no_patch(void** save, void** load, Fiber* start, const StackBounds* bounds);
 extern "C" void Aps5FiberTrampoline_nid_no_patch();
 
 asm(".text\n"
@@ -483,8 +489,11 @@ static void Resume(Fiber* target, void** save, std::uint64_t argOnRun) {
     }
     ThreadState().current = target;
     ThreadState().transfer = argOnRun;
-    SetBounds(target->context ? FiberBounds(target) : ThreadState().threadBounds);
-    Aps5FiberSwitchStack_nid_no_patch(save, target->context ? &target->savedStack : &ThreadState().threadStack, target->context ? nullptr : target);
+    // The switch routine sets these bounds once it is on the target stack: set here, a write-watch
+    // fault on the routine's pushes to the current stack was dispatched with rsp outside the
+    // declared bounds, and Windows ended the process without running a handler.
+    const auto bounds = target->context ? FiberBounds(target) : ThreadState().threadBounds;
+    Aps5FiberSwitchStack_nid_no_patch(save, target->context ? &target->savedStack : &ThreadState().threadStack, target->context ? nullptr : target, &bounds);
 }
 
 static bool CopyGuestIn(void* dst, const void* src, std::size_t size) {
@@ -621,8 +630,8 @@ int32_t APS5_VABI sceFiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_o
     ThreadState().pendingSuspend = self;
     ThreadState().current = nullptr;
     ThreadState().transfer = arg_on_return;
-    SetBounds(ThreadState().threadBounds);
-    Aps5FiberSwitchStack_nid_no_patch(&self->savedStack, &ThreadState().threadStack, nullptr);
+    const auto bounds = ThreadState().threadBounds;
+    Aps5FiberSwitchStack_nid_no_patch(&self->savedStack, &ThreadState().threadStack, nullptr, &bounds);
     CompletePendingSuspend();
     if (arg_on_run) {
         const auto val = ThreadState().transfer;
