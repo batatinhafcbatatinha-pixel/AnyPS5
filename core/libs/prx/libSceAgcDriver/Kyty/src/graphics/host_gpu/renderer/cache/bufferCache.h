@@ -81,6 +81,10 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// Another GPU write to a range all of whose bytes are still GPU-written (not downloaded, not
+	// adopted from the CPU since) in one cache buffer: what ObtainBuffer(is_written) would set is
+	// already set, so only the write tick and the color-metadata checks change. False otherwise.
+	[[nodiscard]] bool RepeatGpuWrite(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
