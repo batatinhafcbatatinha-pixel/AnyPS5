@@ -92,6 +92,27 @@ bool Protect(uint64_t address, uint64_t bytes, DWORD protection) {
 	return VirtualProtect(reinterpret_cast<void*>(address), bytes, protection, &previous) != 0;
 }
 
+// A run VirtualProtect refused as a whole spans mappings (separate views): protect it one memory
+// region (one mapping, equal state) at a time, not one page at a time.
+std::atomic<uint64_t> g_split_runs {0};
+void ProtectByRegion(uint64_t begin, uint64_t end, DWORD protection) {
+	if (Common::DebugCounters::g_aps5_stats) g_split_runs.fetch_add(1, std::memory_order_relaxed);
+	for (uint64_t address = begin; address < end;) {
+		MEMORY_BASIC_INFORMATION memory {};
+		if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) == 0) {
+			(void)Protect(address, PageBytes, protection);
+			address += PageBytes;
+			continue;
+		}
+		const auto stop =
+		    std::min(end, reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize);
+		if (!Protect(address, stop - address, protection)) {
+			for (uint64_t page = address; page < stop; page += PageBytes) (void)Protect(page, PageBytes, protection);
+		}
+		address = stop;
+	}
+}
+
 // Applies `mode` to [begin, end), page by page in runs of equal protection. Mutex held.
 std::atomic<uint64_t> g_apply_calls[3] {}, g_apply_pages[3] {}; // no access, reduced, restored
 
@@ -114,9 +135,7 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 		const auto flush    = [&](uint64_t run_end) {
 			if (run_open && run_end > run_begin &&
 			    !Protect(run_begin, run_end - run_begin, run_target)) {
-				for (uint64_t page = run_begin; page < run_end; page += PageBytes) {
-					(void)Protect(page, PageBytes, run_target);
-				}
+				ProtectByRegion(run_begin, run_end, run_target);
 			}
 			run_open = false;
 		};
@@ -152,9 +171,7 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 			const auto flush    = [&](uint64_t run_end) {
 				if (run_open && run_end > run_begin &&
 				    !Protect(run_begin, run_end - run_begin, run_target)) {
-					for (uint64_t page = run_begin; page < run_end; page += PageBytes) {
-						(void)Protect(page, PageBytes, run_target);
-					}
+					ProtectByRegion(run_begin, run_end, run_target);
 				}
 				run_open = false;
 			};
@@ -378,10 +395,10 @@ void ReportStats() {
 	ReportWaitSites();
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "[memstats] VirtualProtect: {} calls, {} pages; tracker changes (calls/pages): no access {}/{}, "
-	    "write-watched {}/{}, restored {}/{}\n",
+	    "write-watched {}/{}, restored {}/{}; runs split by mapping {}\n",
 	    g_protect_calls.exchange(0), g_protect_pages.exchange(0), g_apply_calls[0].exchange(0),
 	    g_apply_pages[0].exchange(0), g_apply_calls[1].exchange(0), g_apply_pages[1].exchange(0),
-	    g_apply_calls[2].exchange(0), g_apply_pages[2].exchange(0)));
+	    g_apply_calls[2].exchange(0), g_apply_pages[2].exchange(0), g_split_runs.exchange(0)));
 	ReportSites("[memstats] readback sites (rva or guest-fault: count, size):", Common::DebugCounters::g_readback_sites, true, false);
 	ReportSites("[memstats] downloads per MiB (s sync, e eager: count, size):", Common::DebugCounters::g_download_regions, false, true);
 	ReportSites("[memstats] uploads per MiB (count, size):", Common::DebugCounters::g_upload_regions, false, false);
