@@ -898,6 +898,9 @@ jobs:
         run: cmake --build build --target libs
       - if: github.event_name != 'pull_request'
         shell: cmd
+        env:
+          # The runner has no Vulkan driver; the VRAM-resident backend (default on Windows) needs one.
+          APS5_GPU_BACKEND: legacy
         run: python tools/select_tests.py ctest build --output-on-failure --timeout 120 --parallel 4 --output-log ctest.log --output-junit ctest.xml
       - if: github.event_name != 'pull_request'
         run: python tools/check_skips.py build/ctest.xml --job windows
