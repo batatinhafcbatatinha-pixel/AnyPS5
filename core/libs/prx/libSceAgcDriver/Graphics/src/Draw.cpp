@@ -1590,7 +1590,8 @@ bool drawInputBackoffEnabled() {
 
 DrawInputBackoff* drawInputBackoff(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use) {
     if (!drawInputBackoffEnabled()) return nullptr;
-    thread_local std::unordered_map<std::uint64_t, DrawInputBackoff> entries;
+    thread_local std::unordered_map<std::uint64_t, DrawInputBackoff>* entriesSlot = nullptr;
+    auto& entries = ShaderRecompiler::ThreadOwned(entriesSlot);
     if (entries.size() > 65536) entries.clear();
     const auto key = (address * 0x9e3779b97f4a7c15ull) ^ (static_cast<std::uint64_t>(bytes) << 8u) ^ static_cast<std::uint64_t>(use);
     return &entries[key];
