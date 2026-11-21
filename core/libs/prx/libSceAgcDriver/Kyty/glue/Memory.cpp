@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "../shader/recompiler/ThreadOwned.hpp"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -779,7 +780,8 @@ bool TryReadBackingStrided(uint64_t first, uint64_t stride, uint32_t count, uint
 	constexpr uint64_t SpanLimit = 64 * 1024;
 	const uint64_t     span      = stride * last_index + 1u;
 	if (span <= SpanLimit) {
-		thread_local std::vector<uint8_t> bytes;
+		thread_local std::vector<uint8_t>* bytesSlot = nullptr;
+		auto&                              bytes     = ShaderRecompiler::ThreadOwned(bytesSlot);
 		bytes.resize(span);
 		if (AgcDriver::VramBackend::GuardedRead(first, bytes.data(), span)) {
 			for (uint32_t index = 0; index < count; ++index) {

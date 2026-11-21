@@ -21,15 +21,13 @@ static void SleepHighResolution100ns(uint64_t units_100ns) {
 	if (units_100ns == 0) {
 		return;
 	}
-	// Closed when the thread exits.
-	thread_local const std::unique_ptr<void, decltype(&CloseHandle)> timer {
-	    CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-		                       TIMER_ALL_ACCESS),
-	    &CloseHandle};
+	// A plain handle: a thread_local with a destructor would run after emulated TLS freed it. The
+	// handle is released with the process.
+	thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
 	LARGE_INTEGER due_time {};
 	due_time.QuadPart = -static_cast<LONGLONG>(units_100ns);
-	if (SetWaitableTimerEx(timer.get(), &due_time, 0, nullptr, nullptr, nullptr, 0) != 0) {
-		WaitForSingleObject(timer.get(), INFINITE);
+	if (SetWaitableTimerEx(timer, &due_time, 0, nullptr, nullptr, nullptr, 0) != 0) {
+		WaitForSingleObject(timer, INFINITE);
 	}
 }
 
