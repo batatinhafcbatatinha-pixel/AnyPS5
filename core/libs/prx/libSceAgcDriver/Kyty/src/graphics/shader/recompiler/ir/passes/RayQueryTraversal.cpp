@@ -1425,6 +1425,9 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 			walked ? RewriteWalk(program, walk) : Rewrite(program, traversal);
 			program.info.ray_query_tlas = tlas;
 			++traced;
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "ShaderRecompiler BVH traversal converted to ray query: hash=0x{:016x}\n",
+			    program.shader_hash));
 		} else if (EnclosingLoop(program, bvh->Parent()) != nullptr) {
 			left.emplace_back(bvh, match_fail, walk_fail);
 		}
