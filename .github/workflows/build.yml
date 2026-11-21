@@ -515,7 +515,7 @@ jobs:
     needs: eligibility
     if: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.linux)) && needs.eligibility.outputs.full == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_MAXSIZE: 30G
@@ -605,7 +605,7 @@ jobs:
           git submodule update --init --recursive
       - name: Install Linux build and test dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ccache libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev
-      - uses: actions/cache@v6
+      - uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_DIR }}
           key: linux-ccache-${{ github.sha }}
@@ -731,6 +731,13 @@ jobs:
       - name: Report compiler cache statistics
         if: ${{ !cancelled() }}
         run: ccache --show-stats
+      # Saved even when the job fails or times out, so a cold build resumes where it stopped.
+      - if: ${{ always() && github.event_name == 'push' }}
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: linux-ccache-${{ github.sha }}
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
         shell: bash
@@ -898,6 +905,11 @@ jobs:
         run: cmake --build build --target libs
       - if: github.event_name != 'pull_request'
         shell: cmd
+        env:
+          # The runner has no Vulkan driver; the VRAM-resident backend (default on Windows) needs one.
+          APS5_GPU_BACKEND: legacy
+          # Direct memory as private copies (the Windows memory tests expect them).
+          APS5_DIRECT_SHARED: 0
         run: python tools/select_tests.py ctest build --output-on-failure --timeout 120 --parallel 4 --output-log ctest.log --output-junit ctest.xml
       - if: github.event_name != 'pull_request'
         run: python tools/check_skips.py build/ctest.xml --job windows

@@ -9271,7 +9271,8 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     std::vector<Region*> copies;
     if (std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && region.deviceLocal && !region.copiedBack; })) recorder.CloseRunOwing(this);
     bool hits = false;
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> hitRanges;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* hitRangesSlot = nullptr;
+    auto& hitRanges = ShaderRecompiler::ThreadOwned(hitRangesSlot);
     hitRanges.clear();
     for (auto& region : regions) {
         if (!region.gpuCopy || !region.deviceLocal) continue;

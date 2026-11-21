@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "ThreadOwned.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -209,7 +210,8 @@ bool syncBlocks(Cache& state, const Context& context, Recorder& recorder, Chunk&
     const auto firstBlock = static_cast<std::size_t>((from - chunkBase) / BlockBytes);
     const auto lastBlock = static_cast<std::size_t>((to - 1 - chunkBase) / BlockBytes);
     const auto blocks = lastBlock - firstBlock + 1;
-    thread_local std::vector<std::uint8_t> changed;
+    thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
+    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
     changed.assign(blocks, 0);
     const auto blockBase = chunkBase + firstBlock * BlockBytes;
     GuestMemory::ChangedBlocks(blockBase, static_cast<std::size_t>(blocks * BlockBytes), std::span<const std::uint64_t>(chunk.uploaded.data() + firstBlock, blocks), std::span<std::uint8_t>(changed.data(), blocks));
