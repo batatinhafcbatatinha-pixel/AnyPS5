@@ -1055,7 +1055,10 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.target.fixedPushSlots = reader.ReadBool();
     }
     if (version >= 62u) result.request.target.spannedAnySubgroup = reader.ReadBool();
-    if (version >= 57u && reader.Remaining() != 0u) result.request.target.renderScale = reader.ReadBool();
+    if (version >= 57u && reader.Remaining() != 0u) {
+        if (reader.ReadU8() != 1u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
+        result.request.target.renderScale = true;
+    }
     if (version >= 21u && reader.Remaining() != 0u) throw std::runtime_error("RequestSerializer: unexpected trailing data");
     return result;
 }
