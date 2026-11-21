@@ -9213,7 +9213,7 @@ bool GuestBufferMemory::deferCopyBack(Region& region, std::span<const std::pair<
             publishResidentDirty(registry);
         } else {
             const auto base = region.bufferBase != 0 ? region.bufferBase : region.begin;
-            if (!region.copiedIn || region.copyGeneration == 0 || region.shadowCopy == nullptr || region.shadowCopy->DeviceAddress() == 0 || region.buffer->DeviceAddress() == 0 || region.copySourceAddress == 0 || region.begin % 4u != 0 || base % 4u != 0 || region.copySourceBase % 4u != 0 || bytes > residentBudget()) return false;
+            if (!region.copiedIn || region.copyGeneration == 0 || region.shadowCopy == nullptr || !region.shadowCopy->HasDeviceAddress() || !region.buffer->HasDeviceAddress() || region.copySourceAddress == 0 || region.begin % 4u != 0 || base % 4u != 0 || region.copySourceBase % 4u != 0 || bytes > residentBudget()) return false;
             if (std::any_of(registry.entries.begin(), registry.entries.end(), [&](const ResidentEntry& entry) { return region.begin < entry.end && entry.begin < region.end; })) return false;
             registry.entries.push_back({context, ++registry.ids, region.begin, region.end, region.buffer, base, region.shadowCopy, region.copySource, region.copySourceBase, region.copySourceAddress, region.copyGeneration, ++registry.clock, std::move(dirty)});
             registry.bytes += bytes;
