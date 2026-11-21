@@ -179,7 +179,7 @@ bool RelaxedShaderFloatEnabled() {
 }
 
 bool NativeRtEnabled() {
-	static const bool enabled = Flag("APS5_KYTY_NATIVE_RT", false);
+	static const bool enabled = Flag("APS5_KYTY_NATIVE_RT", true);
 	return enabled;
 }
 
