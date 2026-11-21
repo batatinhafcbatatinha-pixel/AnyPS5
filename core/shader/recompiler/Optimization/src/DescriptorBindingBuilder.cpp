@@ -843,6 +843,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             physical.imageAtomic.reserve(physical.imageAtomic.size() + tables->elements.size());
             physical.imageAtomic64.reserve(physical.imageAtomic64.size() + tables->elements.size());
             physical.imageUintStorage.reserve(physical.imageUintStorage.size() + tables->elements.size());
+            physical.imageScalable.reserve(physical.imageScalable.size() + tables->elements.size());
             physical.imageSamplers.reserve(physical.imageSamplers.size() + tables->elements.size());
             for (const auto& element : tables->elements) {
                 physical.guestDescriptor.insert(physical.guestDescriptor.end(), element.words.begin(), element.words.end());

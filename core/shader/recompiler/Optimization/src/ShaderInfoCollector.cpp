@@ -766,7 +766,7 @@ bool HalfTest(const IrValue* value) {
     return (LaneIndex(left) && right != nullptr && right->HasImmediate()) || (LaneIndex(right) && left != nullptr && left->HasImmediate());
 }
 
-thread_local std::string maskBlocker;
+thread_local std::string_view maskBlocker;
 
 bool MaskValue(const IrValue* root) {
     std::vector<const IrValue*> pending{root};
@@ -794,7 +794,7 @@ bool MaskValue(const IrValue* root) {
             for (std::size_t index = 0; index < value->ArgumentCount(); ++index) pending.push_back(value->Argument(index));
             continue;
         }
-        maskBlocker = std::string(IrOpcodeName(opcode));
+        maskBlocker = IrOpcodeName(opcode);
         return false;
     }
     return true;
@@ -817,7 +817,7 @@ bool OwnBitUse(const IrValue* lane, const IrValue& user, std::string& reason) {
         }
         for (const IrValue* next : user.Uses()) {
             if (next->Opcode() != IrOpcode::BitwiseAnd32 || !MaskValue(ArgumentOf(*next, 0u) == &user ? next->Argument(1) : next->Argument(0))) {
-                reason = std::string("lane-id:bit-") + std::string(IrOpcodeName(next->Opcode())) + "-" + maskBlocker;
+                reason = std::string("lane-id:bit-") + std::string(IrOpcodeName(next->Opcode())) + "-" + std::string(maskBlocker);
                 return false;
             }
         }
@@ -826,13 +826,13 @@ bool OwnBitUse(const IrValue* lane, const IrValue& user, std::string& reason) {
     if (HalfTest(&user)) {
         for (const IrValue* next : user.Uses()) {
             if ((next->Opcode() != IrOpcode::Select && next->Opcode() != IrOpcode::SelectU32) || ArgumentOf(*next, 0u) != &user || !MaskValue(next->Argument(1)) || !MaskValue(next->Argument(2))) {
-                reason = std::string("lane-id:half-") + std::string(IrOpcodeName(next->Opcode())) + "-" + maskBlocker;
+                reason = std::string("lane-id:half-") + std::string(IrOpcodeName(next->Opcode())) + "-" + std::string(maskBlocker);
                 return false;
             }
         }
         return true;
     }
-    reason = std::string("lane-id:") + std::string(IrOpcodeName(opcode)) + "-" + maskBlocker;
+    reason = std::string("lane-id:") + std::string(IrOpcodeName(opcode)) + "-" + std::string(maskBlocker);
     return false;
 }
 
