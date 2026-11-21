@@ -23,6 +23,11 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
+	// Stores bytes at their guest addresses without raising guest faults: the pages are writable
+	// for the copy and get their watcher protection back. For GPU results in ranges the backing
+	// store does not hold (private runtime mappings); the backing store takes the others.
+	void WriteGuest(uint64_t vaddr, const void* data, uint64_t size);
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

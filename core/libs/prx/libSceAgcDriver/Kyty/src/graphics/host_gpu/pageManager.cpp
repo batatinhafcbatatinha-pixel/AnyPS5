@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -264,6 +265,44 @@ struct PageManager::Impl {
 		}
 	}
 
+	void WriteGuest(uint64_t vaddr, const void* data, uint64_t size) {
+		ValidateRange(vaddr, size);
+		const auto* bytes = static_cast<const uint8_t*>(data);
+		const auto  end   = vaddr + size;
+		for (auto chunk_begin = vaddr; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+			auto*      destination = reinterpret_cast<void*>(chunk_begin);
+			const auto source      = bytes + (chunk_begin - vaddr);
+			auto*      region      = FindRegion(chunk_begin);
+			if (region == nullptr) {
+				// No page here was ever watched, so none is protected by the tracker.
+				std::memcpy(destination, source, chunk_end - chunk_begin);
+				chunk_begin = chunk_end;
+				continue;
+			}
+			// Watcher changes of these pages wait on the lock, so no protection change interleaves.
+			SpinGuard  lock(region->lock);
+			const auto page_begin = Common::AlignDown(chunk_begin, PAGE_SIZE);
+			const auto page_end   = Common::AlignUp(chunk_end, PAGE_SIZE);
+			Protect(page_begin, page_end - page_begin, Common::VirtualMemory::Mode::ReadWrite);
+			std::memcpy(destination, source, chunk_end - chunk_begin);
+			const auto last = static_cast<size_t>((page_end - region_base) / PAGE_SIZE);
+			for (auto first = static_cast<size_t>((page_begin - region_base) / PAGE_SIZE); first < last;) {
+				const auto perms = region->pages[first].Perms();
+				auto       next  = first + 1;
+				while (next < last && region->pages[next].Perms() == perms) {
+					++next;
+				}
+				if (perms != Common::VirtualMemory::Mode::ReadWrite) {
+					Protect(region_base + first * PAGE_SIZE, (next - first) * PAGE_SIZE, perms);
+				}
+				first = next;
+			}
+			chunk_begin = chunk_end;
+		}
+	}
+
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	Common::SrwMutex                        region_mutex;
@@ -278,6 +317,10 @@ PageManager::~PageManager() = default;
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size);
+}
+
+void PageManager::WriteGuest(uint64_t vaddr, const void* data, uint64_t size) {
+	m_impl->WriteGuest(vaddr, data, size);
 }
 
 template void PageManager::UpdatePageWatchers<true, true>(uint64_t, uint64_t);

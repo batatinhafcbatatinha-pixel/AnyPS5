@@ -21,6 +21,8 @@ namespace Libs::Graphics {
 class MemoryTracker final {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
+
+	[[nodiscard]] PageManager& Pages() noexcept { return m_page_manager; }
 	~MemoryTracker();
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);

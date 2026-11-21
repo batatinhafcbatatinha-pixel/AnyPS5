@@ -332,6 +332,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
 	m_context.GetCommandScheduler().PopPendingOperations();
+	if (!async_compute) {
+		m_context.GetCommandScheduler().SubmitIfIdle();
+	}
 	auto& sh_ctx = buffer.GetShaders();
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
