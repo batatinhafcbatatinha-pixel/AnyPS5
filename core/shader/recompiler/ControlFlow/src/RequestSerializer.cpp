@@ -927,7 +927,8 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(64u);
+    // Version 64 only for the render scale flag; every other request keeps version 63.
+    writer.WriteU32(request.target.renderScale ? 64u : 63u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -981,8 +982,10 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteU32(request.target.maxImageArrayLayers);
     writer.WriteBool(request.target.fixedPushSlots);
     writer.WriteBool(request.target.spannedAnySubgroup);
-    if (const bool barycentrics = request.graphics.has_value() && request.graphics->emulateBarycentrics; barycentrics || request.target.renderScale) {
-        writer.WriteU8(static_cast<std::uint8_t>((barycentrics ? 1u : 0u) | (request.target.renderScale ? 2u : 0u)));
+    if (const bool barycentrics = request.graphics.has_value() && request.graphics->emulateBarycentrics; request.target.renderScale) {
+        writer.WriteU8(static_cast<std::uint8_t>((barycentrics ? 1u : 0u) | 2u));
+    } else if (barycentrics) {
+        writer.WriteBool(true);
     }
     return base64Encode(buffer);
 }
