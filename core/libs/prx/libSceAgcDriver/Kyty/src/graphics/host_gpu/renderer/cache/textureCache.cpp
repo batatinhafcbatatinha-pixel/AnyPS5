@@ -1192,7 +1192,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, bytes.size());
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			if (!LibKernel::Memory::TryWriteBacking(address, bytes.data(), bytes.size())) {
+				m_page_manager.WriteGuest(address, bytes.data(), bytes.size());
+			}
 		}
 	}
 }
@@ -1911,7 +1913,10 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool unlocked_copy) {
 	m_scheduler.DeferPriorityOperation(
 	    [this, download = std::move(download), range, trapped = m_readback_storage_images] {
 		    download.buffer->Invalidate(download.offset, range.size);
-		    LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
+		    // Private runtime mappings are outside the backing store.
+		    if (!LibKernel::Memory::TryWriteBacking(range.address, download.mapped, range.size)) {
+			    m_page_manager.WriteGuest(range.address, download.mapped, range.size);
+		    }
 		    if (trapped) {
 			    m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
 			    // Priority operations run in queue order, so this write-back is the oldest.

@@ -224,12 +224,15 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
 	auto publish = [total_size, buffer_address, copies = std::move(copies),
-	                download = std::move(download)] {
+	                download = std::move(download), pages = &m_memory_tracker.Pages()] {
 		download.buffer->Invalidate(download.offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(
-			    buffer_address + copy.srcOffset,
-			    download.mapped + (copy.dstOffset - download.offset), copy.size);
+			const auto  address = buffer_address + copy.srcOffset;
+			const auto* bytes   = download.mapped + (copy.dstOffset - download.offset);
+			// Private runtime mappings are outside the backing store.
+			if (!Libs::LibKernel::Memory::TryWriteBacking(address, bytes, copy.size)) {
+				pages->WriteGuest(address, bytes, copy.size);
+			}
 		}
 	};
 	if constexpr (async) {
@@ -1131,14 +1134,17 @@ void BufferCache::RecordEagerBatch(const RangeSet& writes) {
 		    copies.begin() + static_cast<ptrdiff_t>(pieces[last - 1].last_copy));
 		// Every packed copy lies inside the source buffer's guest range.
 		m_scheduler.DeferPriorityOperation(
-		    [download, buffer_address, own = std::move(own)] {
+		    [download, buffer_address, own = std::move(own), pages = &m_memory_tracker.Pages()] {
 			    const auto begin = own.front().dstOffset;
 			    const auto end   = own.back().dstOffset + own.back().size;
 			    download->buffer->Invalidate(begin, end - begin);
 			    for (const auto& copy: own) {
-				    LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-				                                    download->mapped + (copy.dstOffset - download->offset),
-				                                    copy.size);
+				    const auto  address = buffer_address + copy.srcOffset;
+				    const auto* bytes   = download->mapped + (copy.dstOffset - download->offset);
+				    // Private runtime mappings are outside the backing store.
+				    if (!LibKernel::Memory::TryWriteBacking(address, bytes, copy.size)) {
+					    pages->WriteGuest(address, bytes, copy.size);
+				    }
 			    }
 		    },
 		    GuestRange {buffer_address, buffer.Size()});
@@ -1170,6 +1176,14 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 	// of overlapping bytes: those land first (or the side one waits for a later call), so an older
 	// copy never overwrites a newer one.
 	std::vector<uint8_t> side_ready(m_eager_downloads.size(), 0);
+	// The newest tick whose priority operations are known to have run.
+	uint64_t   published_tick = 0;
+	const auto published      = [&](uint64_t tick) {
+		if (tick <= published_tick) return true;
+		if (!m_scheduler.PriorityOperationsDone(tick)) return false;
+		published_tick = tick;
+		return true;
+	};
 	for (size_t index = 0; index < m_eager_downloads.size(); ++index) {
 		const auto& side = m_eager_downloads[index];
 		if (side.side == 0 || side.end <= vaddr || end <= side.begin ||
@@ -1215,6 +1229,12 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 		}
 		// The timeline was read above; a download finishing since is released by a later call.
 		if (side_only || (finished_only && !master.IsFree(download.tick))) {
+			return false;
+		}
+		// Its bytes reach guest memory in a priority operation of its tick. Until that has run the
+		// pages keep faulting: a guest write made after their release would be overwritten by it,
+		// and a guest read would see the bytes from before the GPU wrote them.
+		if (finished_only && !published(download.tick)) {
 			return false;
 		}
 		if (download.tick > waited) {

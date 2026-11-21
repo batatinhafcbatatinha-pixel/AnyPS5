@@ -28,6 +28,10 @@ public:
 	void           EndRendering() { m_command.EndRendering(); }
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	// Called before each dispatch the GPU thread records: submits the open batch once it holds a
+	// few dispatches and the GPU has finished every batch before it, so the GPU does not sit idle
+	// while the batch keeps growing.
+	void           SubmitIfIdle();
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
@@ -38,6 +42,8 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Whether every priority operation of `tick` and earlier ticks has run, without waiting.
+	[[nodiscard]] bool        PriorityOperationsDone(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	// range covers every guest access of the callback: an empty range declares a host-only
@@ -134,6 +140,7 @@ private:
 	CommandPool                  m_side_pool;
 	vk::CommandBuffer            m_main_buffer = nullptr; // Saved while recording a side buffer.
 	bool                         m_in_side     = false;
+	uint32_t                     m_batch_dispatches = 0; // Dispatches recorded into the open batch.
 	uint64_t                     m_side_wait   = 0; // Side value the next main submission waits for.
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;

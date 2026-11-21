@@ -169,6 +169,17 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
+void CommandScheduler::SubmitIfIdle() {
+	// Fewer dispatches cost more in submission than the idle time they save (8 measured best of
+	// 1, 4, 8 and 16 on one title).
+	constexpr uint32_t MinDispatches = 8;
+	if (m_in_side || !Active() || m_command.IsInvalid() || ++m_batch_dispatches < MinDispatches ||
+	    !m_master.IsFree(CurrentTick() - 1)) {
+		return;
+	}
+	Flush();
+}
+
 void CommandScheduler::Finish() {
 	CheckActive();
 	if (!m_command.IsInvalid()) {
@@ -484,6 +495,14 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	});
 }
 
+bool CommandScheduler::PriorityOperationsDone(uint64_t tick) {
+	std::scoped_lock lock(m_operation_mutex);
+	const bool active_before_or_at = m_priority_active_tick != 0 && m_priority_active_tick <= tick;
+	const bool queued_before_or_at =
+	    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
+	return !active_before_or_at && !queued_before_or_at;
+}
+
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	CommandScheduler* previous    = g_deferred_callback_scheduler;
 	g_deferred_callback_scheduler = this;
@@ -512,6 +531,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	m_batch_dispatches = 0;
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
