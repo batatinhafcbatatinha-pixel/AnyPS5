@@ -177,8 +177,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api --method POST "repos/$GH_REPO/releases/generate-notes" -f tag_name="$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.json"
-          python tools/prepare_release_notes.py --input "$RUNNER_TEMP/release-notes.json" --body "$RUNNER_TEMP/release-body.md" --full dist/release-notes.md
+          if [ "$GH_REPO" = batatinhafcbatatinha-pixel/AnyPS5 ]; then
+            cat > "$RUNNER_TEMP/release-body.md" <<'NOTES'
+          First fork release of AnyPS5.
+
+          - Improved GPU read-back ordering, page lifetime tracking, and idle submission.
+          - Shared direct-memory mappings and write-watch fixes.
+          - Pipeline initialization and fiber stack fixes.
+          - Full Linux and Windows builds plus macOS host checks in CI.
+          NOTES
+            cp "$RUNNER_TEMP/release-body.md" dist/release-notes.md
+          else
+            gh api --method POST "repos/$GH_REPO/releases/generate-notes" -f tag_name="$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.json"
+            python tools/prepare_release_notes.py --input "$RUNNER_TEMP/release-notes.json" --body "$RUNNER_TEMP/release-body.md" --full dist/release-notes.md
+          fi
       - name: Create or refresh draft and upload files
         shell: bash
         env:
