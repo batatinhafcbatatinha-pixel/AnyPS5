@@ -356,6 +356,7 @@ async function selectInputs(inputs) {
 $("choose").onclick = () => { $("file").value = ""; $("file").click(); };
 $("change").onclick = () => {
   if (working) return;
+  const restoreFocus = document.activeElement === $("change");
   worker?.terminate();
   worker = null;
   if (downloadUrl) { URL.revokeObjectURL(downloadUrl); downloadUrl = null; }
@@ -369,6 +370,7 @@ $("change").onclick = () => {
   $("acknowledge").checked = false;
   $("drop").hidden = false;
   update();
+  if (restoreFocus) $("choose").focus();
 };
 $("choose-folder").onclick = () => { $("folder").value = ""; $("folder").click(); };
 $("folder").onchange = () => {
@@ -456,7 +458,7 @@ updateLocaleButton();
 update();
 lock(false);
 if (supported) fetch("./release.json", { cache: "no-cache" }).then(response => { if (!response.ok) throw localizedError(() => translate(locale, "cannotLoadReleaseInfo", { status: response.status, hint: response.status === 404 ? translate(locale, "cannotLoadReleaseInfoHint") : "" })); return response.json(); }).then(value => {
-  if (!value.tag || !["windows", "linux"].every(target => Number.isSafeInteger(value.platforms?.[target]?.expandedBytes))) throw localizedError(() => translate(locale, "invalidReleaseInfo"));
+  if (!value || typeof value !== "object" || typeof value.tag !== "string" || !/^v[0-9A-Za-z][0-9A-Za-z._-]*$/u.test(value.tag) || value.tag.endsWith(".") || !["windows", "linux"].every(target => Number.isSafeInteger(value.platforms?.[target]?.expandedBytes))) throw localizedError(() => translate(locale, "invalidReleaseInfo"));
   release = value;
   update();
 }).catch(error => fail(error instanceof TypeError ? () => translate(locale, "cannotReachReleaseInfo") : error));
