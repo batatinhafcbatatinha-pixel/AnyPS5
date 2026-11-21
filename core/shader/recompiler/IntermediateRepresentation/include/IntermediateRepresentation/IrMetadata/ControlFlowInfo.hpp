@@ -59,9 +59,10 @@ struct TableColumn {
     // per-draw snapshot or map.
     bool global = false;
     std::uint32_t selection = 0;
+    bool pointerKeyed = false;
 
     bool operator==(const TableColumn& other) const {
-        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler && address == other.address && buffer == other.buffer && indirect == other.indirect && indirectOffset == other.indirectOffset && indirectImmediate == other.indirectImmediate && pointerHops == other.pointerHops && foldedAddend == other.foldedAddend && foldedCarry == other.foldedCarry && selected == other.selected && global == other.global && selection == other.selection;
+        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler && address == other.address && buffer == other.buffer && indirect == other.indirect && indirectOffset == other.indirectOffset && indirectImmediate == other.indirectImmediate && pointerHops == other.pointerHops && foldedAddend == other.foldedAddend && foldedCarry == other.foldedCarry && selected == other.selected && global == other.global && selection == other.selection && pointerKeyed == other.pointerKeyed;
     }
 };
 

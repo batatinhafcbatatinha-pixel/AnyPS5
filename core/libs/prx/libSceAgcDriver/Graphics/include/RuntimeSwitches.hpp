@@ -28,7 +28,9 @@ enum class RuntimeSwitch : std::size_t {
     NoTargetMemoOverlapCache,
     GpuWrittenIndexInPlace,
     SkipHookSync,
+    NoStagePoolReuse,
     IndexInPlaceBehindWriter,
+    WideLibraryKeys,
     Count,
 };
 

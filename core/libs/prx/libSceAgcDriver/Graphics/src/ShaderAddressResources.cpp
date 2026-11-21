@@ -237,7 +237,7 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         if (tables != 0 && storesThroughAddressesCached(shader.program->spirv)) bdaReadOnly = false;
         usesFaultBuffer = usesFaultBuffer || faults != 0;
         const bool tableFaultsOnly = std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; });
-        faultChecks = faultChecks || tables != 0 || (faults != 0 && (!tableFaultsOnly || shader.program->imageTableFaults != 0 || shader.program->poisonedSrtReads != 0 || shader.program->windowLaneGuards != 0 || shader.program->descriptorFaults != 0 || loopGuarded));
+        faultChecks = faultChecks || tables != 0 || (faults != 0 && (!tableFaultsOnly || shader.program->imageTableFaults != 0 || shader.program->poisonedSrtReads != 0 || shader.program->windowLaneGuards != 0 || shader.program->descriptorFaults != 0 || shader.program->splitStateLanes != 0 || loopGuarded));
     }
     // APS5_GPU_SRT_LIGHT=1 (with APS5_BUFFER_CACHE): stages that resolve their SRT on the GPU and never
     // store through addresses read guest memory through the buffer cache's page table (BdaResources

@@ -113,8 +113,8 @@ static_assert(sizeof(IrResourcePlan) == 728, "IrResourcePlan changed: update Enc
 static_assert(sizeof(IrValue) == 144, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
-static_assert(sizeof(DescriptorSource) == 216, "DescriptorSource changed: update the plan encoder");
-static_assert(sizeof(TableColumn) == 112, "TableColumn changed: update the plan encoder");
+static_assert(sizeof(DescriptorSource) == 224, "DescriptorSource changed: update the plan encoder");
+static_assert(sizeof(TableColumn) == 120, "TableColumn changed: update the plan encoder");
 static_assert(sizeof(KeyDomain) == 16, "KeyDomain changed: update the plan encoder");
 static_assert(sizeof(ResourceBlock) == 104, "ResourceBlock changed: update the plan encoder");
 static_assert(sizeof(SrtRead) == 16, "SrtRead changed: update the plan encoder");
@@ -551,6 +551,8 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.fullSubgroups);
     writer.Value(result.functionLdsBuffer);
     writer.Value(result.meshWindowBuffer);
+    writer.Value(result.dispatchThreadLimit);
+    writer.Value(result.splitStateLanes);
     writer.Value(result.scratchPoolSlotDwords);
     writer.Values(std::span<const std::uint32_t>(result.parameterExports));
     writer.List(result.fragmentParameters, [](Writer& out, const FragmentParameter& parameter) {
@@ -621,6 +623,8 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.fullSubgroups);
     reader.Value(result.functionLdsBuffer);
     reader.Value(result.meshWindowBuffer);
+    reader.Value(result.dispatchThreadLimit);
+    reader.Value(result.splitStateLanes);
     reader.Value(result.scratchPoolSlotDwords);
     reader.Values(result.parameterExports);
     reader.List(result.fragmentParameters, 10, [](Reader& in, FragmentParameter& parameter) {
@@ -1212,6 +1216,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Value(column.selected);
         out.Value(column.global);
         out.Value(column.selection);
+        out.Value(column.pointerKeyed);
         out.Values(std::span<const std::uint32_t>(source.requiredBlocks));
     });
     writer.List(plan.controlFlow, [&](Writer& out, const ResourceBlock& block) {
@@ -1347,7 +1352,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         value.SetDetachedOperands(std::move(arguments), std::move(phiBlocks));
     }
     reader.List(plan.memoryInfo, 79, decodeMemoryInfo);
-    reader.List(plan.descriptorSources, 81, [&](Reader& in, DescriptorSource& source) {
+    reader.List(plan.descriptorSources, 82, [&](Reader& in, DescriptorSource& source) {
         for (auto& dword : source.dwords) dword = valueAt(in.Get<std::uint32_t>());
         in.Value(source.dwordCount);
         const bool table = in.Get<bool>();
@@ -1380,6 +1385,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(column.selected);
         in.Value(column.global);
         in.Value(column.selection);
+        in.Value(column.pointerKeyed);
         source.tableColumn = table ? std::optional(std::move(column)) : std::nullopt;
         in.Values(source.requiredBlocks);
     });
@@ -1422,7 +1428,8 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         const auto& column = *source.tableColumn;
         if (column.buffer && (column.sampler || column.dwordCount != 4u)) return false;
         const auto& parent = plan.descriptorSources[column.heapSource].tableColumn;
-        if (parent.has_value() && (column.buffer || column.sampler || column.address || column.indirect || !parent->buffer || !parent->indirect || plan.descriptorSources[parent->heapSource].tableColumn.has_value())) return false;
+        if (parent.has_value() && (column.buffer || column.address || column.indirect || !parent->buffer || !parent->indirect || plan.descriptorSources[parent->heapSource].tableColumn.has_value())) return false;
+        if (column.pointerKeyed && (!column.indirect || column.buffer || parent.has_value())) return false;
     }
     if (!std::ranges::all_of(plan.info.buffers, [&](const BufferResource& buffer) { return knownSource(buffer.source); })) return false;
     if (!std::ranges::all_of(plan.info.images, [&](const ImageResource& image) { return knownSource(image.source); })) return false;
