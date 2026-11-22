@@ -1,4 +1,5 @@
 #include "PortabilitySubset.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -14956,10 +14957,11 @@ void oneFragmentFmaskGuardTests(const Device& device) {
     std::cout << "One-fragment FMASK guard tests passed\n";
 }
 
-void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
+void msaaClearPassTests(const Device& device, Recorder& recorder, ColorMetadataPass::Mode mode) {
+    const std::string name = mode == ColorMetadataPass::Mode::FmaskDecompress ? "FMASK decompress" : "fast-clear eliminate";
     const auto& base = device.GetContext();
     if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || base.hostImportAlignment == 0) {
-        std::cout << "4x color targets or host imports unavailable: FMASK decompress not tested\n";
+        std::cout << "4x color targets or host imports unavailable: " << name << " not tested\n";
         return;
     }
     constexpr std::uint32_t side = 128;
@@ -14972,7 +14974,7 @@ void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
 #else
     void* block = std::aligned_alloc(65536, (bytes + 65535u) & ~std::size_t{65535u});
 #endif
-    Require(block != nullptr, "cannot allocate the FMASK decompress block");
+    Require(block != nullptr, "cannot allocate the " + name + " block");
     std::memset(block, 0, bytes);
     const auto address = reinterpret_cast<std::uint64_t>(block);
     const auto cmaskAddress = address + 5u * 65536u;
@@ -15027,7 +15029,7 @@ void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
     destination.tileMode = ColorTileMode::RenderTarget;
     {
         std::lock_guard gpu(GpuMutex());
-        RunColorMetadataPass(context, {ColorMetadataPass::Mode::FmaskDecompress, {source}});
+        RunColorMetadataPass(context, {mode, {source}});
         auto recolored = source;
         recolored.clearWords = {0x55667788u, 0};
         RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {destination}, recolored});
@@ -15037,14 +15039,14 @@ void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
     }
     std::vector<std::uint32_t> resolved(destBytes / 4);
     AgcDriver::GuestMemory::Read(destAddress, std::as_writable_bytes(std::span(resolved)));
-    Require(std::ranges::all_of(resolved, [](auto word) { return word == 0x11223344u; }), "FMASK decompress did not materialize the seeded clear to the host multisampled image");
+    Require(std::ranges::all_of(resolved, [](auto word) { return word == 0x11223344u; }), name + " did not materialize the seeded clear to the host multisampled image");
     source.clearWords = {0x55667788u, 0};
     ColorTarget destination2 = destination;
     destination2.address = destAddress2;
     destination2.surfaceAddress = destAddress2;
     {
         std::lock_guard gpu(GpuMutex());
-        RunColorMetadataPass(context, {ColorMetadataPass::Mode::FmaskDecompress, {source}});
+        RunColorMetadataPass(context, {mode, {source}});
         RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {destination2}, source});
         recorder.Submit();
         device.WaitQueue();
@@ -15052,8 +15054,8 @@ void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
     }
     std::vector<std::uint32_t> resolved2(destBytes / 4);
     AgcDriver::GuestMemory::Read(destAddress2, std::as_writable_bytes(std::span(resolved2)));
-    Require(std::ranges::all_of(resolved2, [](auto word) { return word == 0x11223344u; }), "subsequent FMASK decompress re-cleared the multisampled target");
-    std::cout << "FMASK decompress MSAA clear and resolve tests passed\n";
+    Require(std::ranges::all_of(resolved2, [](auto word) { return word == 0x11223344u; }), "subsequent " + name + " re-cleared the multisampled target");
+    std::cout << name << " MSAA clear and resolve tests passed\n";
 }
 
 void tiledResolveTests(const Device& device, Recorder& recorder) {
@@ -16249,6 +16251,16 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
     }
 }
 
+template<typename Condition>
+bool EventuallyTrue(Condition&& condition) {
+    for (int attempt = 0; attempt < 5000 && !condition(); ++attempt) {
+        GpuMutex().unlock();
+        for (const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1); std::chrono::steady_clock::now() < until;) std::this_thread::yield();
+        GpuMutex().lock();
+    }
+    return condition();
+}
+
 bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool imported) {
     if (!device.Graphics() || (imported && device.GetContext().hostImportAlignment == 0)) return false;
     constexpr std::size_t unit = 65536;
@@ -16407,6 +16419,51 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
     vertex.vertexAttributes = {attributeFor(address, 0, 0)};
     Draw(context, consumer, triangle, shaders);
     WaitForOptimizedPipelines(context.device);
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    std::shared_ptr<const AgcDriver::DrawRecipe> retained;
+    Draw(context, consumer, triangle, shaders, {}, &retained);
+    Require(retained != nullptr && retained->targets.size() == 1, "target retention draw did not produce a recipe");
+    WaitForOptimizedPipelines(context.device);
+    SharedResourceCache().Clear();
+    ClearCachedTextures(context.device);
+    Require(!retained->targets.front().expired(), "recorded target expired after cache eviction before completion");
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    Require(EventuallyTrue([&] { return retained->targets.front().expired(); }), "completion did not release the recorded target owner");
+    if (imported) {
+        const auto argumentsAddress = address + 2 * unit;
+        const std::array<std::uint32_t, 4> arguments{3, 1, 0, 0};
+        AgcDriver::GuestMemory::Write(argumentsAddress, std::as_bytes(std::span(arguments)));
+        vertex.vertexAttributes = {attributeFor(argumentsAddress + 256, 16, 0)};
+        vertex.vertexAttributes[0].resource.fields[2] = 3;
+        auto indirect = triangle;
+        indirect.indirect.emplace();
+        indirect.indirect->arguments = argumentsAddress;
+        indirect.indirect->opcode = 0x24;
+        indirect.indirect->recordBytes = 16;
+        indirect.indirect->stride = 16;
+        indirect.indirect->count = 1;
+        auto pool = GetBufferPool(context);
+        const auto usage = BufferPool::Usage(VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        const auto availableScratch = [&] {
+            auto allocation = pool->Take(sizeof(arguments), usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (!allocation) allocation = pool->Take(sizeof(arguments), usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true);
+            const bool available = allocation.has_value();
+            if (allocation) pool->Put(*allocation);
+            return available;
+        };
+        Require(!availableScratch(), "scratch retention fixture already had an idle indirect scratch");
+        recorder.NotePendingWrite(argumentsAddress, sizeof(arguments));
+        Draw(context, consumer, indirect, shaders);
+        Require(!availableScratch(), "GPU indirect scratch recycled before completion");
+        const auto read = recorder.DescribePendingRead(argumentsAddress, sizeof(arguments));
+        Require(read && read->kind == Recorder::ReadKind::Indirect, "scratch retention draw did not use GPU indirect arguments");
+        recorder.Submit();
+        recorder.Sync();
+        Require(EventuallyTrue(availableScratch), "GPU indirect scratch survived completion");
+    }
+
     std::cout << "Vertex range and pending color producer tests passed (" << (imported ? "imported" : "copied") << ")\n";
     return true;
 }
@@ -18805,7 +18862,8 @@ int main(int argc, char** argv) {
             multisampleGuestAccessTests(device, recorder);
             multisampleTargetOverPendingStorageTests(device, recorder);
             oneFragmentFmaskGuardTests(device);
-            fmaskDecompressMsaaTests(device, recorder);
+            msaaClearPassTests(device, recorder, ColorMetadataPass::Mode::FmaskDecompress);
+            msaaClearPassTests(device, recorder, ColorMetadataPass::Mode::EliminateFastClear);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {
@@ -18888,7 +18946,8 @@ int main(int argc, char** argv) {
         repeatStorageGuardTests(device, recorder);
         oneFragmentFmaskGuardTests(device);
         tiledResolveTests(device, recorder);
-        fmaskDecompressMsaaTests(device, recorder);
+        msaaClearPassTests(device, recorder, ColorMetadataPass::Mode::FmaskDecompress);
+        msaaClearPassTests(device, recorder, ColorMetadataPass::Mode::EliminateFastClear);
         misalignedSnapshotTests(device, recorder);
         misalignedRegionTests(device, recorder);
         pendingUploadGpuCopyTests(device, recorder);
