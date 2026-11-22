@@ -6810,16 +6810,22 @@ bool recordRangeCopyBack(const Context& context, Recorder& recorder, VkCommandBu
     auto whole = from;
     const auto wholeEnd = to;
     bool shadowUsed = false;
-    if (source.shadow != nullptr && source.buffer != nullptr && source.buffer->HasDeviceAddress() && source.shadow->HasDeviceAddress() && source.targetAddress != 0 && source.shadowBase % 4u == 0 && source.bufferBase % 4u == 0 && source.targetBase % 4u == 0) {
+    const bool addressed = addressedChangedCopyBacks(context);
+    if (source.shadow != nullptr && (addressed ? source.targetAddress != 0 : source.target != VK_NULL_HANDLE) && source.shadowBase % 4u == 0 && source.bufferBase % 4u == 0 && source.targetBase % 4u == 0) {
         const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
         const auto alignedTo = to & ~std::uint64_t{3};
         static const bool traceDivergence = std::getenv("APS5_TRACE_COPY_BACK") != nullptr;
         std::shared_ptr<Buffer> counter;
         if (traceDivergence && alignedFrom < alignedTo) {
-            counter = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            counter = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (addressed ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
             std::memset(counter->Bytes().data(), 0, 16);
         }
-        if (alignedFrom < alignedTo && recorder.RecordChangedCopy(commands, source.buffer->DeviceAddress() + (alignedFrom - source.bufferBase), source.shadow->DeviceAddress() + (alignedFrom - source.shadowBase), source.targetAddress + (alignedFrom - source.targetBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), counter != nullptr ? counter->DeviceAddress() : 0)) {
+        const auto dwords = static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u);
+        const auto recordChanged = [&] {
+            if (!addressed) return recorder.RecordBoundChangedCopy(commands, {source.buffer->Handle(), alignedFrom - source.bufferBase}, {source.shadow->Handle(), alignedFrom - source.shadowBase}, {source.target, alignedFrom - source.targetBase}, dwords, counter != nullptr ? counter->Handle() : VK_NULL_HANDLE);
+            return recorder.RecordChangedCopy(commands, source.buffer->DeviceAddress() + (alignedFrom - source.bufferBase), source.shadow->DeviceAddress() + (alignedFrom - source.shadowBase), source.targetAddress + (alignedFrom - source.targetBase), dwords, counter != nullptr ? counter->DeviceAddress() : 0);
+        };
+        if (alignedFrom < alignedTo && recordChanged()) {
             if (counter != nullptr) {
                 recorder.Keep(counter);
                 recorder.OnComplete([counter, alignedFrom, alignedTo, regionBegin = source.shadowBase] {
