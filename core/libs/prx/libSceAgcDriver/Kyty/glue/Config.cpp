@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-// Settings of the KytyPS5 GPU backend. Defaults follow the KytyPS5 runs title B was measured with
+// Settings of the KytyPS5 GPU backend. Defaults follow the KytyPS5 test runs
 // (shader cache on, read-backs and tessellation off); APS5_KYTY_<NAME>=0/1 overrides.
 
 namespace Config {

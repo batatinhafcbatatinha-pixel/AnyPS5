@@ -2,7 +2,7 @@
 #define KYTY_COMMON_EMULATOR_CONFIG_H_
 
 // AnyPS5: the settings the KytyPS5 GPU stack reads. KytyPS5 loads them from its command line;
-// here they are fixed defaults (those of the KytyPS5 runs title B was measured with) that
+// here they are fixed defaults (those of the KytyPS5 test runs) that
 // APS5_KYTY_* environment variables can change (glue/Config.cpp).
 
 #include "common/common.h"

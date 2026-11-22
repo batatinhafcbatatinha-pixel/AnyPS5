@@ -2186,7 +2186,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // still writes (GPU-built index lists) is bound in place behind a barrier: reading it on the
         // CPU for the copy and its highest index would first submit the open batch and wait for the
         // GPU. Without the highest index the vertex ranges are bound whole (prepareDrawInputs below).
-        // Opt-in (APS5_GPU_WRITTEN_INDEX_IN_PLACE=1); off, the range is synced and copied. In title B it removes
+        // Opt-in (APS5_GPU_WRITTEN_INDEX_IN_PLACE=1); off, the range is synced and copied. In one game it removes
         // the committer's GPU waits for GPU-written index ranges (+4-5% presents in-run, A/B), but one of three
         // runs with it on from launch never finished the save load (cause unknown), so it is not the default.
         const bool gpuWrittenIndexInPlace = RuntimeSwitches::Set(RuntimeSwitch::GpuWrittenIndexInPlace);

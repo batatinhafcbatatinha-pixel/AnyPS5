@@ -7115,7 +7115,7 @@ std::optional<ResidentSource> ResidentSourceFor(VkDevice device, VkBuffer import
         // The copy serves the upload only while nothing has written the range since it was taken:
         // neither the CPU nor stored GPU results (an image write-back lands in the import, not in
         // this copy). A CPU-only check let a copy taken before such stores keep feeding refreshes
-        // of the image with its old texels: title B's TAA history images froze at the last frame
+        // of the image with its old texels: one game's TAA history images froze at the last frame
         // of a cutscene and one display buffer in three showed it for the rest of the session.
         if (GuestMemory::UnchangedSinceCollected(address, bytes, found->generation) && GuestMemory::UnchangedSince(address, bytes, found->generation)) {
             found->lastUse = ++registry.clock;

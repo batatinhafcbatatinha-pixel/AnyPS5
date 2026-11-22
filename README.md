@@ -24,15 +24,6 @@ Resolution patches (addresses and values only, no game code) go into the port's 
 `.local/ports/<title id>/patches/`. Display-mode writes can be "held": AnyPS5 writes the patch's values again
 whenever the game writes its own (the log says `[patch] held value at ... replaced`). Remove the file to go back.
 
-## Frame rate
-
-![In-game fps of title B: 11.8 fps at native 720p](docs/fps/fps-control.svg)
-
-Lobby of title B at native 720p, measured with the old GPU engine on an RTX 3050 laptop GPU +
-Ryzen 5 3600; not measured yet with the new one.
-
-**[See more games →](docs/games.md)**
-
 ## How to play a game
 
 Windows 10/11 x64 with a Vulkan GPU and a CPU with AVX2. About 1 GB free per game and a few minutes for the first
@@ -56,12 +47,7 @@ conversion; the game itself is not copied.
    V-Sync mode, performance panel and its corner, console language, volume, mute in background, vibration. In the game:
    F10 performance panel, F11 fullscreen, F12 screenshot, F5/F6/F8 volume and mute.
 
-Every PS5 game takes the same generic path; there are no per-game profiles. Tested so far:
-
-| Game | Title ID | State |
-| --- | --- | --- |
-| title C | TITLE_ID | title menu at 60 fps; PC settings checked in game |
-| title B | TITLE_ID | gameplay, 11.8 fps at native 720p (old GPU engine, see [Frame rate](#frame-rate)) |
+Every PS5 game takes the same generic path; there are no per-game profiles.
 
 ## Differences from upstream
 
@@ -81,31 +67,12 @@ launcher's generic path, or copy `setup.json`/`installer.json` from another port
 ```bat
 git clone --recurse-submodules https://github.com/batatinhafcbatatinha-pixel/AnyPS5.git
 cd AnyPS5
-powershell -ExecutionPolicy Bypass -File tools\port-installer\setup\setup.ps1 -GameDir .local\ports\TITLE_ID -ToolsDir .local\tools -Source "D:\Dumps\TITLE_ID-app0"
-.local\ports\TITLE_ID\Play.cmd
+powershell -ExecutionPolicy Bypass -File tools\port-installer\setup\setup.ps1 -GameDir .local\ports\<title id> -ToolsDir .local\tools -Source "D:\Dumps\<title id>-app0"
+.local\ports\<title id>\Play.cmd
 ```
 
 `ps5port.py build` uses a local AnyPS5 build instead of the release when `ANYPS5_RELINKER` and `ANYPS5_LIBS` point to
 its `relinker.exe` and `libs` folder. Building AnyPS5 itself: [docs/dev/BUILD.md](docs/dev/BUILD.md).
-
-## Screenshots
-
-Each game at the furthest point it reaches today.
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img src="docs/screenshots/dreaming-sarah.jpg" alt="title C" width="100%"><br>
-      <b>title C</b><br>
-      <sub>PS5 &middot; title menu</sub>
-    </td>
-    <td align="center" width="50%">
-      <img src="docs/screenshots/control.jpg" alt="title B" width="100%"><br>
-      <b>title B</b><br>
-      <sub>PS5 &middot; gameplay, title B lobby</sub>
-    </td>
-  </tr>
-</table>
 
 ## Upstream
 
