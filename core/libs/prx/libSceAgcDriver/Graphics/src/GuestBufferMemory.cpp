@@ -6810,7 +6810,7 @@ bool recordRangeCopyBack(const Context& context, Recorder& recorder, VkCommandBu
     auto whole = from;
     const auto wholeEnd = to;
     bool shadowUsed = false;
-    if (source.shadow != nullptr && source.targetAddress != 0 && source.shadowBase % 4u == 0 && source.bufferBase % 4u == 0 && source.targetBase % 4u == 0) {
+    if (source.shadow != nullptr && source.buffer != nullptr && source.buffer->HasDeviceAddress() && source.shadow->HasDeviceAddress() && source.targetAddress != 0 && source.shadowBase % 4u == 0 && source.bufferBase % 4u == 0 && source.targetBase % 4u == 0) {
         const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
         const auto alignedTo = to & ~std::uint64_t{3};
         static const bool traceDivergence = std::getenv("APS5_TRACE_COPY_BACK") != nullptr;
