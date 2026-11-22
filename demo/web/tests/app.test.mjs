@@ -51,7 +51,8 @@ async function setup(t, name, overrides = {}) {
       },
       querySelectorAll: () => []
     },
-    window: { isSecureContext: true, Worker, WebAssembly, ReadableStream, WritableStream, crypto: { subtle: {} }, ...overrides },
+    window: { isSecureContext: true, Worker, WebAssembly, ReadableStream, WritableStream, crypto: { subtle: {} },
+      navigator: { locks: { request: (_name, acquire) => acquire() } }, ...overrides },
     Worker,
     fetch: overrides.fetch ?? (async () => ({
       ok: true,
@@ -354,7 +355,13 @@ test("a late successful release request cannot hide a replacement request failur
 
 for (const [name, bad] of [
   ["HTTP error", { ok: false, status: 503 }],
-  ["invalid manifest", { ok: true, json: async () => ({ tag: "bad" }) }]
+  ["invalid manifest", { ok: true, json: async () => ({ tag: "bad" }) }],
+  ["negative Linux library size", { ok: true, json: async () => ({
+    tag: "v1-test", platforms: { linux: { expandedBytes: -1 }, windows: { expandedBytes: 1024 } }
+  }) }],
+  ["oversized Windows library size", { ok: true, json: async () => ({
+    tag: "v1-test", platforms: { linux: { expandedBytes: 1024 }, windows: { expandedBytes: 512 * 1024 * 1024 + 1 } }
+  }) }]
 ]) {
   test(`selecting an input retries release information after ${name}`, async t => {
     let calls = 0;
@@ -562,6 +569,22 @@ for (const stage of ["picker", "writable"]) {
   });
 }
 
+test("selected batch details follow a language switch", async t => {
+  const { get, workers } = await setup(t, "locale-selected-batch");
+  const names = ["first.zip", "second.zip"];
+  get("file").files = names.map(name => ({ name }));
+  get("file").onchange();
+  await inspect(workers[0], names.length);
+  const rows = () => get("app-list").children.map(row => row.children.map(cell => cell.textContent));
+  assert.equal(get("archive-name").textContent, "2 app ZIPs");
+  assert.deepEqual(rows(), names.map(name => [name, "1 files · 1.0 KiB expanded · 0 modules"]));
+
+  get("locale").onclick();
+  assert.equal(document.documentElement.lang, "de");
+  assert.equal(get("archive-name").textContent, "2 App-ZIPs");
+  assert.deepEqual(rows(), names.map(name => [name, "1 Dateien · 1.0 KiB entpackt · 0 Module"]));
+});
+
 test("a visible error follows a language switch", async t => {
   const { get } = await setup(t, "locale-error", { fetch: async () => ({ ok: false, status: 404 }) });
   assert.equal(get("error").hidden, false);
@@ -611,13 +634,55 @@ test("a browser that denies direct ZIP writes explains how to continue", async t
   assert.equal(get("convert").disabled, true);
 });
 
+test("Cancel is available while a selected ZIP destination opens", async t => {
+  const opening = deferred();
+  const pending = deferred();
+  let aborted = 0;
+  const { get, workers } = await setup(t, "cancel-pending-zip-destination", {
+    showSaveFilePicker: async () => ({
+      createWritable() {
+        opening.resolve();
+        return pending.promise;
+      }
+    })
+  });
+  const original = await selected(get, workers, "first.zip");
+  const converting = get("convert").onclick();
+  try {
+    await opening.promise;
+    assert.equal(get("cancel").hidden, false);
+    await get("cancel").onclick();
+    assert.equal(original.terminated, true);
+    const replacement = await selected(get, workers, "replacement.zip");
+    assert.equal(replacement.terminated, false);
+  } finally {
+    pending.resolve({ async abort() { aborted++; } });
+    await converting;
+  }
+  assert.equal(aborted, 1);
+  assert.equal(original.messages.some(message => message.type === "convert"), false);
+  assert.equal(get("archive-name").textContent, "replacement.zip");
+});
+
 test("cancelling the ZIP picker does not report a failure", async t => {
   const { get, workers } = await setup(t, "write-cancelled", {
     showSaveFilePicker: async () => { throw Object.assign(new Error("cancelled"), { name: "AbortError" }); }
   });
   await selected(get, workers, "first.zip");
   await get("convert").onclick();
+  assert.equal(get("cancel").hidden, true);
   assert.equal(get("error").hidden, true);
   assert.equal(get("selection").hidden, false);
   assert.equal(get("convert").disabled, false);
 });
+
+for (const supported of [false, true]) {
+  test(`Folder output requires Web Locks (${supported})`, async t => {
+    const { get } = await setup(t, `folder-locks-${supported}`, {
+      showDirectoryPicker() {},
+      navigator: supported ? { locks: { request() {} } } : {}
+    });
+    assert.equal(get("save").querySelector('[value="disk"]').disabled, !supported);
+    assert.equal(get("save").querySelector('[value="memory"]').disabled, false);
+  });
+}
