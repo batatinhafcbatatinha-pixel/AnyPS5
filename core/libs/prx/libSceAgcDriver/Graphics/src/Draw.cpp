@@ -3319,7 +3319,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             excluded.emplace_back(state.depth->address, state.depth->address + bytes);
             if (state.depth->stencilAddress != 0) excluded.emplace_back(state.depth->stencilAddress, state.depth->stencilAddress + bytes);
         }
-        auto listed = passAttachments;
+        const auto attachmentList = passAttachments.Span();
+        std::vector<std::pair<VkImage, bool>> listed(attachmentList.begin(), attachmentList.end());
         const auto attachments = listed.size();
         BindlessDrawReads(context, listed, passReads, excluded);
         passImages.insert(passImages.end(), listed.begin() + static_cast<std::ptrdiff_t>(attachments), listed.end());
