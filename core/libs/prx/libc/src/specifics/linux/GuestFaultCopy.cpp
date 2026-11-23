@@ -5,9 +5,11 @@
 #include <csignal>
 #include <cstdlib>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <iterator>
 #include <ucontext.h>
+#include "prx/libc/include/GuestArena.hpp"
 
 extern "C" {
 std::size_t GuestFaultCopyBytes(void* destination, const void* source, std::size_t bytes);
@@ -195,5 +197,15 @@ bool Resume(const siginfo_t* info, void* context) {
     return true;
 }
 
+}
+
+namespace GuestArena {
+extern "C" bool GuestArenaCopyOwned_nid_no_patch(std::uintptr_t source, void* destination, std::size_t bytes) {
+    if (bytes == 0) return true;
+    if (::GuestFaultCopy::Ready()) return ::GuestFaultCopy::Copy(destination, reinterpret_cast<const void*>(source), bytes);
+    iovec local{destination, bytes};
+    iovec remote{reinterpret_cast<void*>(source), bytes};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(bytes);
+}
 }
 #endif

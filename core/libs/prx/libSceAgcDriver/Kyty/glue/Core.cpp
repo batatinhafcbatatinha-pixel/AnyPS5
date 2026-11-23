@@ -23,8 +23,14 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/HostFault.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <link.h>
+#endif
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <span>
@@ -39,11 +45,21 @@ std::unique_ptr<Libs::Graphics::RenderContext> g_renderer;
 std::unique_ptr<Libs::VideoOut::VideoOutDriver> g_video_out;
 std::unique_ptr<Internal::Presenter>          g_presenter;
 std::atomic<Libs::Graphics::RenderContext*>    g_published {nullptr};
+#ifdef _WIN32
 HMODULE                                       g_vulkan = nullptr;
+#else
+void*                                         g_vulkan = nullptr;
+#endif
 
+#ifdef _WIN32
 bool FaultThunk(void* exception_pointers) noexcept {
 	return Core::HandleFault(exception_pointers);
 }
+#else
+bool FaultThunk(void* signal_info, void* signal_context) noexcept {
+	return Core::HandleFault(signal_info, signal_context);
+}
+#endif
 
 void MappedThunk(std::uintptr_t address, std::size_t bytes) {
 	Core::NoteMapped(address, bytes);
@@ -91,12 +107,39 @@ void MapGuestRanges(Libs::Graphics::RenderContext& renderer) {
 	if (base != 0 && lower > base) {
 		renderer.MapMemory(base, lower - base);
 	}
+#ifdef _WIN32
 	const auto* image = reinterpret_cast<const std::byte*>(GetModuleHandleW(nullptr));
 	const auto* dos   = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
 	const auto* nt    = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
 	const auto  start = reinterpret_cast<uint64_t>(image);
 	const auto  size  = static_cast<uint64_t>(nt->OptionalHeader.SizeOfImage);
-	if (Libs::Graphics::GuestRange {start, size}.Valid()) {
+#else
+	// The relinked executable is the first object dl_iterate_phdr reports: its loadable segments
+	// from the lowest to the highest address.
+	struct Span {
+		uint64_t low  = UINT64_MAX;
+		uint64_t high = 0;
+	} span;
+	dl_iterate_phdr(
+	    [](dl_phdr_info* info, size_t, void* data) -> int {
+		    auto* out = static_cast<Span*>(data);
+		    for (int index = 0; index < info->dlpi_phnum; ++index) {
+			    const auto& header = info->dlpi_phdr[index];
+			    if (header.p_type != PT_LOAD) {
+				    continue;
+			    }
+			    const uint64_t low  = (info->dlpi_addr + header.p_vaddr) & ~uint64_t {0xfff};
+			    const uint64_t high = (info->dlpi_addr + header.p_vaddr + header.p_memsz + 0xfff) & ~uint64_t {0xfff};
+			    out->low            = std::min(out->low, low);
+			    out->high           = std::max(out->high, high);
+		    }
+		    return 1; // the main program only
+	    },
+	    &span);
+	const uint64_t start = span.low;
+	const uint64_t size  = span.high > span.low ? span.high - span.low : 0;
+#endif
+	if (size != 0 && Libs::Graphics::GuestRange {start, size}.Valid()) {
 		renderer.MapMemory(start, size);
 	}
 }
@@ -129,6 +172,7 @@ void Core::Start(const WindowDesc* window) {
 		return;
 	}
 	Common::InitializeThreads();
+#ifdef _WIN32
 	g_vulkan = LoadLibraryW(L"vulkan-1.dll");
 	if (g_vulkan == nullptr) {
 		Host::Fail("the Vulkan loader vulkan-1.dll is missing");
@@ -138,6 +182,20 @@ void Core::Start(const WindowDesc* window) {
 	if (get_instance_proc_addr == nullptr) {
 		Host::Fail("vulkan-1.dll exports no vkGetInstanceProcAddr");
 	}
+#else
+	g_vulkan = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+	if (g_vulkan == nullptr) {
+		g_vulkan = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+	}
+	if (g_vulkan == nullptr) {
+		Host::Fail("the Vulkan loader libvulkan.so.1 is missing (install the Vulkan loader and a GPU driver)");
+	}
+	const auto get_instance_proc_addr =
+	    reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(g_vulkan, "vkGetInstanceProcAddr"));
+	if (get_instance_proc_addr == nullptr) {
+		Host::Fail("libvulkan.so.1 exports no vkGetInstanceProcAddr");
+	}
+#endif
 	const std::span<const char* const> extensions =
 	    window != nullptr && window->extensions != nullptr
 	        ? std::span<const char* const>(window->extensions, window->extensionCount)

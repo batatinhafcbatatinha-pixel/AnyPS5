@@ -374,5 +374,797 @@
     ],
     "play_cmd": "@echo off\r\nrem Starts this game (converted by the launcher with tools/ps5port).\r\npython \"%~dp0..\\..\\..\\tools\\ps5port\\ps5port.py\" play --port \"%~dp0.\"\r\nexit /b %errorlevel%\r\n",
     "pc_menu": false
+  },
+  "linux": {
+    "exe": "build/out/app.elf",
+    "packages": {
+      "apt": [
+        "libvulkan1",
+        "mesa-vulkan-drivers",
+        "libx11-6",
+        "libxext6",
+        "libxrandr2",
+        "libxkbcommon0",
+        "libwayland-client0",
+        "libpulse0"
+      ],
+      "apt-get": [
+        "libvulkan1",
+        "mesa-vulkan-drivers",
+        "libx11-6",
+        "libxext6",
+        "libxrandr2",
+        "libxkbcommon0",
+        "libwayland-client0",
+        "libpulse0"
+      ],
+      "dnf": [
+        "vulkan-loader",
+        "mesa-vulkan-drivers",
+        "libX11",
+        "libXext",
+        "libXrandr",
+        "libxkbcommon",
+        "libwayland-client",
+        "pulseaudio-libs"
+      ],
+      "pacman": [
+        "vulkan-icd-loader",
+        "mesa",
+        "libx11",
+        "libxext",
+        "libxrandr",
+        "libxkbcommon",
+        "wayland",
+        "libpulse"
+      ],
+      "zypper": [
+        "libvulkan1",
+        "libX11-6",
+        "libXext6",
+        "libXrandr2",
+        "libxkbcommon0",
+        "libwayland-client0",
+        "libpulse0"
+      ]
+    },
+    "deps": {
+      "buildtools_gb": 0,
+      "python_gb": 0.1,
+      "tools": []
+    },
+    "groups": [
+      {
+        "pt": "Vídeo",
+        "en": "Video",
+        "items": [
+          {
+            "key": "modo",
+            "pt": "Modo de exibição",
+            "en": "Display mode",
+            "default": 0,
+            "help_pt": "Janela ou tela cheia na resolução da área de trabalho. F11 troca durante o jogo.",
+            "help_en": "Window or fullscreen at the desktop resolution. F11 switches while playing.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Janela",
+                "en": "Window"
+              },
+              {
+                "v": 1,
+                "pt": "Tela cheia",
+                "en": "Fullscreen"
+              }
+            ]
+          },
+          {
+            "key": "res",
+            "pt": "Resolução do jogo",
+            "en": "Game resolution",
+            "default": 1,
+            "help_pt": "A saída de vídeo que o console informa ao jogo. Jogos que escolhem a própria resolução ignoram.",
+            "help_en": "The video output the console reports to the game. Games that pick their own resolution ignore it.",
+            "choices": [
+              {
+                "v": 1,
+                "pt": "1080p",
+                "en": "1080p"
+              },
+              {
+                "v": 2,
+                "pt": "4K (2160p)",
+                "en": "4K (2160p)"
+              },
+              {
+                "v": 0,
+                "pt": "Automática (a do monitor)",
+                "en": "Automatic (the monitor's)"
+              }
+            ],
+            "restart": true
+          },
+          {
+            "key": "vsync",
+            "pt": "Sincronização vertical",
+            "en": "Vertical sync",
+            "default": 0,
+            "help_pt": "Ligada espera o monitor. Sem cortes troca pelo quadro mais novo; Desligada pode cortar a imagem.",
+            "help_en": "On waits for the monitor. Without tearing shows the newest frame; Off can tear.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Ligada",
+                "en": "On"
+              },
+              {
+                "v": 1,
+                "pt": "Desligada sem cortes (mailbox)",
+                "en": "Off without tearing (mailbox)"
+              },
+              {
+                "v": 2,
+                "pt": "Desligada",
+                "en": "Off"
+              }
+            ],
+            "restart": true
+          },
+          {
+            "key": "fps_limit",
+            "pt": "Limite de quadros",
+            "en": "Frame limit",
+            "default": 0,
+            "help_pt": "Máximo de quadros por segundo que a janela apresenta. Limitar reduz o uso de CPU, GPU e energia quando o jogo passa do limite. Requer um runtime AnyPS5 mais novo que o v0.1.4 (build local via ANYPS5_RELINKER/ANYPS5_LIBS); o v0.1.4 ignora esta opção.",
+            "help_en": "Most frames per second the window presents. A limit lowers CPU, GPU and power use when the game runs above it. Needs an AnyPS5 runtime newer than v0.1.4 (a local build through ANYPS5_RELINKER/ANYPS5_LIBS); v0.1.4 ignores this setting.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Sem limite",
+                "en": "No limit"
+              },
+              {
+                "v": 30,
+                "pt": "30 fps",
+                "en": "30 fps"
+              },
+              {
+                "v": 60,
+                "pt": "60 fps",
+                "en": "60 fps"
+              },
+              {
+                "v": 120,
+                "pt": "120 fps",
+                "en": "120 fps"
+              }
+            ]
+          },
+          {
+            "key": "upscale",
+            "pt": "Ampliação da imagem",
+            "en": "Upscaling",
+            "default": 0,
+            "help_pt": "Como a imagem do jogo é ampliada quando a janela é maior que ela. FSR 1 dá mais nitidez que o bilinear; com Resolução do jogo em 1080p num monitor maior, o jogo renderiza menos pixels e o FSR amplia. Requer um runtime AnyPS5 mais novo que o v0.1.4 (build local via ANYPS5_RELINKER/ANYPS5_LIBS); o v0.1.4 ignora esta opção.",
+            "help_en": "How the game's image is scaled when the window is larger than it. FSR 1 is sharper than bilinear; with Game resolution at 1080p on a larger monitor the game renders fewer pixels and FSR scales them up. Needs an AnyPS5 runtime newer than v0.1.4 (a local build through ANYPS5_RELINKER/ANYPS5_LIBS); v0.1.4 ignores this setting.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Bilinear",
+                "en": "Bilinear"
+              },
+              {
+                "v": 1,
+                "pt": "AMD FSR 1",
+                "en": "AMD FSR 1"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pt": "Sistema",
+        "en": "System",
+        "items": [
+          {
+            "key": "show_fps",
+            "pt": "Mostrar desempenho",
+            "en": "Show performance",
+            "default": 0,
+            "help_pt": "Painel com FPS e tempos de quadro desde o início. F10 troca durante o jogo.",
+            "help_en": "Panel with FPS and frame times from the start. F10 switches while playing.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Não",
+                "en": "No"
+              },
+              {
+                "v": 1,
+                "pt": "FPS",
+                "en": "FPS"
+              },
+              {
+                "v": 2,
+                "pt": "Detalhado",
+                "en": "Detailed"
+              }
+            ]
+          },
+          {
+            "key": "overlay_pos",
+            "pt": "Posição do painel",
+            "en": "Panel position",
+            "default": 0,
+            "help_pt": "Canto da tela do painel de desempenho.",
+            "help_en": "Screen corner of the performance panel.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Superior esquerdo",
+                "en": "Top left"
+              },
+              {
+                "v": 1,
+                "pt": "Superior direito",
+                "en": "Top right"
+              },
+              {
+                "v": 2,
+                "pt": "Inferior esquerdo",
+                "en": "Bottom left"
+              },
+              {
+                "v": 3,
+                "pt": "Inferior direito",
+                "en": "Bottom right"
+              }
+            ]
+          },
+          {
+            "key": "language",
+            "pt": "Idioma do console",
+            "en": "Console language",
+            "default": -1,
+            "help_pt": "O idioma que o jogo recebe do console; o jogo usa se tiver textos nele.",
+            "help_en": "The language the game gets from the console; the game uses it when it has text in it.",
+            "choices": [
+              {
+                "v": -1,
+                "pt": "Automático (idioma do sistema)",
+                "en": "Automatic (system language)"
+              },
+              {
+                "v": 17,
+                "pt": "Português (Brasil)",
+                "en": "Portuguese (Brazil)"
+              },
+              {
+                "v": 7,
+                "pt": "Português (Portugal)",
+                "en": "Portuguese (Portugal)"
+              },
+              {
+                "v": 1,
+                "pt": "Inglês (EUA)",
+                "en": "English (United States)"
+              },
+              {
+                "v": 18,
+                "pt": "Inglês (Reino Unido)",
+                "en": "English (United Kingdom)"
+              },
+              {
+                "v": 3,
+                "pt": "Espanhol (Espanha)",
+                "en": "Spanish (Spain)"
+              },
+              {
+                "v": 20,
+                "pt": "Espanhol (América Latina)",
+                "en": "Spanish (Latin America)"
+              },
+              {
+                "v": 2,
+                "pt": "Francês",
+                "en": "French"
+              },
+              {
+                "v": 4,
+                "pt": "Alemão",
+                "en": "German"
+              },
+              {
+                "v": 5,
+                "pt": "Italiano",
+                "en": "Italian"
+              },
+              {
+                "v": 6,
+                "pt": "Holandês",
+                "en": "Dutch"
+              },
+              {
+                "v": 8,
+                "pt": "Russo",
+                "en": "Russian"
+              },
+              {
+                "v": 16,
+                "pt": "Polonês",
+                "en": "Polish"
+              },
+              {
+                "v": 19,
+                "pt": "Turco",
+                "en": "Turkish"
+              },
+              {
+                "v": 0,
+                "pt": "Japonês",
+                "en": "Japanese"
+              },
+              {
+                "v": 9,
+                "pt": "Coreano",
+                "en": "Korean"
+              },
+              {
+                "v": 11,
+                "pt": "Chinês (simplificado)",
+                "en": "Chinese (Simplified)"
+              },
+              {
+                "v": 10,
+                "pt": "Chinês (tradicional)",
+                "en": "Chinese (Traditional)"
+              }
+            ]
+          },
+          {
+            "key": "volume",
+            "pt": "Volume",
+            "en": "Volume",
+            "default": 100,
+            "help_pt": "Volume inicial (F5/F6 mudam durante o jogo, F8 silencia).",
+            "help_en": "Starting volume (F5/F6 change it while playing, F8 mutes).",
+            "min": 0,
+            "max": 100,
+            "step": 5
+          },
+          {
+            "key": "mute_unfocused",
+            "pt": "Silenciar em segundo plano",
+            "en": "Mute in background",
+            "default": 0,
+            "help_pt": "Silencia o jogo quando a janela perde o foco.",
+            "help_en": "Mutes the game while its window is not focused.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Não",
+                "en": "No"
+              },
+              {
+                "v": 1,
+                "pt": "Sim",
+                "en": "Yes"
+              }
+            ]
+          },
+          {
+            "key": "vibration",
+            "pt": "Vibração do controle",
+            "en": "Controller vibration",
+            "default": 100,
+            "help_pt": "Força da vibração; 0 desliga.",
+            "help_en": "Vibration strength; 0 turns it off.",
+            "min": 0,
+            "max": 100,
+            "step": 10
+          }
+        ]
+      }
+    ],
+    "generic": {
+      "play": "Play.cmd",
+      "exe": "build/out/app.elf",
+      "disk_gb": 1,
+      "download_gb": 0.3,
+      "minutes": "1-5",
+      "tools": [],
+      "buildtools": false,
+      "gb_per_job": 1,
+      "link_game": true,
+      "steps": [
+        {
+          "name": "Convert the game for PC (AnyPS5 relinker)",
+          "run": [
+            "{python}",
+            "../../../tools/ps5port/ps5port.py",
+            "build",
+            "--port",
+            "{root}"
+          ],
+          "done_if": "build/out/app.elf"
+        }
+      ],
+      "pc_menu": false,
+      "play_sh": "#!/usr/bin/env bash\n# Starts this game (converted by the launcher with tools/ps5port).\nhere=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nexec \"${PYTHON:-python3}\" \"$here/../../../tools/ps5port/ps5port.py\" play --port \"$here\" \"$@\"\n"
+    }
+  },
+  "macos": {
+    "exe": "build/out/app",
+    "packages": {
+      "brew": [
+        "cmake",
+        "ninja",
+        "pkg-config"
+      ]
+    },
+    "deps": {
+      "buildtools_gb": 1.5,
+      "python_gb": 0.1,
+      "tools": []
+    },
+    "groups": [
+      {
+        "pt": "Vídeo",
+        "en": "Video",
+        "items": [
+          {
+            "key": "modo",
+            "pt": "Modo de exibição",
+            "en": "Display mode",
+            "default": 0,
+            "help_pt": "Janela ou tela cheia na resolução da área de trabalho. F11 troca durante o jogo.",
+            "help_en": "Window or fullscreen at the desktop resolution. F11 switches while playing.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Janela",
+                "en": "Window"
+              },
+              {
+                "v": 1,
+                "pt": "Tela cheia",
+                "en": "Fullscreen"
+              }
+            ]
+          },
+          {
+            "key": "res",
+            "pt": "Resolução do jogo",
+            "en": "Game resolution",
+            "default": 1,
+            "help_pt": "A saída de vídeo que o console informa ao jogo. Jogos que escolhem a própria resolução ignoram.",
+            "help_en": "The video output the console reports to the game. Games that pick their own resolution ignore it.",
+            "choices": [
+              {
+                "v": 1,
+                "pt": "1080p",
+                "en": "1080p"
+              },
+              {
+                "v": 2,
+                "pt": "4K (2160p)",
+                "en": "4K (2160p)"
+              },
+              {
+                "v": 0,
+                "pt": "Automática (a do monitor)",
+                "en": "Automatic (the monitor's)"
+              }
+            ],
+            "restart": true
+          },
+          {
+            "key": "vsync",
+            "pt": "Sincronização vertical",
+            "en": "Vertical sync",
+            "default": 0,
+            "help_pt": "Ligada espera o monitor. Sem cortes troca pelo quadro mais novo; Desligada pode cortar a imagem.",
+            "help_en": "On waits for the monitor. Without tearing shows the newest frame; Off can tear.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Ligada",
+                "en": "On"
+              },
+              {
+                "v": 1,
+                "pt": "Desligada sem cortes (mailbox)",
+                "en": "Off without tearing (mailbox)"
+              },
+              {
+                "v": 2,
+                "pt": "Desligada",
+                "en": "Off"
+              }
+            ],
+            "restart": true
+          },
+          {
+            "key": "fps_limit",
+            "pt": "Limite de quadros",
+            "en": "Frame limit",
+            "default": 0,
+            "help_pt": "Máximo de quadros por segundo que a janela apresenta. Limitar reduz o uso de CPU, GPU e energia quando o jogo passa do limite. Requer um runtime AnyPS5 mais novo que o v0.1.4 (build local via ANYPS5_RELINKER/ANYPS5_LIBS); o v0.1.4 ignora esta opção.",
+            "help_en": "Most frames per second the window presents. A limit lowers CPU, GPU and power use when the game runs above it. Needs an AnyPS5 runtime newer than v0.1.4 (a local build through ANYPS5_RELINKER/ANYPS5_LIBS); v0.1.4 ignores this setting.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Sem limite",
+                "en": "No limit"
+              },
+              {
+                "v": 30,
+                "pt": "30 fps",
+                "en": "30 fps"
+              },
+              {
+                "v": 60,
+                "pt": "60 fps",
+                "en": "60 fps"
+              },
+              {
+                "v": 120,
+                "pt": "120 fps",
+                "en": "120 fps"
+              }
+            ]
+          },
+          {
+            "key": "upscale",
+            "pt": "Ampliação da imagem",
+            "en": "Upscaling",
+            "default": 0,
+            "help_pt": "Como a imagem do jogo é ampliada quando a janela é maior que ela. FSR 1 dá mais nitidez que o bilinear; com Resolução do jogo em 1080p num monitor maior, o jogo renderiza menos pixels e o FSR amplia. Requer um runtime AnyPS5 mais novo que o v0.1.4 (build local via ANYPS5_RELINKER/ANYPS5_LIBS); o v0.1.4 ignora esta opção.",
+            "help_en": "How the game's image is scaled when the window is larger than it. FSR 1 is sharper than bilinear; with Game resolution at 1080p on a larger monitor the game renders fewer pixels and FSR scales them up. Needs an AnyPS5 runtime newer than v0.1.4 (a local build through ANYPS5_RELINKER/ANYPS5_LIBS); v0.1.4 ignores this setting.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Bilinear",
+                "en": "Bilinear"
+              },
+              {
+                "v": 1,
+                "pt": "AMD FSR 1",
+                "en": "AMD FSR 1"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "pt": "Sistema",
+        "en": "System",
+        "items": [
+          {
+            "key": "show_fps",
+            "pt": "Mostrar desempenho",
+            "en": "Show performance",
+            "default": 0,
+            "help_pt": "Painel com FPS e tempos de quadro desde o início. F10 troca durante o jogo.",
+            "help_en": "Panel with FPS and frame times from the start. F10 switches while playing.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Não",
+                "en": "No"
+              },
+              {
+                "v": 1,
+                "pt": "FPS",
+                "en": "FPS"
+              },
+              {
+                "v": 2,
+                "pt": "Detalhado",
+                "en": "Detailed"
+              }
+            ]
+          },
+          {
+            "key": "overlay_pos",
+            "pt": "Posição do painel",
+            "en": "Panel position",
+            "default": 0,
+            "help_pt": "Canto da tela do painel de desempenho.",
+            "help_en": "Screen corner of the performance panel.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Superior esquerdo",
+                "en": "Top left"
+              },
+              {
+                "v": 1,
+                "pt": "Superior direito",
+                "en": "Top right"
+              },
+              {
+                "v": 2,
+                "pt": "Inferior esquerdo",
+                "en": "Bottom left"
+              },
+              {
+                "v": 3,
+                "pt": "Inferior direito",
+                "en": "Bottom right"
+              }
+            ]
+          },
+          {
+            "key": "language",
+            "pt": "Idioma do console",
+            "en": "Console language",
+            "default": -1,
+            "help_pt": "O idioma que o jogo recebe do console; o jogo usa se tiver textos nele.",
+            "help_en": "The language the game gets from the console; the game uses it when it has text in it.",
+            "choices": [
+              {
+                "v": -1,
+                "pt": "Automático (idioma do sistema)",
+                "en": "Automatic (system language)"
+              },
+              {
+                "v": 17,
+                "pt": "Português (Brasil)",
+                "en": "Portuguese (Brazil)"
+              },
+              {
+                "v": 7,
+                "pt": "Português (Portugal)",
+                "en": "Portuguese (Portugal)"
+              },
+              {
+                "v": 1,
+                "pt": "Inglês (EUA)",
+                "en": "English (United States)"
+              },
+              {
+                "v": 18,
+                "pt": "Inglês (Reino Unido)",
+                "en": "English (United Kingdom)"
+              },
+              {
+                "v": 3,
+                "pt": "Espanhol (Espanha)",
+                "en": "Spanish (Spain)"
+              },
+              {
+                "v": 20,
+                "pt": "Espanhol (América Latina)",
+                "en": "Spanish (Latin America)"
+              },
+              {
+                "v": 2,
+                "pt": "Francês",
+                "en": "French"
+              },
+              {
+                "v": 4,
+                "pt": "Alemão",
+                "en": "German"
+              },
+              {
+                "v": 5,
+                "pt": "Italiano",
+                "en": "Italian"
+              },
+              {
+                "v": 6,
+                "pt": "Holandês",
+                "en": "Dutch"
+              },
+              {
+                "v": 8,
+                "pt": "Russo",
+                "en": "Russian"
+              },
+              {
+                "v": 16,
+                "pt": "Polonês",
+                "en": "Polish"
+              },
+              {
+                "v": 19,
+                "pt": "Turco",
+                "en": "Turkish"
+              },
+              {
+                "v": 0,
+                "pt": "Japonês",
+                "en": "Japanese"
+              },
+              {
+                "v": 9,
+                "pt": "Coreano",
+                "en": "Korean"
+              },
+              {
+                "v": 11,
+                "pt": "Chinês (simplificado)",
+                "en": "Chinese (Simplified)"
+              },
+              {
+                "v": 10,
+                "pt": "Chinês (tradicional)",
+                "en": "Chinese (Traditional)"
+              }
+            ]
+          },
+          {
+            "key": "volume",
+            "pt": "Volume",
+            "en": "Volume",
+            "default": 100,
+            "help_pt": "Volume inicial (F5/F6 mudam durante o jogo, F8 silencia).",
+            "help_en": "Starting volume (F5/F6 change it while playing, F8 mutes).",
+            "min": 0,
+            "max": 100,
+            "step": 5
+          },
+          {
+            "key": "mute_unfocused",
+            "pt": "Silenciar em segundo plano",
+            "en": "Mute in background",
+            "default": 0,
+            "help_pt": "Silencia o jogo quando a janela perde o foco.",
+            "help_en": "Mutes the game while its window is not focused.",
+            "choices": [
+              {
+                "v": 0,
+                "pt": "Não",
+                "en": "No"
+              },
+              {
+                "v": 1,
+                "pt": "Sim",
+                "en": "Yes"
+              }
+            ]
+          },
+          {
+            "key": "vibration",
+            "pt": "Vibração do controle",
+            "en": "Controller vibration",
+            "default": 100,
+            "help_pt": "Força da vibração; 0 desliga.",
+            "help_en": "Vibration strength; 0 turns it off.",
+            "min": 0,
+            "max": 100,
+            "step": 10
+          }
+        ]
+      }
+    ],
+    "generic": {
+      "play": "Play.cmd",
+      "exe": "build/out/app",
+      "disk_gb": 15,
+      "download_gb": 2,
+      "minutes": "90-300",
+      "tools": [],
+      "buildtools": false,
+      "gb_per_job": 1,
+      "link_game": true,
+      "steps": [
+        {
+          "name": "Convert the game for PC (AnyPS5 relinker)",
+          "run": [
+            "{python}",
+            "../../../tools/ps5port/ps5port.py",
+            "build",
+            "--port",
+            "{root}"
+          ],
+          "done_if": "build/out/app"
+        }
+      ],
+      "pc_menu": false,
+      "play_sh": "#!/usr/bin/env bash\n# Starts this game (converted by the launcher with tools/ps5port).\nhere=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nexec \"${PYTHON:-python3}\" \"$here/../../../tools/ps5port/ps5port.py\" play --port \"$here\" \"$@\"\n"
+    }
   }
 }

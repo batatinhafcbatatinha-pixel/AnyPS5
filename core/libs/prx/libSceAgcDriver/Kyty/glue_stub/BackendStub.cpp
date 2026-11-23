@@ -1,4 +1,4 @@
-// The VRAM-resident GPU backend is Windows only; on other hosts it is never enabled and the
+// The VRAM-resident GPU backend is built on Windows (and on Linux with ANYPS5_KYTY_GPU_LINUX); where it is not, it is never enabled and the
 // entry points below are unreachable (callers check Enabled() first).
 
 #include "prx/libSceAgcDriver/Kyty/glue/Backend.hpp"
