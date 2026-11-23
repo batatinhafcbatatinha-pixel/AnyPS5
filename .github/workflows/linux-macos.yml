@@ -111,6 +111,7 @@ jobs:
 
   runtime-linux:
     name: system libraries, Linux${{ matrix.gpu == 'on' && ' with the VRAM-resident GPU backend' || '' }}
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     continue-on-error: ${{ matrix.gpu == 'on' }}
