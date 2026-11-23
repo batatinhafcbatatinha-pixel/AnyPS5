@@ -111,7 +111,6 @@ jobs:
 
   runtime-linux:
     name: system libraries, Linux${{ matrix.gpu == 'on' && ' with the VRAM-resident GPU backend' || '' }}
-    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     continue-on-error: ${{ matrix.gpu == 'on' }}
@@ -143,7 +142,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DANYPS5_KYTY_GPU_LINUX=${{ matrix.gpu == 'on' && 'ON' || 'OFF' }}
       - name: Build the system libraries
-        run: cmake --build build --target libs --parallel
+        run: cmake --build build --target libs --parallel -- -k 0
       - name: The libraries exist
         run: |
           test -f build/core/libs/libs/libkernel.prx
