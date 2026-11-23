@@ -2,8 +2,6 @@
 
 **English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [Català](docs/user/README.ca.md) | [Italiano](docs/user/README.it.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md) | [Bahasa Indonesia](docs/user/README.id.md) | [Polski](docs/user/README.pl.md) | [日本語](docs/user/README.ja.md) | [العربية](docs/user/README.ar.md) | [Ελληνικά](docs/user/README.el.md) | [Türkçe](docs/user/README.tr.md)
 
-**English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [Català](docs/user/README.ca.md) | [Italiano](docs/user/README.it.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md) | [Bahasa Indonesia](docs/user/README.id.md) | [Polski](docs/user/README.pl.md) | [日本語](docs/user/README.ja.md)
-
 Fork of [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), a relinker that converts PlayStation 5 executables
 into native Windows and Linux programs (no emulation: the PS5's Zen 2 code runs as it is, the system libraries are
 reimplemented). This fork adds the launcher the other recompilers use, so a game is converted and started from
@@ -56,7 +54,6 @@ Every PS5 game takes the same generic path; there are no per-game profiles.
   in `build/out/game-log.txt`), `env` (print those variables)
 - launcher + one-click convert/play (`Launcher.cmd`, `launcher.json`, [port-installer](https://github.com/batatinhafcbatatinha-pixel/port-installer)
   submodule in `tools/port-installer`)
-- the AnyPS5 code itself is upstream's, unchanged
 
 ## Building
 
