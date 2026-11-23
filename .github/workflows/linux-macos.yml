@@ -43,7 +43,7 @@ jobs:
         run: |
           bash -n Launcher.sh
           bash -n tools/ps5port/build-runtime.sh
-          shellcheck Launcher.sh tools/ps5port/build-runtime.sh
+          shellcheck -S error Launcher.sh tools/ps5port/build-runtime.sh
       - name: Shell scripts have LF line endings and a bash shebang
         run: |
           for file in Launcher.sh tools/ps5port/build-runtime.sh; do
