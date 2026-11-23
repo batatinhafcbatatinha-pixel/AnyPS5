@@ -753,7 +753,12 @@ bool CopyOpened(uint64_t address, void* data, uint64_t bytes, bool write) {
 	// The protection a reduced page opens to, or 0 for a page the tracker left alone.
 	const auto target = [&](uint64_t page) -> DWORD {
 		const auto found = originals.find(page);
-		return found == originals.end() ? 0 : write ? PAGE_READWRITE : found->second;
+#ifdef _WIN32
+		const DWORD writable = PAGE_READWRITE;
+#else
+		const DWORD writable = PROT_READ | PROT_WRITE;
+#endif
+		return found == originals.end() ? 0 : write ? writable : found->second;
 	};
 	for (uint64_t page = begin; page < end;) {
 		Region memory;
