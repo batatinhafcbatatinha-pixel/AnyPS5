@@ -153,8 +153,7 @@ bool QueryRegion(uint64_t address, Region& out) {
 		const char* end  = buffer + kept + got;
 		const char* line = buffer;
 		for (const char* scan = buffer; scan < end && !done; ++scan) {
-			if (*scan != '
-') {
+			if (*scan != '\n') {
 				continue;
 			}
 			done = ParseMapsLine(line, scan, address, out);
