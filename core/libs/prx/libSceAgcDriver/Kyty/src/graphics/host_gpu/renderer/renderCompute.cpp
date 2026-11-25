@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/cutSwitch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -276,6 +277,15 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		return;
 	}
 	auto& cache = context.GetBufferCache();
+	// AnyPS5: unless APS5_KYTY_X_CUT_ON lists p (see cutSwitch.h) the counts of an indirect
+	// dispatch are read on the CPU and size the binding, as before the KytyPS5 8ebe9a09 port.
+	static const bool gpu_counts = CutEnabled('p');
+	if (indirect && !gpu_counts) {
+		indirect = false;
+		cache.ReadMemory(input.indirect_args_address, sizeof(vk::DispatchIndirectCommand));
+		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(input.indirect_args_address),
+		            sizeof(input.workgroup_counts));
+	}
 	// LDS has no contents to preserve between dispatches. The existing shader hazard
 	// barriers also order other users of this GPU-only utility buffer.
 	auto& storage = context.GetCommandScheduler().InSide() ? cache.GetSideSharedMemoryBuffer()

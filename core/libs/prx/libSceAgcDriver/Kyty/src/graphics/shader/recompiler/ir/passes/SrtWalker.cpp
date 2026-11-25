@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "common/fastTls.h"
+#include "graphics/host_gpu/cutSwitch.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -208,7 +209,9 @@ thread_local const char* t_walker_scalar_off     = nullptr; // PROBE: why deferr
 
 // 1 when a branch-only load at address reads as unknown, else 0.
 uint64_t WalkerConditionPendingEntry(uint64_t address) {
-	if (!t_walker_defers_conditions) return 0;
+	// AnyPS5: off unless APS5_KYTY_X_CUT_ON lists p (see cutSwitch.h).
+	static const bool enabled = Libs::Graphics::CutEnabled('p');
+	if (!enabled || !t_walker_defers_conditions) return 0;
 	const auto function = g_walker_gpu_pending.load(std::memory_order_relaxed);
 	if (function == nullptr || !function(address)) return 0;
 	WalkerDeferred().push_back(address);
@@ -1925,8 +1928,9 @@ bool TakeWalkerDeferredConditions(std::vector<uint64_t>& addresses) {
 
 bool GpuScalarEnabled() {
 	static const bool enabled = [] {
+		// AnyPS5: off unless APS5_KYTY_X_CUT_ON lists s (see cutSwitch.h).
 		const char* value = std::getenv("APS5_KYTY_GPU_SCALAR");
-		return value == nullptr || value[0] != '0';
+		return Libs::Graphics::CutEnabled('s') && (value == nullptr || value[0] != '0');
 	}();
 	return enabled;
 }

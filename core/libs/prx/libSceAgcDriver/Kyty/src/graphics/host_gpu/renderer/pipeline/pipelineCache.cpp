@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/cutSwitch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -248,9 +249,10 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 namespace {
 
 // APS5_KYTY_X_RT with the letter w keeps every wave64 compute program on the lane-pair emission.
+// AnyPS5: off unless APS5_KYTY_X_CUT_ON lists w (see cutSwitch.h).
 bool WaveSplitAllowed() {
 	const char* value = std::getenv("APS5_KYTY_X_RT");
-	return value == nullptr || std::strchr(value, 'w') == nullptr;
+	return CutEnabled('w') && (value == nullptr || std::strchr(value, 'w') == nullptr);
 }
 
 } // namespace

@@ -969,6 +969,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 }
 
 bool BufferCache::WriteInGpuOrder(uint64_t vaddr, const void* data, uint64_t size) {
+	static const bool enabled = CutEnabled('k');
+	if (!enabled) {
+		return false;
+	}
 	// Pages without GPU writes take the CPU write: it faults at most to mark them CPU-modified.
 	// So do pages with an image write-back pending, whose fault waits for it to land before the
 	// write. vkCmdUpdateBuffer takes dword-aligned ranges up to 64 KiB.
@@ -1015,6 +1019,10 @@ void BufferCache::StoreCpKnown(uint64_t vaddr, const void* data, uint64_t size) 
 }
 
 void BufferCache::NoteCpKnown(uint64_t vaddr, const void* data, uint64_t size) {
+	static const bool enabled = CutEnabled('k');
+	if (!enabled) {
+		return;
+	}
 	// Only bytes a GPU-ordered write left pending need it; others are current in guest memory.
 	if (!GuestGpu::IsGpuThread() || (vaddr & 3u) != 0 || (size & 3u) != 0 || size == 0 || size > 4096 ||
 	    !GuestRange {vaddr, size}.Valid() || !m_gpu_modified_ranges.Contains(vaddr, size)) {
@@ -1035,7 +1043,8 @@ void BufferCache::NoteCpFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 bool BufferCache::KnownBytes(uint64_t vaddr, uint64_t size, void* data) {
 	// The bytes a GPU copy recorded now reads: the command processor's known values, or guest
 	// memory where no GPU write or pending read-back covers them.
-	if (!GuestGpu::IsGpuThread() || !GuestRange {vaddr, size}.Valid()) {
+	static const bool enabled = CutEnabled('k');
+	if (!enabled || !GuestGpu::IsGpuThread() || !GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
 	if (CpKnownWords(vaddr, size, data)) {

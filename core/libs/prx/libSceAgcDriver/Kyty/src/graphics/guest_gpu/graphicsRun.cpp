@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/cutSwitch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -982,8 +983,10 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	// Thread counts a GPU write the host lacks covers stay on the GPU: the executor derives the
 	// groups and the program's extents there. Ordered append splits the dispatch per group on the
 	// host, so it keeps reading them.
+	// AnyPS5: off unless APS5_KYTY_X_CUT_ON lists p (see cutSwitch.h).
+	static const bool gpu_counts = CutEnabled('p');
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0 &&
-	    ((mode & ORDERED_APPEND_ENABLE) != 0 ||
+	    ((mode & ORDERED_APPEND_ENABLE) != 0 || !gpu_counts ||
 	     !m_renderer.GetBufferCache().HasPendingGpuWrite(args_addr, sizeof(vk::DispatchIndirectCommand)))) {
 		// AnyPS5: the arguments may be a GPU write still in flight or held only by a cache
 		// buffer: read them through the buffer cache, as the dispatch would see them, not from
