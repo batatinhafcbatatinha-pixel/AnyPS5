@@ -196,6 +196,25 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 }
 
+void Buffer::Update(uint64_t offset, const void* data, uint64_t size) {
+	if (((offset | size) & 3u) != 0 || size == 0 || size > 65536 || offset > Size() ||
+	    size > Size() - offset) {
+		EXIT("Buffer: invalid update range\n");
+	}
+	auto& command = Scheduler().Current();
+	command.EndRendering();
+	const auto before = Barrier(offset, size, MEMORY_ACCESS, vk::AccessFlagBits::eTransferWrite);
+	const auto native = command.Handle();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+	                       0, nullptr, 1, &before, 0, nullptr);
+	native.updateBuffer(Handle(), offset, size, data);
+	const auto after = Barrier(offset, size, vk::AccessFlagBits::eTransferWrite, MEMORY_ACCESS);
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+}
+
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size)
     : Buffer(graphics, scheduler, usage, 0,

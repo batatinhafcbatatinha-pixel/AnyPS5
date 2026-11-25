@@ -40,6 +40,10 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// Scalar-slot variant (SrtRuntime::scalar_slots): per scalar read whose word a GPU write
+	// holds, the flattened word of its device address (low, high follows) and its guest address.
+	// The renderer fills in the address of the cache buffer bytes when it binds the stage.
+	std::vector<std::pair<uint32_t, uint64_t>> gpu_scalar_words;
 	UniformFill                 uniform_fill;
 };
 

@@ -636,6 +636,53 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	return result;
 }
 
+// Scalar-slot variant: each scalar read takes its value from the device address the host leaves
+// in the flattened SRT after the reads (IR::ScalarAddressWord) when that address is not 0. The
+// host leaves one for a word a GPU write holds that the walk did not wait for: the address of the
+// cache buffer bytes the write went to, read after the barrier that follows the writer. Slots the
+// host reads itself (global bases, the traced TLAS) keep the flattened value; the pipeline cache
+// does not defer them.
+static void LoadGpuScalarSlots(IR::Program& ir, bool traced) {
+	const auto count     = static_cast<uint32_t>(ir.srt_reads.size());
+	const auto host_slot = [&](uint32_t slot) {
+		return std::ranges::any_of(ir.info.address_bases,
+		                           [&](const auto& base) { return base[0] == slot || base[1] == slot; }) ||
+		       (traced && (ir.info.ray_query_tlas[0] == slot || ir.info.ray_query_tlas[1] == slot));
+	};
+	for (auto* block: ir.blocks) {
+		auto& list = block->Instructions();
+		for (auto it = list.begin(); it != list.end(); ++it) {
+			if (it->GetOpcode() != IR::ValueOpcode::ReadConst || it->NumArgs() != 2) continue;
+			const auto slot = it->Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != IR::Type::U32 || slot.U32() >= count ||
+			    host_slot(slot.U32())) {
+				continue;
+			}
+			auto&                      read = *it;
+			const IR::Value            flat(&read);
+			const std::vector<IR::Use> uses = read.Uses();
+			const auto                 next = std::next(it);
+			const auto                 word = IR::ScalarAddressWord(count, slot.U32());
+			const auto add = [&](IR::ValueOpcode opcode, std::initializer_list<IR::Value> args, uint64_t flags = 0) {
+				return IR::Value(&*block->PrependNewInst(next, opcode, args, flags));
+			};
+			const auto low     = add(IR::ValueOpcode::ReadConst, {read.Arg(0), IR::Value(word)}, read.Flags<uint64_t>());
+			const auto high    = add(IR::ValueOpcode::ReadConst, {read.Arg(0), IR::Value(word + 1u)},
+			                         read.Flags<uint64_t>());
+			const auto present = add(IR::ValueOpcode::INotEqual32,
+			                         {add(IR::ValueOpcode::BitwiseOr32, {low, high}), IR::Value(0u)});
+			const auto loaded  = add(IR::ValueOpcode::LoadDeviceAddressU32, {low, high, IR::Value(0u), present});
+			const auto value   = add(IR::ValueOpcode::SelectU32, {present, loaded, flat});
+			for (const auto& use: uses) use.user->SetArg(use.operand, value);
+			for (auto* other: ir.blocks) {
+				if (other->condition.Resolve() == flat) other->condition = value;
+				if (other->indirect_target.Resolve() == flat) other->indirect_target = value;
+			}
+			it = std::prev(next);
+		}
+	}
+}
+
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword, uint32_t push_data_ceiling) {
@@ -686,12 +733,14 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	uint32_t traced = 0;
 	if (options.profile->ray_query) {
-		if (const auto traced = IR::TraceTraversalsWithRayQueries(ir); traced != 0) {
+		if (traced = IR::TraceTraversalsWithRayQueries(ir); traced != 0) {
 			LOGF("ShaderRecompiler %s ray query traversals: hash=0x%016" PRIx64 " loops=%u\n",
 			     stage, ir.shader_hash, traced);
 		}
 	}
+	if (options.scalar_slots) LoadGpuScalarSlots(ir, traced != 0);
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;

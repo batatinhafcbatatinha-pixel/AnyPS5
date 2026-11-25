@@ -621,6 +621,15 @@ bool Core::HandleFault(void* exception_pointers) noexcept {
 			skip_load(length, value);
 			return true;
 		}
+		// A scalar read's word a GPU write holds: the walk resumes at the load's deferral stub
+		// and the shader loads the word itself, instead of waiting for a read-back (KytyPS5
+		// b386cf25).
+		if (length != 0) {
+			if (const auto skip = IR::SrtWalkerDeferLoad(context->Rip, context->R10); skip != 0) {
+				skip_load(skip, 0);
+				return true;
+			}
+		}
 	}
 	if (!Tracked(address)) {
 		return false;

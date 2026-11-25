@@ -14,7 +14,9 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/fastTls.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/cutSwitch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -54,9 +56,21 @@ public:
 		m_thread = std::thread([this] { Run(); });
 	}
 
-	// Reserves a record with `extra` bytes after the closure; returns its start.
-	uint8_t* Reserve(size_t extra) {
-		const size_t size = (sizeof(Header) + SlotSize + extra + 15) & ~size_t {15};
+	// Room a record keeps for a closure of this type, a multiple of 16. Sized to the closure, a
+	// command of a few words fills one or two cache lines instead of four: the ring is far larger
+	// than the caches, so the GPU thread writes and the recorder thread reads fewer lines that
+	// miss (APS5_KYTY_X_CUT=b keeps the full slot; KytyPS5 b386cf25).
+	template <typename Closure>
+	static size_t ClosureRoom() noexcept {
+		static_assert(sizeof(Closure) <= SlotSize && alignof(Closure) <= 16);
+		static const bool compact = Libs::Graphics::CutEnabled('b');
+		return compact ? (sizeof(Closure) + 15) & ~size_t {15} : SlotSize;
+	}
+
+	// Reserves a record with `closure` bytes for the closure (ClosureRoom) and `extra` bytes
+	// after it; returns its start.
+	uint8_t* Reserve(size_t closure, size_t extra) {
+		const size_t size = (sizeof(Header) + closure + extra + 15) & ~size_t {15};
 		EXIT_IF(size > Bytes / 4);
 		for (;;) {
 			auto       write = m_write_local;
@@ -129,7 +143,11 @@ private:
 	void Run() {
 		m_thread_id.store(GetCurrentThreadId());
 		SetThreadDescription(GetCurrentThread(), L"Kyty_Recorder");
-		uint64_t read = 0;
+		// Reading the write position after every record pulls its cache line away from the
+		// producer, whose next publish then waits for it back: during a burst the position is
+		// read again only once the records seen are done (APS5_KYTY_X_CUT=f: after every record).
+		static const bool batched = Libs::Graphics::CutEnabled('f');
+		uint64_t          read    = 0;
 		for (;;) {
 			auto write = m_write.load(std::memory_order_acquire);
 			if (read == write) {
@@ -160,25 +178,30 @@ private:
 					m_read.store(read, std::memory_order_release);
 					m_done.store(read, std::memory_order_release);
 				}
-				write = m_write.load(std::memory_order_acquire);
+				if (!batched || read == write) {
+					write = m_write.load(std::memory_order_acquire);
+				}
 			}
 			m_read.store(read, std::memory_order_release);
 			m_done.store(read, std::memory_order_release);
 		}
 	}
 
-	uint8_t*              m_data;
-	HANDLE                m_wake = nullptr;
-	std::atomic<uint64_t> m_write {0};
-	std::atomic<uint64_t> m_read {0};
-	std::atomic<uint64_t> m_done {0};
-	std::atomic<bool>     m_sleeping {false};
-	std::atomic<DWORD>    m_thread_id {0};
-	uint64_t              m_ran = 0; // consumer only
-	uint64_t              m_write_local  = 0; // producer only
-	uint64_t              m_read_cached  = 0; // producer only
-	size_t                m_pending_size = 0; // producer only
-	std::thread           m_thread;
+	uint8_t* m_data;
+	HANDLE   m_wake = nullptr;
+	// One cache line per writer: the producer's (written every record), the consumer's (every
+	// 32 records) and the sleep flag (written when the consumer sleeps, read every record).
+	// Sharing a line made every record of one thread wait for the line the other just wrote.
+	alignas(64) std::atomic<uint64_t> m_write {0};
+	uint64_t                          m_write_local  = 0; // producer only
+	uint64_t                          m_read_cached  = 0; // producer only
+	size_t                            m_pending_size = 0; // producer only
+	alignas(64) std::atomic<uint64_t> m_read {0};
+	std::atomic<uint64_t>             m_done {0};
+	uint64_t                          m_ran = 0; // consumer only
+	alignas(64) std::atomic<bool>     m_sleeping {false};
+	std::atomic<DWORD>                m_thread_id {0};
+	alignas(64) std::thread           m_thread;
 };
 
 Ring* g_ring = nullptr;
@@ -188,6 +211,11 @@ constexpr size_t                                MaxOpen = 64;
 std::array<std::atomic<VkCommandBuffer>, MaxOpen> g_open {};
 
 std::atomic<size_t> g_open_high {0}; // slots in use are below this
+// Grows after every Open and Close: the GPU thread's last queued buffer (Queue) is still open
+// while it has not changed. Starts at 1, so the zero the TLS slots start with never matches.
+std::atomic<uint64_t>             g_open_epoch {1};
+Common::FastTls<VkCommandBuffer> t_queued;
+Common::FastTls<uint64_t>        t_queued_epoch;
 
 bool IsOpen(VkCommandBuffer buffer) noexcept {
 	const auto high = g_open_high.load(std::memory_order_acquire);
@@ -205,6 +233,7 @@ void Open(VkCommandBuffer buffer) {
 			auto high = g_open_high.load();
 			while (high < i + 1 && !g_open_high.compare_exchange_weak(high, i + 1)) {
 			}
+			g_open_epoch.fetch_add(1, std::memory_order_acq_rel);
 			return;
 		}
 	}
@@ -214,6 +243,7 @@ void Close(VkCommandBuffer buffer) {
 	for (auto& slot: g_open) {
 		VkCommandBuffer expected = buffer;
 		if (slot.compare_exchange_strong(expected, VK_NULL_HANDLE)) {
+			g_open_epoch.fetch_add(1, std::memory_order_acq_rel);
 			return;
 		}
 	}
@@ -222,10 +252,20 @@ void Close(VkCommandBuffer buffer) {
 // How a call on `buffer` runs: queued, or here (after the queue drained when the buffer is a
 // deferred one used from another thread).
 bool Queue(VkCommandBuffer buffer) {
+	// Every command of a batch asks again for the same buffer on the same thread: the answer
+	// stands until a buffer is opened or closed (APS5_KYTY_X_CUT=c asks in full every time).
+	static const bool remember = Libs::Graphics::CutEnabled('c');
+	const auto        epoch    = g_open_epoch.load(std::memory_order_acquire);
+	if (remember && buffer != VK_NULL_HANDLE && buffer == t_queued.Get() && epoch == t_queued_epoch.Get()) {
+		return true;
+	}
 	if (g_ring == nullptr || !IsOpen(buffer)) {
 		return false;
 	}
 	if (Libs::Graphics::GuestGpu::IsGpuThread()) {
+		// Read before IsOpen: a Close since then changes the epoch, so the next call asks again.
+		t_queued.Set(buffer);
+		t_queued_epoch.Set(epoch);
 		return true;
 	}
 	g_ring->Drain();
@@ -269,14 +309,17 @@ constexpr size_t Room(size_t count) {
 // Queues `run` (a closure over copies) with `extra` bytes of copies filled by `fill(Extra&)`.
 template <typename Fill, typename Make>
 void Push(size_t extra, Fill&& fill, Make&& make) {
-	auto* record = g_ring->Reserve(extra);
-	Extra copies(record + sizeof(Ring::Header) + Ring::SlotSize);
-	auto  state = fill(copies);
+	using State   = std::invoke_result_t<Fill&, Extra&>;
+	using Closure = std::decay_t<std::invoke_result_t<Make&, State&>>;
+	const auto room   = Ring::ClosureRoom<Closure>();
+	auto*      record = g_ring->Reserve(room, extra);
+	Extra      copies(record + sizeof(Ring::Header) + room);
+	auto       state = fill(copies);
 	g_ring->Publish(record, make(state));
 }
 template <typename F>
 void PushSimple(F&& run) {
-	auto* record = g_ring->Reserve(0);
+	auto* record = g_ring->Reserve(Ring::ClosureRoom<std::decay_t<F>>(), 0);
 	g_ring->Publish(record, std::forward<F>(run));
 }
 

@@ -19,15 +19,13 @@ public:
 	RangeSet& operator=(const RangeSet&) = default;
 	// A moved-from set is empty, so its recent ranges go with the ranges.
 	RangeSet(RangeSet&& other) noexcept
-	    : m_ranges(std::move(other.m_ranges)), m_recent(other.m_recent),
-	      m_recent_next(other.m_recent_next) {
+	    : m_ranges(std::move(other.m_ranges)), m_recent(other.m_recent) {
 		other.Reset();
 	}
 	RangeSet& operator=(RangeSet&& other) noexcept {
 		if (this != &other) {
-			m_ranges      = std::move(other.m_ranges);
-			m_recent      = other.m_recent;
-			m_recent_next = other.m_recent_next;
+			m_ranges = std::move(other.m_ranges);
+			m_recent = other.m_recent;
 			other.Reset();
 		}
 		return *this;
@@ -35,12 +33,10 @@ public:
 
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
-		// The same ranges are added again and again (a buffer every draw writes): one inside a
-		// range added lately is in the set already.
-		for (const auto& [begin, last]: m_recent) {
-			if (begin <= address && end <= last) {
-				return;
-			}
+		// The same ranges are added again and again (a buffer every draw writes, the spans of a
+		// table every dispatch writes): one inside a range added lately is in the set already.
+		if (Recalled(address, end)) {
+			return;
 		}
 		auto it = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
@@ -50,7 +46,7 @@ public:
 			it = m_ranges.emplace_hint(it, address, end);
 		} else {
 			if (it->second >= end) {
-				Remember(it->first, it->second);
+				Remember(address, it->first, it->second);
 				return;
 			}
 			it->second = end;
@@ -60,7 +56,7 @@ public:
 			it->second = std::max(it->second, next->second);
 			next       = m_ranges.erase(next);
 		}
-		Remember(it->first, it->second);
+		Remember(address, it->first, it->second);
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
@@ -78,10 +74,12 @@ public:
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
 			it = std::prev(it);
 		}
+		if (it != m_ranges.end() && it->first < end) {
+			Forget();
+		}
 		while (it != m_ranges.end() && it->first < end) {
 			const auto begin = it->first;
 			const auto last  = it->second;
-			Forget();
 			func(std::max(begin, address), std::min(last, end));
 			it = m_ranges.erase(it);
 			if (begin < address) {
@@ -103,7 +101,10 @@ public:
 
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
-		auto       it  = m_ranges.lower_bound(address);
+		if (Recalled(address, end)) {
+			return true;
+		}
+		auto it = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
 			return true;
 		}
@@ -112,7 +113,10 @@ public:
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
-		auto       it  = m_ranges.upper_bound(address);
+		if (Recalled(address, end)) {
+			return true;
+		}
+		auto it = m_ranges.upper_bound(address);
 		if (it == m_ranges.begin()) {
 			return false;
 		}
@@ -146,24 +150,30 @@ private:
 		return address + size;
 	}
 
-	// Ranges each inside one range of the set; a removal forgets them. Empty slots are {0, 0}.
-	void Remember(uint64_t begin, uint64_t end) {
-		m_recent[m_recent_next] = {begin, end};
-		m_recent_next           = (m_recent_next + 1) % m_recent.size();
+	// Ranges each inside one range of the set, in a slot chosen by the address of the Add that
+	// found them: an Add only grows ranges, so they stay inside, and a removal forgets them all.
+	// Repeated adds of up to a few dozen distinct ranges (the written spans of one dispatch) are
+	// answered here without a tree walk. Empty slots are {0, 0}, which hold no nonempty range.
+	static constexpr unsigned RECENT_BITS  = 5;
+	static constexpr size_t   RECENT_SLOTS = size_t {1} << RECENT_BITS;
+	[[nodiscard]] static size_t Slot(uint64_t address) noexcept {
+		return static_cast<size_t>(((address >> 4u) * 0x9e3779b97f4a7c15ull) >> (64u - RECENT_BITS));
 	}
-	void Forget() {
-		m_recent      = {};
-		m_recent_next = 0;
+	[[nodiscard]] bool Recalled(uint64_t address, uint64_t end) const noexcept {
+		const auto& [begin, last] = m_recent[Slot(address)];
+		return begin <= address && end <= last;
 	}
+	void Remember(uint64_t address, uint64_t begin, uint64_t end) noexcept {
+		m_recent[Slot(address)] = {begin, end};
+	}
+	void Forget() noexcept { m_recent = {}; }
 	void Reset() noexcept {
 		m_ranges.clear();
-		m_recent      = {};
-		m_recent_next = 0;
+		m_recent = {};
 	}
 
-	std::map<uint64_t, uint64_t>                 m_ranges;
-	std::array<std::pair<uint64_t, uint64_t>, 4> m_recent {};
-	size_t                                       m_recent_next = 0;
+	std::map<uint64_t, uint64_t>                            m_ranges;
+	std::array<std::pair<uint64_t, uint64_t>, RECENT_SLOTS> m_recent {};
 };
 
 } // namespace Libs::Graphics

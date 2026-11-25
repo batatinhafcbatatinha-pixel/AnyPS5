@@ -1956,6 +1956,22 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	});
 }
 
+void TextureCache::InvalidateMemoryFromGpuOrderedWrite(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	// Every image the bytes overlap, like the CPU write fault (InvalidateMemory), not only one
+	// starting at them. The newest bytes are the cache buffer's, not the image's: it is no longer
+	// GPU-modified, so it is neither downloaded nor written back over them, and it reloads from the
+	// buffer (InitializeImage) after the write in GPU order. Its page watches stay: guest memory is
+	// not written, so other images on the pages keep their state.
+	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
+		if (!image.Overlaps(address, size)) {
+			return;
+		}
+		image.ClearGpuModified();
+		image.MarkBufferModified();
+	});
+}
+
 bool TextureCache::HasGpuWrittenImageAt(uint64_t address) {
 	std::scoped_lock lock {m_lock};
 	bool             found = false;

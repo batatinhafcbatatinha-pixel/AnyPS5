@@ -73,9 +73,10 @@ uint64_t WalkerFastLoad(uint64_t vaddr) {
 	return (uint64_t {1} << 32u) | value;
 }
 
-// SRT-walker loads that only decide branches: whether the word holds a GPU write guest memory
-// lacks, in which case the walk takes both branches instead of waiting for a read-back (KytyPS5
-// src/kernel/memory.cpp WalkerGpuPending, commit 8ebe9a09).
+// SRT-walker loads that only decide branches or fill a scalar read's flattened slot: whether the
+// word holds a GPU write guest memory lacks, in which case the walk takes both branches, or leaves
+// the slot to the shader, instead of waiting for a read-back (KytyPS5 src/kernel/memory.cpp
+// WalkerGpuPending, commits 8ebe9a09 and b386cf25).
 bool WalkerGpuPending(uint64_t vaddr) {
 	auto* renderer = g_published.load(std::memory_order_acquire);
 	return (vaddr & 3u) == 0 && renderer != nullptr && Libs::Graphics::GuestGpu::IsGpuThread() &&

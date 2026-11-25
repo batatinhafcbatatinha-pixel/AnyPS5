@@ -22,6 +22,9 @@ struct CompileOptions {
 	uint32_t                    user_data_base  = 0;
 	uint64_t                    shader_hash     = 0;
 	bool                        runtime_srt     = false; // Variant with run-time descriptors.
+	// Scalar-slot variant: scalar reads load their value from a device address in the flattened
+	// SRT when the host left one there (IR::ScalarAddressWord).
+	bool                        scalar_slots    = false;
 	bool                        dump_ir                    = true;
 	bool                        emit_debug_info            = false;
 	const Spirv::Profile*       profile                    = &Spirv::DefaultProfile;

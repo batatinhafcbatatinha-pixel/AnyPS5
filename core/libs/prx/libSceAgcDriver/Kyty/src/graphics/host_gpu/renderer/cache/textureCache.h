@@ -75,6 +75,10 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// A command-processor write recorded in GPU order into a cache buffer (see
+	// BufferCache::WriteInGpuOrder) changed the bytes: every image over them takes its contents
+	// from the buffer at its next use, as the CPU write's fault would have made it reload them.
+	void               InvalidateMemoryFromGpuOrderedWrite(uint64_t address, uint64_t size);
 	// True when a GPU-written image starts at the address, so its newest contents live in the
 	// image rather than in guest memory or a cached buffer.
 	[[nodiscard]] bool HasGpuWrittenImageAt(uint64_t address);

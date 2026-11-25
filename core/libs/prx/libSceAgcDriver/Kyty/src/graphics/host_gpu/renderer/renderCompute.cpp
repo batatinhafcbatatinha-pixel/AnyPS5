@@ -455,6 +455,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		// at the same time; LDS emulation has a buffer of its own on the side queue.
 		bool eligible = program.info.images.empty() && !program.info.uses_dma &&
 		                !program.info.uses_gds && !program.info.uses_image_heap;
+		// GPU-written scalar reads come from cache buffers the queued work may still write.
+		eligible = eligible && resources.gpu_scalar_words.empty();
 		for (const auto kind: {Kind::Gds, Kind::BdaPagetable, Kind::FaultBuffer}) {
 			eligible = eligible && counts[static_cast<size_t>(kind)] == 0;
 		}

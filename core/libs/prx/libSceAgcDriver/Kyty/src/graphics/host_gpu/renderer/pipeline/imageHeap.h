@@ -174,6 +174,7 @@ private:
 	uint64_t                             m_suspend_draw = 0; // m_draw at the last suspend point.
 	std::vector<ShaderRecompiler::IR::ImageResource>  m_profiles;
 	std::vector<Element>                              m_elements;
+	std::vector<uint8_t>                              m_repoint_marked; // Repoint's scratch.
 	std::unordered_map<Key, uint32_t, KeyHash>        m_index;
 	std::vector<uint32_t>                             m_free;
 	std::vector<uint32_t>                             m_pending;  // Not yet resolved.

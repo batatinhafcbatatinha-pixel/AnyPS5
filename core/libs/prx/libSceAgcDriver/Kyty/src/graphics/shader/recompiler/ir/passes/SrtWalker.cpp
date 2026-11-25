@@ -11,9 +11,14 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <mutex>
+#include <set>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -173,6 +178,7 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 }
 
 Common::FastTls<const Xbyak::CodeGenerator*> t_running_walker;
+Common::FastTls<const ResourcePlan*>         t_running_plan;
 
 std::atomic<WalkerFastLoad> g_walker_fast_load {nullptr};
 
@@ -195,6 +201,10 @@ std::vector<uint64_t>& WalkerDeferred() {
 	}
 	return *list;
 }
+
+thread_local bool        t_walker_defers_scalars = false;
+thread_local bool        t_walker_scalar_faults  = false; // A load deferred since the last take.
+thread_local const char* t_walker_scalar_off     = nullptr; // PROBE: why deferral is off.
 
 // 1 when a branch-only load at address reads as unknown, else 0.
 uint64_t WalkerConditionPendingEntry(uint64_t address) {
@@ -242,7 +252,12 @@ std::atomic<uint32_t>              g_hot_next {0};
 // so their loads first ask the fast load (a call that keeps every register the walker uses and
 // the flags). When it cannot answer, the same mov runs and a fault completes it as before (a zero
 // read for unmapped memory, a read-back wait for GPU-written words).
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
+// sites, when given, receives the code offset of each guest load emitted.
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address,
+               std::vector<uint32_t>* sites = nullptr) {
+	const auto site = [&] {
+		if (sites != nullptr) sites->push_back(static_cast<uint32_t>(code.getSize()));
+	};
 	Xbyak::Label hot;
 	Xbyak::Label slow;
 	Xbyak::Label done;
@@ -259,6 +274,7 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	}
 	code.pop(code.rcx);
 	code.popfq();
+	site();
 	code.mov(code.eax, code.dword[code.r10]);
 	code.jmp(done, Xbyak::CodeGenerator::T_NEAR);
 
@@ -297,6 +313,7 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	code.jmp(done, Xbyak::CodeGenerator::T_NEAR);
 	code.L(slow);
 	code.pop(code.rcx);
+	site();
 	code.mov(code.eax, code.dword[code.r10]);
 	code.L(done);
 }
@@ -526,6 +543,10 @@ private:
 		bool                 pending = true, referenced = false, masked = false, called = false;
 		// A read only branch conditions depend on: a GPU write it lacks makes it unknown.
 		bool                 condition_only = false;
+		// A scalar read's own load whose value only fills its flattened slot and decides
+		// branches: a fault on a GPU-written word may defer it (state 4, address in the slot).
+		bool                 scalar_slot = false;
+		uint32_t             reason      = UINT32_MAX; // PROBE: index in srt_load_reasons.
 	};
 	// An out-of-line thunk call for a walk body reference to a value the body referenced before.
 	struct Stub {
@@ -572,6 +593,11 @@ private:
 	void EmitNode(uint32_t index);
 	void EmitRead(const Node& node);
 	void EmitStrict(const Node& node);
+	bool ScalarSlotRoot(const Operand& read, uint32_t slot) const;
+	void ClassifyReads(std::span<const Operand> reads, std::span<const std::vector<Operand>> descriptors,
+	                   std::span<const Operand> outputs);
+	void DescribeReads(std::span<const Operand> reads, std::span<const std::vector<Operand>> descriptors,
+	                   std::span<const Operand> outputs); // PROBE
 
 	ResourcePlan&                                     m_plan;
 	Xbyak::CodeGenerator&                             m_code;
@@ -586,7 +612,10 @@ private:
 	Xbyak::Label                                      m_ret;
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_bias = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
+	// Scratch offset of the per scalar read deferred addresses; 0 without deferrable loads.
+	uint32_t m_deferred = 0;
 	bool     m_body = true;
+	std::vector<ResourcePlan::LoadSite> m_sites;
 };
 
 void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
@@ -857,6 +886,12 @@ void WalkerCompiler::Layout() {
 		slot = offset;
 		offset += 8u;
 	}
+	m_deferred = 0;
+	if (std::ranges::any_of(m_nodes, [](const Node& node) { return node.scalar_slot; })) {
+		m_deferred = offset;
+		offset += static_cast<uint32_t>(m_plan.srt_reads.size()) * 8u;
+	}
+	m_plan.srt_deferred = m_deferred;
 	// Captured addresses come last; EmitRead counts them.
 	m_plan.srt_captures = offset;
 }
@@ -1087,6 +1122,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 	const bool vector = op == ValueOpcode::LoadBufferU32;
 	auto args = std::span(node.args);
 	Xbyak::Label zero;
+	std::vector<uint32_t> loads;
 	if (vector) {
 		Fetch(args[0], m_ret);
 		c.test(c.rax, c.rax);
@@ -1151,17 +1187,29 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read;
 		// pages that faulted recently ask the fast load first.
 		if (node.condition_only) PendingCheck(c, m_ret);
-		LoadGuest(c, c.r10);
+		LoadGuest(c, c.r10, node.scalar_slot || node.reason != UINT32_MAX ? &loads : nullptr);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.add(c.r8, 8);
 		Store(node);
 	}
 	// Only buffer reads have a zero path.
-	if (op == ValueOpcode::LoadAddressU32) return;
-	c.L(zero);
-	c.xor_(c.eax, c.eax);
-	Store(node);
+	if (op != ValueOpcode::LoadAddressU32) {
+		c.L(zero);
+		c.xor_(c.eax, c.eax);
+		Store(node);
+	}
+	// A deferred load resumes here (SrtWalkerDeferLoad) with r10 its address and the stack as at
+	// the load: the value stays unknown (state 4) and the slot keeps the address for the
+	// flattened slot it fills. The load is not captured: the walk lists it with the deferred ones.
+	uint32_t deferral = 0;
+	if (node.scalar_slot && !loads.empty()) {
+		deferral = static_cast<uint32_t>(c.getSize());
+		c.mov(c.qword[At(node.slot)], c.r10);
+		c.mov(c.byte[At(node.state)], 4);
+		c.ret();
+	}
+	for (const auto load: loads) m_sites.push_back({load, deferral, node.reason});
 }
 
 void WalkerCompiler::EmitStrict(const Node& node) {
@@ -1384,7 +1432,160 @@ void WalkerCompiler::EmitStrict(const Node& node) {
 	Store(node);
 }
 
+// A scalar read whose walked value is its own load (not folded) and fills a flattened slot the
+// host does not read itself: the slot of a global base backs pages from its value
+// (ShaderInfo::address_bases), so such slots keep waiting.
+bool WalkerCompiler::ScalarSlotRoot(const Operand& read, uint32_t slot) const {
+	if (read.kind != Kind::Node || read.value >= m_nodes.size() || slot >= m_plan.srt_reads.size()) return false;
+	const auto& node = m_nodes[read.value];
+	const auto  op   = node.inst->GetOpcode();
+	const auto  flat = m_plan.srt_reads[slot].flat_offset;
+	if (node.result != read || (op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) ||
+	    flat >= m_plan.srt_reads.size()) {
+		return false;
+	}
+	return std::ranges::none_of(m_plan.info.address_bases,
+	                            [&](const auto& base) { return base[0] == flat || base[1] == flat; });
+}
+
+// Reads no descriptor, scalar read or output depends on only decide branches. An unknown branch
+// reaches both successors, which over-approximates the shader's own choice: the resources of
+// both stay bound and the shader picks at run time.
+// A scalar read's own load (ScalarSlotRoot) that nothing else but branches depends on only fills
+// its flattened slot: the scalar-slot variant's shader can load that word itself, so the load
+// may be deferred (scalar_slot). Its address operands stay strict.
+void WalkerCompiler::ClassifyReads(std::span<const Operand> reads,
+                                   std::span<const std::vector<Operand>> descriptors,
+                                   std::span<const Operand> outputs) {
+	std::vector<uint8_t>  strict(m_nodes.size(), 0);
+	std::vector<uint8_t>  slot_root(m_nodes.size(), 0);
+	std::vector<uint32_t> pending;
+	const auto visit = [&](const Operand& operand) {
+		if (operand.kind != Kind::Node || operand.value >= strict.size() || strict[operand.value] != 0) return;
+		strict[operand.value] = 1;
+		pending.push_back(static_cast<uint32_t>(operand.value));
+	};
+	const bool scalars = GpuScalarEnabled();
+	for (uint32_t slot = 0; slot < reads.size(); ++slot) {
+		const auto& read = reads[slot];
+		if (!scalars || !ScalarSlotRoot(read, slot)) {
+			visit(read);
+			continue;
+		}
+		slot_root[read.value] = 1;
+		for (const auto& arg: m_nodes[read.value].args) visit(arg);
+	}
+	for (const auto& words: descriptors) {
+		for (const auto& word: words) visit(word);
+	}
+	for (const auto& output: outputs) visit(output);
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		const auto& node = m_nodes[index];
+		for (const auto& arg: node.args) visit(arg);
+		visit(node.result);
+	}
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+		auto&      node = m_nodes[index];
+		const auto op   = node.inst->GetOpcode();
+		const bool read = op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+		                  op == ValueOpcode::LoadBufferU32;
+		node.condition_only = read && strict[index] == 0 && slot_root[index] == 0;
+		node.scalar_slot    = slot_root[index] != 0 && strict[index] == 0;
+	}
+}
+
+// PROBE: per walker read, the roots that need its value, for the wait report of
+// SrtWalkerDeferLoad.
+void WalkerCompiler::DescribeReads(std::span<const Operand> reads,
+                                   std::span<const std::vector<Operand>> descriptors,
+                                   std::span<const Operand> outputs) {
+	const auto is_read = [](const Node& node) {
+		const auto op = node.inst->GetOpcode();
+		return op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+		       op == ValueOpcode::LoadBufferU32;
+	};
+	const auto& sources = m_plan.descriptor_sources;
+	std::vector<std::string> kinds(sources.size());
+	const auto add_kind = [&](uint32_t source, const std::string& kind) {
+		if (source >= kinds.size() || kinds[source].find(kind) != std::string::npos) return;
+		kinds[source] += (kinds[source].empty() ? "" : "/") + kind;
+	};
+	const auto add_root = [&](uint32_t root, const std::string& kind) {
+		add_kind(root, kind);
+		if (root >= sources.size() || !sources[root].indirect_descriptor) return;
+		const auto& indirect = *sources[root].indirect_descriptor;
+		add_kind(indirect.table_source, "table of " + kind);
+		if (indirect.selector) {
+			add_kind(indirect.selector->source, "selector of " + kind);
+			if (indirect.selector->rows) add_kind(indirect.selector->rows->source, "selector of " + kind);
+		}
+		for (const auto source: indirect.sources) add_kind(source, "candidate " + kind);
+	};
+	for (const auto& buffer: m_plan.info.buffers) {
+		add_root(buffer.source, buffer.written || buffer.atomic ? "written buffer V#" : "buffer V#");
+	}
+	for (const auto& image: m_plan.info.images) add_root(image.source, "image T#");
+	for (const auto& sampler: m_plan.info.samplers) add_root(sampler.source, "sampler S#");
+	std::vector<std::string>                uses(m_nodes.size());
+	std::vector<uint8_t>                    seen;
+	std::vector<std::pair<uint32_t, bool>> stack;
+	const auto describe = [&](const Operand& root, const std::string& name) {
+		seen.assign(m_nodes.size() * 2u, 0);
+		const auto push = [&](const Operand& operand, bool address) {
+			if (operand.kind != Kind::Node || operand.value >= m_nodes.size()) return;
+			auto& mark = seen[operand.value * 2u + (address ? 1u : 0u)];
+			if (mark != 0) return;
+			mark = 1;
+			stack.emplace_back(static_cast<uint32_t>(operand.value), address);
+		};
+		push(root, false);
+		while (!stack.empty()) {
+			const auto [index, address] = stack.back();
+			stack.pop_back();
+			const auto& node = m_nodes[index];
+			const bool  read = is_read(node);
+			if (read) {
+				const auto text = address ? "address of a read for " + name : name;
+				auto&      list = uses[index];
+				if (list.size() < 400u && list.find(text) == std::string::npos) {
+					list += (list.empty() ? "" : "; ") + text;
+				}
+			}
+			for (const auto& arg: node.args) push(arg, address || read);
+			push(node.result, address);
+		}
+	};
+	for (uint32_t slot = 0; slot < reads.size(); ++slot) {
+		describe(reads[slot], "scalar read " + std::to_string(slot));
+	}
+	for (uint32_t source = 0; source < descriptors.size(); ++source) {
+		const auto name = "descriptor source " + std::to_string(source) + " (" +
+		                  (kinds[source].empty() ? std::string("unknown kind") : kinds[source]) + ")";
+		for (const auto& word: descriptors[source]) describe(word, name);
+	}
+	for (uint32_t output = 0; output < outputs.size(); ++output) {
+		describe(outputs[output], "walk output " + std::to_string(output));
+	}
+	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+		auto& node = m_nodes[index];
+		if (!is_read(node)) continue;
+		std::array<char, 32> pc {};
+		std::snprintf(pc.data(), pc.size(), "pc 0x%x: ", node.inst->Flags<MemoryFlags>().pc);
+		std::string text = pc.data();
+		text += node.condition_only ? std::string("branch conditions only")
+		        : uses[index].empty() ? std::string("nothing found")
+		                              : uses[index];
+		if (node.scalar_slot) text += " [the scalar-slot variant defers it]";
+		node.reason = static_cast<uint32_t>(m_plan.srt_load_reasons.size());
+		m_plan.srt_load_reasons.push_back(std::move(text));
+	}
+}
+
 void WalkerCompiler::Compile(std::span<const Value> values) {
+	m_plan.srt_load_reasons.clear();
+	m_plan.srt_load_sites.clear();
 	auto&       c         = m_code;
 	const auto& sources   = m_plan.descriptor_sources;
 	const auto& blocks    = m_plan.control_flow;
@@ -1406,35 +1607,8 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
 	if (resources) {
-		// Reads no descriptor, scalar read or output depends on only decide branches. An unknown
-		// branch reaches both successors, which over-approximates the shader's own choice: the
-		// resources of both stay bound and the shader picks at run time.
-		std::vector<uint8_t>  strict(m_nodes.size(), 0);
-		std::vector<uint32_t> pending;
-		const auto visit = [&](const Operand& operand) {
-			if (operand.kind != Kind::Node || operand.value >= strict.size() || strict[operand.value] != 0) return;
-			strict[operand.value] = 1;
-			pending.push_back(static_cast<uint32_t>(operand.value));
-		};
-		for (const auto& read: reads) visit(read);
-		for (const auto& words: descriptors) {
-			for (const auto& word: words) visit(word);
-		}
-		for (const auto& output: outputs) visit(output);
-		while (!pending.empty()) {
-			const auto index = pending.back();
-			pending.pop_back();
-			const auto& node = m_nodes[index];
-			for (const auto& arg: node.args) visit(arg);
-			visit(node.result);
-		}
-		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
-			auto&      node = m_nodes[index];
-			const auto op   = node.inst->GetOpcode();
-			node.condition_only = strict[index] == 0 &&
-			    (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
-			     op == ValueOpcode::LoadBufferU32);
-		}
+		ClassifyReads(reads, descriptors, outputs);
+		if (GpuScalarProbe()) DescribeReads(reads, descriptors, outputs);
 	}
 	Layout();
 
@@ -1448,6 +1622,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		c.mov(c.qword[At(slot)], c.rax);
 	}
 	Zero(m_reach, m_states_end - m_reach);
+	if (m_deferred != 0) Zero(m_deferred, static_cast<uint32_t>(m_plan.srt_reads.size()) * 8u);
 	c.lea(c.r8, c.ptr[At(m_plan.srt_captures)]);
 	if (!resources) {
 		for (uint32_t block = 0; block < blocks.size(); ++block)
@@ -1517,8 +1692,26 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 				c.jmp(fail, Near);
 				return;
 			}
-			Fetch(reads[slot], fail);
+			const auto& read = reads[slot];
+			if (read.kind != Kind::Node || !m_nodes[read.value].scalar_slot) {
+				Fetch(read, fail);
+				c.mov(c.dword[c.rsi + offset * sizeof(uint32_t)], c.eax);
+				return;
+			}
+			// A deferred load leaves the slot zero and its address for the shader.
+			auto&        deferred = exits.emplace_back();
+			Xbyak::Label stored;
+			const auto&  node = m_nodes[read.value];
+			Branch(read, deferred);
+			Load(c.rax, read);
 			c.mov(c.dword[c.rsi + offset * sizeof(uint32_t)], c.eax);
+			c.jmp(stored, Near);
+			c.L(deferred);
+			c.cmp(c.byte[At(node.state)], 4);
+			c.jne(fail, Near);
+			c.mov(c.rax, c.qword[At(node.slot)]);
+			c.mov(c.qword[At(m_deferred + offset * 8u)], c.rax);
+			c.L(stored);
 		};
 		if (blocks.empty()) {
 			for (uint32_t slot = 0; slot < reads.size(); ++slot) flat(slot);
@@ -1600,6 +1793,8 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	}
 	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
 	m_plan.srt_user_data = m_user_data;
+	std::ranges::sort(m_sites, {}, &ResourcePlan::LoadSite::code);
+	m_plan.srt_load_sites = std::move(m_sites);
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
 }
@@ -1617,9 +1812,11 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	t_running_walker = plan.srt_code.get();
+	t_running_plan   = &plan;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
+	t_running_plan   = nullptr;
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
 		// Resizing first lets the copy vectorize; emplace_back reloads the vector's end per read.
@@ -1724,6 +1921,56 @@ bool TakeWalkerDeferredConditions(std::vector<uint64_t>& addresses) {
 	addresses.clear();
 	std::swap(addresses, WalkerDeferred());
 	return !addresses.empty();
+}
+
+bool GpuScalarEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("APS5_KYTY_GPU_SCALAR");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool GpuScalarProbe() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("APS5_KYTY_X_SCALAR_PROBE");
+		return value != nullptr && value[0] != '0';
+	}();
+	return enabled;
+}
+
+void SetWalkerDefersGpuScalars(bool defer, const char* why_not) {
+	t_walker_defers_scalars = defer;
+	t_walker_scalar_off     = defer ? nullptr : why_not;
+}
+
+bool TakeWalkerDeferredScalars() {
+	return std::exchange(t_walker_scalar_faults, false);
+}
+
+bool WalkedDeferredScalars(const ResourcePlan& plan, std::vector<std::pair<uint32_t, uint64_t>>& deferred) {
+	deferred.clear();
+	if (plan.srt_deferred == 0) return false;
+	for (uint32_t slot = 0; slot < plan.srt_reads.size(); ++slot) {
+		uint64_t address = 0;
+		std::memcpy(&address, Scratch(plan) + plan.srt_deferred + slot * 8u, sizeof(address));
+		if (address != 0) deferred.emplace_back(slot, address);
+	}
+	return !deferred.empty();
+}
+
+uint64_t SrtWalkerDeferLoad(uint64_t rip, uint64_t address) {
+	const auto* plan = t_running_plan.Get();
+	if (t_running_walker == nullptr || plan == nullptr) return 0;
+	const auto offset = rip - reinterpret_cast<uint64_t>(t_running_walker->getCode());
+	const auto site   = std::ranges::lower_bound(plan->srt_load_sites, offset, {},
+	                                             [](const ResourcePlan::LoadSite& entry) { return uint64_t {entry.code}; });
+	if (site == plan->srt_load_sites.end() || site->code != offset) return 0;
+	const auto pending = g_walker_gpu_pending.load(std::memory_order_relaxed);
+	const bool deferrable = site->deferral != 0 && t_walker_defers_scalars;
+	if (!deferrable || pending == nullptr || !pending(address)) return 0;
+	t_walker_scalar_faults = true;
+	return site->deferral - site->code;
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

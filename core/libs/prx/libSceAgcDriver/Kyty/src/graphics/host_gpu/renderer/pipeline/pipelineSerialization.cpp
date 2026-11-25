@@ -85,8 +85,8 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 
 // Record fields, shared by writing and reading.
 template <class S, class Key> void IoKey(S& io, Key& key) {
-	auto& [stage, hash, user_data_count, static_state, runtime_srt] = key;
-	IoAll(io, stage, hash, user_data_count, static_state, runtime_srt);
+	auto& [stage, hash, user_data_count, static_state, runtime_srt, scalar_slots] = key;
+	IoAll(io, stage, hash, user_data_count, static_state, runtime_srt, scalar_slots);
 }
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {

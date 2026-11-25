@@ -16,6 +16,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -51,6 +52,18 @@ inline constexpr uint32_t GpuSrtAutoParts    = 1u | 2u | 8u | 16u;
 [[nodiscard]] uint32_t GpuSrtStoreTag();
 // Whether the buffer cache should start the host view (something may read through it).
 [[nodiscard]] bool     GpuSrtHostViewWanted();
+// GPU-written scalar SRT reads (on unless APS5_KYTY_GPU_SCALAR=0): a walk whose scalar reads load
+// words a GPU write holds does not wait for them; the draw or dispatch takes the program's
+// scalar-slot variant, whose shader loads those words from the cache buffer holding them.
+[[nodiscard]] bool GpuScalarEnabled();
+// Layout of a scalar-slot variant's flattened SRT: the scalar reads' values, then per read the
+// low and high words of the device address holding its value (0: use the flattened value).
+[[nodiscard]] constexpr uint32_t ScalarAddressWord(uint32_t reads, uint32_t slot) {
+	return reads + slot * 2u;
+}
+[[nodiscard]] constexpr uint32_t ScalarSlotWords(uint32_t reads) {
+	return reads * 3u;
+}
 [[nodiscard]] bool IsRuntimeProgram(uint64_t hash);
 // GPU thread: the descriptor walk of program waited ms for bytes the GPU wrote.
 void NoteDescriptorWait(uint64_t program, double ms);
@@ -845,6 +858,19 @@ struct ResourcePlan {
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
+	// Walker loads of scalar SRT reads (srt_reads) whose values only fill their flattened slot
+	// and decide branches: a fault on a word a GPU write holds may resume at the load's deferral
+	// stub instead of waiting (SrtWalkerDeferLoad). With the probe on, every walker load is listed.
+	struct LoadSite {
+		uint32_t code     = 0;          // Offset of the guest load (mov eax, [r10]) in srt_code.
+		uint32_t deferral = 0;          // Offset of its deferral stub; 0 when the load must wait.
+		uint32_t reason   = UINT32_MAX; // PROBE: index in srt_load_reasons.
+	};
+	std::vector<LoadSite>    srt_load_sites; // Sorted by code.
+	std::vector<std::string> srt_load_reasons; // PROBE: what depends on each listed load.
+	// Scratch offset of one qword per scalar read: the guest address a deferred load of its
+	// value read, or 0 (WalkedDeferredScalars). 0 when no load can be deferred.
+	uint32_t srt_deferred = 0;
 	// GPU-thread scratch for walker results and material keys.
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;

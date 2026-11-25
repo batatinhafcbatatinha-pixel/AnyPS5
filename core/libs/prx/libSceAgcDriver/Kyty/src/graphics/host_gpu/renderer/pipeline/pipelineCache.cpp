@@ -298,6 +298,8 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
                                                  uint32_t push_data_ceiling) {
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 	                                                    specialization));
+	// A walk that took another variant leaves results nothing may use.
+	if (runtime.scalar_diverted != nullptr && *runtime.scalar_diverted) return nullptr;
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		const auto  start  = ShaderRecompiler::IR::PushData::StartFor(
@@ -331,7 +333,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	const auto function_code = program.FunctionCode();
 	ShaderRecompiler::IR::Writer inputs;
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
-	                            key.runtime_srt, info.bindings.push_data_start_dword,
+	                            key.runtime_srt, key.scalar_slots, info.bindings.push_data_start_dword,
 	                            program.specialization);
 	inputs.Raw(function_code.data(), function_code.size_bytes()); // Last, so it needs no size.
 	const auto id = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
@@ -375,7 +377,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor,
-                                              uint32_t  push_data_ceiling) {
+                                              uint32_t  push_data_ceiling,
+                                              ScalarVariant scalar) {
 	const auto user_data = std::span(params.user_data).first(params.user_data_count);
 	ShaderRecompiler::IR::SrtRuntime runtime {
 	    .user_data                  = user_data,
@@ -412,9 +415,86 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	ShaderRecompiler::IR::LearningTick();
 	m_lookup_key.runtime_srt     = ShaderRecompiler::IR::IsRuntimeProgram(params.hash);
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
+	// GPU-written scalar reads: walks defer the loads of scalar reads a GPU write holds unless
+	// this call waits, or a deferred slot of the program turned out to be one the host reads.
+	ScalarProgram* scalar_program = nullptr;
+	const bool     scalars        = scalar != ScalarVariant::Wait && ShaderRecompiler::IR::GpuScalarEnabled();
+	if (scalars) {
+		if (const auto found = m_scalar_programs.find(params.hash); found != m_scalar_programs.end()) {
+			scalar_program = &found->second;
+		}
+	}
+	const bool futile = scalar_program != nullptr && scalar_program->futile;
+	const bool slots  = !futile && (scalar == ScalarVariant::Slots ||
+	                                (scalar == ScalarVariant::Auto && scalar_program != nullptr &&
+	                                 scalar_program->prefer));
+	m_lookup_key.scalar_slots = slots;
+	bool diverted             = false;
+	if (scalars && !futile) {
+		runtime.defer_scalars   = true;
+		runtime.scalar_slots    = slots;
+		runtime.scalar_diverted = &diverted;
+	}
 	auto entry = m_program_cache.find(m_lookup_key);
-	const auto bind = [&](const ShaderModule& module) {
-		input_info.stage = {.module = &module, .resources = &entry->second.resources};
+	// Programs with GPU-selected calls keep one variant: their source follows the callees.
+	const auto no_calls = [&](const Program& program) {
+		if (program.call_source == nullptr) return;
+		runtime.defer_scalars   = false;
+		runtime.scalar_diverted = nullptr;
+	};
+	if (entry != m_program_cache.end()) no_calls(entry->second);
+	// A deferring walk of the program's variant: the scalar-slot variant serves the draw.
+	const auto take_slots = [&]() -> const ShaderModule* {
+		auto& state  = m_scalar_programs[params.hash];
+		state.prefer = true;
+		return GetProgram(params, input_info, push_data_cursor, push_data_ceiling, ScalarVariant::Slots);
+	};
+	const auto bind = [&](const ShaderModule& module) -> const ShaderModule* {
+		const auto& resources = entry->second.resources;
+		if (slots && resources.gpu_scalar_words.empty() && scalar == ScalarVariant::Auto) {
+			// Nothing deferred: the program's own variant, as without GPU-written words.
+			m_scalar_programs[params.hash].prefer = false;
+			return GetProgram(params, input_info, push_data_cursor, push_data_ceiling, ScalarVariant::Auto);
+		}
+		if (slots && !resources.gpu_scalar_words.empty()) {
+			// The host reads the slots of global bases and the ray-query TLAS from the flattened
+			// SRT itself: such a slot cannot come from GPU memory, so the program waits from now on.
+			const auto  count = static_cast<uint32_t>(entry->second.resource_plan.srt_reads.size());
+			const auto& info  = module.info.info;
+			const auto  host_slot = [&](uint32_t slot) {
+				return std::ranges::any_of(info.address_bases,
+				                           [&](const auto& base) { return base[0] == slot || base[1] == slot; }) ||
+				       (module.info.bindings.ray_query_dword != ShaderRecompiler::IR::PushData::NoStart &&
+				        (info.ray_query_tlas[0] == slot || info.ray_query_tlas[1] == slot));
+			};
+			for (const auto& [word, address]: resources.gpu_scalar_words) {
+				const auto slot = (word - count) / 2u;
+				if (!host_slot(slot)) continue;
+				auto& state  = m_scalar_programs[params.hash];
+				state.futile = true;
+				state.prefer = false;
+				if (ShaderRecompiler::IR::GpuScalarProbe()) { // PROBE
+					std::printf("[gpuscalar] program %016llx waits for GPU word 0x%llx: scalar read %u is "
+					            "a slot the host reads (global base or TLAS); the program waits from now on\n",
+					            static_cast<unsigned long long>(params.hash),
+					            static_cast<unsigned long long>(address), slot);
+					std::fflush(stdout);
+				}
+				return GetProgram(params, input_info, push_data_cursor, push_data_ceiling, ScalarVariant::Wait);
+			}
+			if (ShaderRecompiler::IR::GpuScalarProbe()) { // PROBE
+				auto&      state = m_scalar_programs[params.hash];
+				const auto walks = ++state.walks;
+				if (walks == 1 || walks == 100 || walks == 1000 || walks % 10000 == 0) {
+					std::printf("[gpuscalar] program %016llx: %llu walks took the scalar-slot variant "
+					            "(%zu GPU-written scalar reads in this one)\n",
+					            static_cast<unsigned long long>(params.hash),
+					            static_cast<unsigned long long>(walks), resources.gpu_scalar_words.size());
+					std::fflush(stdout);
+				}
+			}
+		}
+		input_info.stage = {.module = &module, .resources = &resources};
 		// Vertex pipeline stages take their data from the top (see PushData::StartFor): the
 		// caller lowers the ceiling instead.
 		if constexpr (!std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -434,12 +514,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			}
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor, push_data_ceiling);
+			if (diverted) return take_slots();
 		}
 		if (module != nullptr) return bind(*module);
 	}
 
 	options.shader_hash     = params.hash;
 	options.runtime_srt     = m_lookup_key.runtime_srt;
+	options.scalar_slots    = m_lookup_key.scalar_slots;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent &&
@@ -480,8 +562,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		    .resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
 		auto& program = entry->second;
+		no_calls(program);
 		EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 		    program.resource_plan, runtime, program.resources, program.specialization));
+		if (diverted) return take_slots();
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		if (const auto* module =

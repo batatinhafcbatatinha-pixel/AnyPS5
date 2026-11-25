@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -51,6 +52,17 @@ struct SrtRuntime {
 	// Nonempty when the indirect arguments are thread counts: the group size they are divided by.
 	std::span<const uint32_t> indirect_group_size;
 	ImageHeapSource*          image_heap            = nullptr;
+	// GPU-written scalar reads (GpuScalarEnabled). defer_scalars: a walker load of a scalar read
+	// whose value only fills its flattened slot (and decides branches) does not wait when its word
+	// holds a GPU write guest memory lacks (SetWalkerDefersGpuScalars). scalar_slots: the variant's
+	// shader reads, per scalar read, a device address from the flattened words after the reads
+	// (ScalarAddressWord) and loads the value there when it is not 0; MaterializeResources lists
+	// the deferred words in ResourceSnapshot::gpu_scalar_words. Without scalar_slots, a walk that
+	// deferred such a load sets *scalar_diverted and returns true with results that must not be
+	// used: the caller takes the scalar_slots variant.
+	bool  defer_scalars   = false;
+	bool  scalar_slots    = false;
+	bool* scalar_diverted = nullptr;
 };
 
 class SrtReadCapture {
@@ -111,6 +123,23 @@ void SetWalkerGpuPending(WalkerGpuPending function);
 void SetWalkerDefersGpuConditions(bool defer);
 // Whether a walk on this thread deferred a load since the last call; addresses receives their words.
 bool TakeWalkerDeferredConditions(std::vector<uint64_t>& addresses);
+// Walker loads of scalar reads whose values only fill their flattened slot and decide branches
+// (ResourcePlan::srt_load_sites). While deferral is enabled on this thread, such a load that
+// faults on a word a GPU write holds (the WalkerGpuPending function) completes as deferred: its
+// value is unknown to branches, its slot reads zero and the walk records the address
+// (WalkedDeferredScalars). why_not: what a disabled deferral is reported as (probe).
+void SetWalkerDefersGpuScalars(bool defer, const char* why_not = nullptr);
+// Whether a walk on this thread deferred such a load since the last call (it may have failed
+// before filling the slot, or the load's slot may lie in a block it did not reach).
+bool TakeWalkerDeferredScalars();
+// The (scalar read, guest address) pairs of the reached slots whose loads the last successful
+// walk of plan deferred; false when none.
+bool WalkedDeferredScalars(const ResourcePlan& plan, std::vector<std::pair<uint32_t, uint64_t>>& deferred);
+// Exception handler, for a faulting walker load at rip of address: the byte distance from rip to
+// the load's deferral stub when the load completes as deferred instead of waiting, else 0.
+uint64_t SrtWalkerDeferLoad(uint64_t rip, uint64_t address);
+// PROBE: APS5_KYTY_X_SCALAR_PROBE=1 reports deferrals and every walker load that still waits.
+[[nodiscard]] bool GpuScalarProbe();
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.

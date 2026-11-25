@@ -88,6 +88,18 @@ public:
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
+	// GPU thread: a command-processor write to guest memory, recorded in GPU order into the cache
+	// buffer instead of written by the CPU, when the range lies on GPU-modified pages (a CPU write
+	// there faults and waits for the GPU to finish the batch). Its bytes become GPU-modified, so
+	// later CPU readers read them back once the GPU has reached the write. False, with nothing
+	// done, where only the CPU write is known to be exact: the caller writes guest memory then.
+	[[nodiscard]] bool WriteInGpuOrder(uint64_t vaddr, const void* data, uint64_t size);
+	// GPU thread, after a command-processor fill or copy recorded in GPU order: the dwords it
+	// leaves pending, when the CPU knows them, so walks read them without waiting (see
+	// m_cp_known). KnownBytes: the bytes such a copy reads, when the CPU knows them now.
+	void               NoteCpKnown(uint64_t vaddr, const void* data, uint64_t size);
+	void               NoteCpFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	[[nodiscard]] bool KnownBytes(uint64_t vaddr, uint64_t size, void* data);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -186,10 +198,17 @@ private:
 	void DeleteBuffer(BufferId id);
 	// Records the downloads of read-back writes (RecordEagerDownloads) in one batch.
 	void RecordEagerBatch(const RangeSet& writes);
+	// generations_out: see MemoryTracker::ForEachUploadRange.
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	                                     bool is_written, bool is_texel_buffer,
+	                                     uint64_t* generations_out = nullptr);
 	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
 	                  uint64_t total_size);
+	// Guest bytes for an upload of tracker-reported pages: CopySparseMemory, but exact hot pages
+	// (hotPages.h) through their shadow, which the copy refreshes.
+	[[nodiscard]] bool CopyGuestForUpload(uint64_t address, uint8_t* destination, uint64_t size);
+	// SynchronizeBda's changed exact hot pages (GPU thread).
+	std::vector<uint64_t> m_hot_scan_scratch;
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -230,6 +249,32 @@ private:
 		double                                ms    = 0;
 	};
 
+	// ObtainBuffer's last buffer-path result per range (GPU thread). A call repeated while
+	// nothing it reads changed does nothing but set the buffer's ticks: the range is CPU-clean
+	// (and GPU-dirty when written) already, the buffer still owns it, and the bookkeeping sets
+	// it adds to hold it already. Tracker state is checked by region generations; the cache's
+	// own sets and buffers by m_obtain_state, which grows whenever one could make a repeated
+	// call do more: a buffer created or deleted, GPU-written bytes leaving
+	// m_gpu_modified_ranges, color metadata checks added, read-back pages added. Read-back
+	// bookkeeping of written ranges is redone on every call (NoteReadbackWrite).
+	struct ObtainMemo {
+		uint64_t vaddr       = 0;
+		uint64_t size        = 0;
+		uint64_t generations = 0;
+		uint64_t state       = 0; // 0: empty
+		BufferId id {};
+		bool     written  = false;
+		bool     readback = false; // a written range on read-back pages (NoteReadbackWrite)
+	};
+	static constexpr size_t OBTAIN_MEMO_SLOTS = 2048;
+	[[nodiscard]] ObtainMemo& ObtainMemoSlot(uint64_t vaddr, uint64_t size, bool written);
+	// ObtainBuffer of a written range: queues the eager download of its bytes on read-back pages
+	// and names the current program as their writer. Whether there were any.
+	bool NoteReadbackWrite(uint64_t vaddr, uint64_t size);
+	void InvalidateObtainMemos() noexcept { m_obtain_state++; }
+	std::unique_ptr<std::array<ObtainMemo, OBTAIN_MEMO_SLOTS>> m_obtain_memo;
+	uint64_t                                          m_obtain_state = 1;
+
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
@@ -247,8 +292,19 @@ private:
 	std::vector<EagerDownload>                        m_eager_downloads;
 	RangeSet                                          m_eager_pending;
 	bool                                              m_recording_eager = false;
+	// CompleteEagerDownloads' pages to unmark, kept for its next call (GPU thread).
+	std::vector<GuestRange>                           m_unmark_scratch;
 	// Early compute: the program binding buffers now, the writers of read-back pages, learning.
 	uint64_t                                          m_current_program = 0;
+	// GPU thread: dwords a command-processor write recorded in GPU order (WriteInGpuOrder) set
+	// last, by address; a GPU write over them (ObtainBuffer written) or a CPU write adopted
+	// as the newest bytes (AdoptGuestMemory) drops them.
+	static constexpr size_t      CpKnownLimit = 65536;
+	std::map<uint64_t, uint32_t> m_cp_known;
+	std::mutex                   m_cp_known_mutex; // AdoptGuestMemory may run on other threads.
+	std::atomic<bool>            m_cp_known_any {false};
+	void                         ForgetCpKnownWords(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool           CpKnownWords(uint64_t vaddr, uint64_t size, void* data);
 	uint64_t                                          m_bda_reader_tick = 0;
 	std::map<uint64_t, std::pair<uint64_t, uint64_t>> m_readback_writers; // begin -> {end, program}
 	std::unordered_map<uint64_t, ProducerWindow>      m_producer_windows;

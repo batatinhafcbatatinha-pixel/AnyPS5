@@ -236,6 +236,7 @@ private:
 		uint32_t              user_data_count = 0;
 		std::vector<uint32_t> static_state;
 		bool                  runtime_srt     = false; // A learned program's run-time descriptor variant.
+		bool                  scalar_slots    = false; // Its scalar-slot variant (ScalarVariant).
 
 		bool operator==(const ProgramKey&) const = default;
 	};
@@ -267,10 +268,24 @@ private:
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
 
+	// GPU-written scalar reads (IR::GpuScalarEnabled). Auto: the program's variant, unless its
+	// walk defers loads of scalar reads whose words a GPU write holds; then the scalar-slot
+	// variant (Slots), whose shader loads those words from the cache buffers holding them. Wait:
+	// the program's variant, waiting for GPU writes as before.
+	enum class ScalarVariant { Auto, Slots, Wait };
+	struct ScalarProgram {
+		bool     prefer = false; // The last walk deferred: the next starts with the scalar-slot variant.
+		bool     futile = false; // A deferred slot is one the host reads itself: walks wait.
+		uint64_t walks  = 0;     // PROBE: draws or dispatches the scalar-slot variant served.
+	};
+	// Programs whose walks deferred scalar reads once.
+	std::unordered_map<uint64_t, ScalarProgram> m_scalar_programs;
+
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(
 	    const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
-	    uint32_t push_data_ceiling = ShaderRecompiler::IR::PushData::DwordCount);
+	    uint32_t push_data_ceiling = ShaderRecompiler::IR::PushData::DwordCount,
+	    ScalarVariant scalar = ScalarVariant::Auto);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,

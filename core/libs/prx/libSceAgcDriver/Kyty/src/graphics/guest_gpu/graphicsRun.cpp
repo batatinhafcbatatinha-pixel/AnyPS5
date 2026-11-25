@@ -303,6 +303,16 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	// On pages holding GPU writes the write goes into the command stream (see
+	// BufferCache::WriteInGpuOrder): writing guest memory there would wait for the GPU. Writes
+	// to one address leave only the last value, which is all a later reader can see.
+	auto&      buffers     = m_renderer.GetBufferCache();
+	const auto dst_address = reinterpret_cast<uint64_t>(dst);
+	if (dw_num != 0 && (write_one_address
+	                        ? buffers.WriteInGpuOrder(dst_address, &src[dw_num - 1u], sizeof(uint32_t))
+	                        : buffers.WriteInGpuOrder(dst_address, src, uint64_t {dw_num} * 4u))) {
+		return;
+	}
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
@@ -318,7 +328,10 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	// Like WriteData: on pages holding GPU writes the copy is recorded in GPU order.
+	if (!m_renderer.GetBufferCache().WriteInGpuOrder(dst_address, &value, num_bytes)) {
+		std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	}
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -377,6 +390,10 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
+		if (!dst_gds) {
+			buffer_cache.NoteCpFill(dst_address_or_offset, num_bytes,
+			                        static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu));
+		}
 		return;
 	}
 	bool src_gds = false;
@@ -386,8 +403,16 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 	if (src_gds && dst_gds) {
 		EXIT("unsupported dmaData GDS-to-GDS copy\n");
 	}
+	// The source bytes as the copy reads them, when the CPU knows them now (read before the copy
+	// is recorded, which may change them when the ranges overlap).
+	std::array<uint32_t, 1024> known {};
+	const bool known_source = !dst_gds && !src_gds && num_bytes <= sizeof(known) &&
+	                          buffer_cache.KnownBytes(src_address_or_offset_or_immediate, num_bytes, known.data());
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
+	if (known_source) {
+		buffer_cache.NoteCpKnown(dst_address_or_offset, known.data(), num_bytes);
+	}
 }
 
 void GuestGpu::Enqueue(Submission submission) {
@@ -976,16 +1001,22 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	m_renderer.GetOcclusionQueries().Publish();
 
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
-	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
-	// downloads GPU-written bytes under the label before the store.
+	// A label over GPU-written bytes, such as one a WriteData in GPU order set, is written in GPU
+	// order too (see BufferCache::WriteInGpuOrder), after the bytes it replaces. Other labels go
+	// through the guest mapping: its fault keeps a clean cached copy current.
 	const auto write_label = [this, address](const void* value, uint64_t size) {
 		const auto vaddr   = reinterpret_cast<uint64_t>(address);
 		auto&      buffers = m_renderer.GetBufferCache();
-		if (!GuestRange {vaddr, size}.Valid() || !buffers.IsRegionGpuModified(vaddr, size) ||
-		    buffers.HasGpuDirtyBytes(vaddr, size) ||
-		    !LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
-			std::memcpy(address, value, size);
+		if (GuestRange {vaddr, size}.Valid() && buffers.IsRegionGpuModified(vaddr, size)) {
+			if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+				if (buffers.WriteInGpuOrder(vaddr, value, size)) {
+					return;
+				}
+			} else if (LibKernel::Memory::TryWriteBacking(vaddr, value, size)) {
+				return;
+			}
 		}
+		std::memcpy(address, value, size);
 	};
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
 	switch (data_sel) {

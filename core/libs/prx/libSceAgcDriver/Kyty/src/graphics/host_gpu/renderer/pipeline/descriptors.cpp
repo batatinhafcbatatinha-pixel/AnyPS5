@@ -790,10 +790,12 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = runtime.module->info;
 	const auto& snapshot = *runtime.resources;
+	// GPU-written scalar reads are loaded through device addresses too, outside bound ranges.
 	m_context.GetBufferCache().SetCurrentProgram(
 	    program.shader_hash,
 	    program.info.uses_dma ||
-	        program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::BdaPagetable)] != 0);
+	        program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::BdaPagetable)] != 0 ||
+	        !snapshot.gpu_scalar_words.empty());
 	prepared.runtime = &runtime;
 	prepared.gds = vk::DescriptorBufferInfo{nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = vk::DescriptorBufferInfo{};
@@ -1049,6 +1051,22 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot = *prepared.runtime->resources;
 	const auto& layout   = program.bindings;
 
+	// Scalar-slot variant: each scalar read the walk did not wait for loads its word from the
+	// cache buffer bytes that hold it now, as a bound read of that word would. Obtained before the
+	// bindings, so a buffer this may create cannot replace one they hold.
+	std::vector<uint32_t> scalar_flat;
+	if (!snapshot.gpu_scalar_words.empty() &&
+	    layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
+		scalar_flat = snapshot.flattened_srt;
+		for (const auto& [word, address]: snapshot.gpu_scalar_words) {
+			EXIT_IF(word + 1u >= scalar_flat.size());
+			const auto [buffer, offset] =
+			    m_context.GetBufferCache().ObtainBuffer(address, sizeof(uint32_t), false);
+			const auto device       = buffer->BufferDeviceAddress() + offset;
+			scalar_flat[word]       = static_cast<uint32_t>(device);
+			scalar_flat[word + 1u]  = static_cast<uint32_t>(device >> 32u);
+		}
+	}
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
@@ -1069,7 +1087,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		prepared.flattened_srt =
+		    NativeUpload(m_context, scalar_flat.empty() ? snapshot.flattened_srt : scalar_flat);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);

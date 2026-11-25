@@ -1736,11 +1736,15 @@ bool HybridWalkAllowed(const ResourcePlan& program) {
 } // namespace
 
 // defer_conditions: walker loads that only decide branches do not wait for GPU writes (see
-// SetWalkerDefersGpuConditions); deferred tells whether one of them did not.
+// SetWalkerDefersGpuConditions); deferred tells whether one of them, or a scalar read's load
+// (defer_scalars, SetWalkerDefersGpuScalars), did not. why_not: what a disabled scalar deferral
+// is reported as (probe).
 static bool MaterializeWalk(const ResourcePlan& program, const SrtRuntime& runtime,
                             ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                            bool defer_conditions, bool& deferred) {
+                            bool defer_conditions, bool defer_scalars, const char* why_not,
+                            bool& deferred) {
 	deferred = false;
+	snapshot.gpu_scalar_words.clear();
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1755,18 +1759,26 @@ static bool MaterializeWalk(const ResourcePlan& program, const SrtRuntime& runti
 	const bool hybrid = runtime.image_heap != nullptr && HybridWalkAllowed(program);
 	SetWalkerSkipsGpuWritten(hybrid);
 	SetWalkerDefersGpuConditions(defer_conditions);
+	SetWalkerDefersGpuScalars(defer_scalars, why_not);
 	(void)TakeWalkerTaint();
 	std::vector<uint64_t> deferred_words;
 	(void)TakeWalkerDeferredConditions(deferred_words);
+	(void)TakeWalkerDeferredScalars();
 	const bool walked = WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr);
+	SetWalkerDefersGpuScalars(false);
 	SetWalkerDefersGpuConditions(false);
 	SetWalkerSkipsGpuWritten(false);
 	SetWalkedProgram(0);
 	deferred = TakeWalkerDeferredConditions(deferred_words);
+	// A deferred scalar load also reads as unknown to the branches it decides.
+	deferred |= TakeWalkerDeferredScalars();
+	std::vector<std::pair<uint32_t, uint64_t>> deferred_scalars;
+	const bool scalars_deferred = walked && defer_scalars && WalkedDeferredScalars(program, deferred_scalars);
 	// The results do not depend on a deferred word, but the reads list it as a waiting walk
 	// would have captured it, for the checks that bound buffer writes by what the walk read.
 	if (capture_reads) {
 		for (const auto word: deferred_words) reads.emplace_back(word, uint64_t {sizeof(uint32_t)});
+		for (const auto& scalar: deferred_scalars) reads.emplace_back(scalar.second, uint64_t {sizeof(uint32_t)});
 	}
 	// A tainted walk read zeros for GPU-written words: global descriptors use the shader path.
 	const bool runtime_descriptors = !hybrid || TakeWalkerTaint();
@@ -1791,6 +1803,21 @@ static bool MaterializeWalk(const ResourcePlan& program, const SrtRuntime& runti
 	if (!walked) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
+	}
+	if (scalars_deferred && !runtime.scalar_slots) {
+		// This variant's shader reads the deferred slots as zero: the caller takes the
+		// scalar-slot variant instead, and nothing of this walk is used.
+		if (runtime.scalar_diverted != nullptr) *runtime.scalar_diverted = true;
+		return runtime.scalar_diverted != nullptr;
+	}
+	if (runtime.scalar_slots) {
+		// Device addresses of deferred slots follow the reads, before any other flattened words;
+		// the renderer fills them in from the guest addresses when it binds the stage.
+		const auto count = static_cast<uint32_t>(program.srt_reads.size());
+		snapshot.flattened_srt.resize(ScalarSlotWords(count), 0u);
+		for (const auto& [slot, address]: deferred_scalars) {
+			snapshot.gpu_scalar_words.emplace_back(ScalarAddressWord(count, slot), address);
+		}
 	}
 	SrtReadCapture capture {runtime, reads};
 	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
@@ -2037,14 +2064,17 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	// reaches both successors and binds the resources of both. When that wider walk fails (a
 	// scalar read or descriptor of a branch the shader may not take is unknown or unusable), the
 	// walk runs again and waits for the writes, as before.
+	// Likewise loads of scalar reads that only fill their flattened slots (runtime.defer_scalars).
 	std::vector<std::string> failures;
 	bool                     deferred = false;
 	t_specialization_failures         = &failures;
-	const bool done = MaterializeWalk(program, runtime, snapshot, specialization, true, deferred);
+	const bool done = MaterializeWalk(program, runtime, snapshot, specialization, true,
+	                                  runtime.defer_scalars, "off for this program", deferred);
 	t_specialization_failures = nullptr;
 	if (done) return true;
 	if (deferred) {
-		return MaterializeWalk(program, runtime, snapshot, specialization, false, deferred);
+		return MaterializeWalk(program, runtime, snapshot, specialization, false, false,
+		                       "the walk with deferred loads failed and runs again waiting", deferred);
 	}
 	for (const auto& failure: failures) (void)SpecializationFail(failure);
 	return false;
@@ -2394,7 +2424,8 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 	       selector_groups, control_flow, control_phis, srt_reads, source_reads, capture_specialization_reads,
 	       srt_plan_complete, resource_tracking_complete, info, uniform_fill,
 	       // Derived on load.
-	       srt_code, srt_user_data, srt_captures, srt_scratch, material_keys, selector_keys] = plan;
+	       srt_code, srt_user_data, srt_captures, srt_load_sites, srt_load_reasons, srt_deferred, srt_scratch,
+	       material_keys, selector_keys] = plan;
 	IoValues(io, values, control_phis);
 	IoAll(io, stage, shader_hash, user_data_base, user_data_count, memory_info, descriptor_sources,
 	      selector_groups, control_flow, srt_reads, source_reads, capture_specialization_reads,

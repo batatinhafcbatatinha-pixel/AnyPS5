@@ -61,7 +61,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
 		return manager;
 	}
-	auto  manager = std::make_unique<RegionManager>(m_page_manager, TrackerAddress(index * TRACKER_REGION_SIZE));
+	auto  manager = std::make_unique<RegionManager>(m_page_manager, TrackerAddress(index * TRACKER_REGION_SIZE), &m_hot);
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
@@ -112,6 +112,34 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, false>(offset, bytes);
 	});
+}
+
+void MemoryTracker::UnmarkRegionsAsGpuModified(std::span<const GuestRange> ranges) {
+	auto& chunks = ::ShaderRecompiler::ThreadOwned(s_unmark_chunks);
+	chunks.clear();
+	for (size_t index = 0; index < ranges.size(); index++) {
+		Iterate<false>(ranges[index].address, ranges[index].size,
+		               [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			               // Nothing to clear in a GPU-clean range; checked without the lock like
+			               // the queries.
+			               if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+				               chunks.push_back({manager, index, offset, bytes});
+			               }
+		               });
+	}
+	for (size_t first = 0; first < chunks.size();) {
+		auto* manager = chunks[first].manager;
+		auto  last    = first + 1;
+		while (last < chunks.size() && chunks[last].manager == manager) {
+			last++;
+		}
+		std::scoped_lock lock(manager->lock);
+		manager->ClearGpuModifiedBatch(last - first, [&](size_t chunk) {
+			return std::pair<uint64_t, uint64_t> {chunks[first + chunk].offset,
+			                                      chunks[first + chunk].bytes};
+		});
+		first = last;
+	}
 }
 
 } // namespace Libs::Graphics

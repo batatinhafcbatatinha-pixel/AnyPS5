@@ -68,6 +68,8 @@ public:
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
 	              uint64_t destination_offset, uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	// Writes dword-aligned data, at most 64 KiB, in command order (vkCmdUpdateBuffer).
+	void Update(uint64_t offset, const void* data, uint64_t size);
 
 	// BufferCache state lives directly on the resource.
 	bool     is_deleted      = false;

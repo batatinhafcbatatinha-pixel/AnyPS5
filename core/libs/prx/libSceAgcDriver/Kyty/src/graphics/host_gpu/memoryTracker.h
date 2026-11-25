@@ -26,6 +26,54 @@ public:
 	explicit MemoryTracker(PageManager& page_manager);
 
 	[[nodiscard]] PageManager& Pages() noexcept { return m_page_manager; }
+	// Exact hot pages of this tracker (see RegionManager and HotPages).
+	[[nodiscard]] HotPages& Hot() noexcept { return m_hot; }
+	// GPU thread: the shadow slot of the exact hot page holding `address`, HotPages::NO_SLOT
+	// when it is watched normally (see RegionManager::ExactHotSlot).
+	[[nodiscard]] uint16_t HotSlot(uint64_t address) const noexcept {
+		const auto* manager =
+		    m_regions[TrackerOffset(address) / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+		return manager != nullptr ? manager->ExactHotSlot(address % TRACKER_REGION_SIZE)
+		                          : HotPages::NO_SLOT;
+	}
+
+	// GPU thread, before each upload of bytes shaders read through device addresses (which no
+	// query reaches): func(page) for each exact hot page whose bytes differ from its upload, so
+	// the upload takes it as a fault would have queued it. Once per frame, hot pages unchanged
+	// for HOT_IDLE_FRAMES frames, or all of them when the compares of the last frame cost more
+	// than they saved (HotPages::EndFrame), are demoted; func(page) gets them too, as their next
+	// upload watches them again.
+	template <typename Func>
+	void ScanHotPages(Func&& func) {
+		if (!ExactHotPagesEnabled()) {
+			return;
+		}
+		m_hot.Recycle();
+		const auto frame    = TrackerFrame();
+		const bool new_frame = m_hot_scan_frame != frame;
+		const bool over      = m_hot.EndFrame(frame);
+		m_hot_scan_frame     = frame;
+		if (m_hot.Live() == 0) {
+			return;
+		}
+		m_hot.ForEachLive([&](uint16_t slot, uint64_t page) {
+			auto* manager = m_regions[TrackerOffset(page) / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+			if (manager == nullptr) {
+				return;
+			}
+			const auto offset = page % TRACKER_REGION_SIZE;
+			if (new_frame && (over || frame - m_hot.ChangedFrame(slot) > HOT_IDLE_FRAMES)) {
+				std::scoped_lock lock(manager->lock);
+				if (manager->DemoteExactHotBytes(offset, TRACKER_PAGE_SIZE)) {
+					func(page);
+				}
+				return;
+			}
+			if (manager->ExactHotChangedAt(offset)) {
+				func(page);
+			}
+		});
+	}
 	~MemoryTracker();
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
@@ -36,6 +84,10 @@ public:
 	[[nodiscard]] bool IsRegionUnwatched(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
+	// UnmarkRegionAsGpuModified for each of `ranges` (ascending, disjoint), the ranges of one
+	// tracker region cleared under one lock with one protection change (see
+	// RegionManager::ClearGpuModifiedBatch).
+	void UnmarkRegionsAsGpuModified(std::span<const GuestRange> ranges);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -84,9 +136,12 @@ public:
 		});
 	}
 
+	// generations_out, when given, gets the sum of the range's region generations as the call
+	// leaves them (see RegionGenerations), read race-free: an equal sum later means the call
+	// would find nothing to upload and change nothing again.
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
-	                        UploadFunc&& upload_func) {
+	                        UploadFunc&& upload_func, uint64_t* generations_out = nullptr) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		// Draws bind the same ranges again and again, unchanged. A call leaves its range
@@ -98,10 +153,17 @@ public:
 		// their memo also holds that submission's epoch.
 		const auto epoch = StickyPagesEnabled() ? TrackerEpoch() : UPLOAD_MEMO_NO_STICKY;
 		auto&      memo  = UploadMemoSlot(vaddr, size, is_written);
+		if (ExactHotPagesEnabled()) {
+			// No upload of an earlier call still copies into a shadow (see HotPages).
+			m_hot.Recycle();
+		}
 		if (memo.tracker == m_id && memo.vaddr == vaddr && memo.size == size &&
 		    memo.written == is_written && (memo.epoch == 0 || memo.epoch == epoch) &&
 		    memo.generations == RegionGenerations(vaddr, size)) {
 			upload_func();
+			if (generations_out != nullptr) {
+				*generations_out = memo.generations;
+			}
 			return;
 		}
 		// The regions' generations as this call leaves them. A region skipped without its lock is
@@ -118,7 +180,13 @@ public:
 				}
 			}
 			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
+			if (is_written) {
+				// The range becomes GPU-modified below: its exact hot pages are uploaded as
+				// ordinary dirty pages, watched before their bytes are copied, and stay watched.
+				(void)manager->DemoteExactHotBytes(offset, bytes);
+			}
+			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func,
+			                                                      !is_written);
 			if (!is_written) {
 				generations += manager->Generation();
 				hot |= manager->HasHot();
@@ -142,6 +210,9 @@ public:
 		        .generations = generations,
 		        .epoch       = hot ? epoch : 0,
 		        .written     = is_written};
+		if (generations_out != nullptr) {
+			*generations_out = generations;
+		}
 	}
 
 	// ForEachUploadRange(range, false, ...) for each of `ranges` with an empty upload callback,
@@ -161,6 +232,10 @@ public:
 				    []() noexcept {});
 			}
 			return;
+		}
+		if (ExactHotPagesEnabled()) {
+			// No upload of an earlier call still copies into a shadow (see HotPages).
+			m_hot.Recycle();
 		}
 		auto& chunks = ::ShaderRecompiler::ThreadOwned(s_batch_chunks);
 		chunks.clear();
@@ -212,6 +287,8 @@ private:
 	};
 	// AnyPS5: no thread_local with a destructor in this module (emulated TLS on MinGW).
 	inline static thread_local std::vector<BatchChunk>* s_batch_chunks = nullptr;
+	// UnmarkRegionsAsGpuModified's ranges cut at tracker regions, per thread.
+	inline static thread_local std::vector<BatchChunk>* s_unmark_chunks = nullptr;
 
 	// ForEachUploadRange's last call per range, per thread.
 	struct UploadMemo {
@@ -240,8 +317,11 @@ private:
 		return (*memo)[hash % UPLOAD_MEMO_SLOTS];
 	}
 
+public:
 	// Sum of the generations of the regions the range touches, without their locks; 0 when one
-	// of them does not exist yet. Indexed like Iterate (AnyPS5: by TrackerOffset).
+	// of them does not exist yet, or when the range holds an exact hot page: guest writes change
+	// such a page without a fault, so no generation tells that it stayed the same. Indexed like
+	// Iterate (AnyPS5: by TrackerOffset).
 	[[nodiscard]] uint64_t RegionGenerations(uint64_t vaddr, uint64_t size) const noexcept {
 		uint64_t   sum   = 0;
 		const auto first = TrackerOffset(vaddr) / TRACKER_REGION_SIZE;
@@ -249,6 +329,13 @@ private:
 		for (auto index = first; index <= last; index++) {
 			const auto* manager = m_regions[index].load(std::memory_order_acquire);
 			if (manager == nullptr) {
+				return 0;
+			}
+			const auto region_begin = index * TRACKER_REGION_SIZE;
+			const auto offset       = TrackerOffset(vaddr);
+			const auto begin        = std::max(offset, region_begin);
+			const auto end          = std::min(offset + size, region_begin + TRACKER_REGION_SIZE);
+			if (manager->HasExactHotBytes(begin - region_begin, end - begin)) {
 				return 0;
 			}
 			sum += manager->Generation();
@@ -280,6 +367,7 @@ private:
 	}
 	std::unique_ptr<std::atomic<uint64_t>[]> m_gpu_regions;
 
+private:
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {
 		ValidateRange(vaddr, size);
@@ -313,6 +401,11 @@ private:
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
+	// Frames a hot page may go unchanged before it is watched again (ScanHotPages).
+	static constexpr uint64_t HOT_IDLE_FRAMES = 8;
+
+	HotPages                                       m_hot;
+	uint64_t                                       m_hot_scan_frame = 0; // GPU thread
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	Common::SrwMutex                               m_region_mutex;

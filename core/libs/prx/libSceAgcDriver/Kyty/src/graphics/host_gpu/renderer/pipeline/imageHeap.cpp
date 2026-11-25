@@ -451,18 +451,41 @@ bool ImageHeap::ForEachChanged(Fn&& fn) {
 
 // Moves the slots of every view off marked elements; pending draws keep reading those.
 void ImageHeap::Repoint() {
+	// An element's refs count the slot words that select it, so the marked elements' refs are the
+	// slots to move: the walk ends after the last one, and tests a byte per element first instead
+	// of loading the element. Moving a slot releases one reference of its marked element; the
+	// elements Intern creates or reuses meanwhile are live and were never counted.
+	auto&    marked    = m_repoint_marked;
+	uint64_t remaining = 0;
+	marked.assign(m_elements.size(), uint8_t {0});
+	for (size_t index = 0; index < m_elements.size(); ++index) {
+		const auto& element = m_elements[index];
+		if (element.state != State::Live && element.refs != 0u) {
+			marked[index] = 1u;
+			remaining += element.refs;
+		}
+	}
 	for (const auto& memory: m_memories) {
 		for (const auto& view: memory->views) {
-			for (uint64_t probe = 0; probe < view->count; ++probe) {
-				const auto  slot    = (view->first + probe * view->step) / 4u;
-				const auto& element = m_elements[view->slots[slot] & ElementMask];
+			for (uint64_t probe = 0; probe < view->count && remaining != 0; ++probe) {
+				const auto slot  = (view->first + probe * view->step) / 4u;
+				const auto index = view->slots[slot] & ElementMask;
+				if (index >= marked.size() || marked[index] == 0u) {
+					continue;
+				}
+				const auto& element = m_elements[index];
 				if (element.state == State::Buried) {
 					memory->dead[slot] = Hash(element.key.value);
 					Assign(*view, slot, 0u);
+					--remaining;
 				} else if (element.state == State::Stale) {
 					const auto key = element.key; // Intern may grow m_elements.
 					Assign(*view, slot, Intern(*view, element.kind, key));
+					--remaining;
 				}
+			}
+			if (remaining == 0) {
+				return;
 			}
 		}
 	}
