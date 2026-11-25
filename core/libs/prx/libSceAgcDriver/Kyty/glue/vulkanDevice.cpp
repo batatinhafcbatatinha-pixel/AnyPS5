@@ -730,8 +730,33 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 
 	vk::Device device = nullptr;
-	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
-	                     "vkCreateDevice");
+	auto       result = physical_device.createDevice(&create.get(), nullptr, &device);
+	if (result != vk::Result::eSuccess) {
+		std::string names;
+		for (const char* name: device_extensions) {
+			names += std::string(" ") + name;
+		}
+		Log::WriteToConsoleAndLog(fmt::format("vkCreateDevice failed: {}\n  extensions:{}\n",
+		                                      vk::to_string(result), names));
+	}
+	if (result != vk::Result::eSuccess && ray_query_enabled) {
+		// KytyPS5 cb84c953: a driver that refuses the device with native ray tracing gets it
+		// without; the ray queries then take the software traversal.
+		Log::WriteToConsoleAndLog("WARNING: retrying vkCreateDevice without native RT\n");
+		for (const char* name: {VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+		                        VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+		                        VK_KHR_RAY_QUERY_EXTENSION_NAME}) {
+			std::erase_if(device_extensions,
+			              [name](const char* other) { return std::strcmp(other, name) == 0; });
+		}
+		create.get().enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
+		create.get().ppEnabledExtensionNames = device_extensions.data();
+		create.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
+		create.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
+		graphics.ray_query_enabled = false;
+		result = physical_device.createDevice(&create.get(), nullptr, &device);
+	}
+	RequireVulkanSuccess(result, "vkCreateDevice");
 	return device;
 }
 
