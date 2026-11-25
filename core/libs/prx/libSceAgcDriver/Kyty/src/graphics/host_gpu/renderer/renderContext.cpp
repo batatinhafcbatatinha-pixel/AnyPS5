@@ -133,6 +133,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		// Deferred upload bytes are read from guest memory: before it is unmapped.
+		m_buffer_cache.FlushDeferredTracking();
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		// AnyPS5: guest releases arrive through libc's release observer for ranges the caches may

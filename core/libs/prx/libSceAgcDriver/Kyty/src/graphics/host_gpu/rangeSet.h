@@ -14,29 +14,40 @@ namespace Libs::Graphics {
 
 class RangeSet final {
 public:
-	RangeSet()                           = default;
-	RangeSet(const RangeSet&)            = default;
-	RangeSet& operator=(const RangeSet&) = default;
+	RangeSet()                = default;
+	RangeSet(const RangeSet&) = default;
+	// Assignments replace the ranges: Removals() grows.
+	RangeSet& operator=(const RangeSet& other) {
+		if (this != &other) {
+			m_ranges   = other.m_ranges;
+			m_recent   = other.m_recent;
+			m_removals = std::max(m_removals, other.m_removals) + 1;
+		}
+		return *this;
+	}
 	// A moved-from set is empty, so its recent ranges go with the ranges.
 	RangeSet(RangeSet&& other) noexcept
-	    : m_ranges(std::move(other.m_ranges)), m_recent(other.m_recent) {
+	    : m_ranges(std::move(other.m_ranges)), m_recent(other.m_recent),
+	      m_removals(other.m_removals) {
 		other.Reset();
 	}
 	RangeSet& operator=(RangeSet&& other) noexcept {
 		if (this != &other) {
-			m_ranges = std::move(other.m_ranges);
-			m_recent = other.m_recent;
+			m_ranges   = std::move(other.m_ranges);
+			m_recent   = other.m_recent;
+			m_removals = std::max(m_removals, other.m_removals) + 1;
 			other.Reset();
 		}
 		return *this;
 	}
 
-	void Add(uint64_t address, uint64_t size) {
+	// True when the set changed (the range was not inside it already).
+	bool Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		// The same ranges are added again and again (a buffer every draw writes, the spans of a
 		// table every dispatch writes): one inside a range added lately is in the set already.
 		if (Recalled(address, end)) {
-			return;
+			return false;
 		}
 		auto it = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
@@ -47,7 +58,7 @@ public:
 		} else {
 			if (it->second >= end) {
 				Remember(address, it->first, it->second);
-				return;
+				return false;
 			}
 			it->second = end;
 		}
@@ -57,7 +68,12 @@ public:
 			next       = m_ranges.erase(next);
 		}
 		Remember(address, it->first, it->second);
+		return true;
 	}
+
+	// Grows whenever bytes leave the set (Extract, Subtract, assignment, being moved from), so
+	// an unchanged value means every range found inside the set before is still inside it.
+	[[nodiscard]] uint64_t Removals() const noexcept { return m_removals; }
 
 	void Subtract(uint64_t address, uint64_t size) {
 		Extract(address, size, [](uint64_t, uint64_t) {});
@@ -76,6 +92,7 @@ public:
 		}
 		if (it != m_ranges.end() && it->first < end) {
 			Forget();
+			m_removals++;
 		}
 		while (it != m_ranges.end() && it->first < end) {
 			const auto begin = it->first;
@@ -170,10 +187,12 @@ private:
 	void Reset() noexcept {
 		m_ranges.clear();
 		m_recent = {};
+		m_removals++;
 	}
 
 	std::map<uint64_t, uint64_t>                            m_ranges;
 	std::array<std::pair<uint64_t, uint64_t>, RECENT_SLOTS> m_recent {};
+	uint64_t                                                m_removals = 0;
 };
 
 } // namespace Libs::Graphics

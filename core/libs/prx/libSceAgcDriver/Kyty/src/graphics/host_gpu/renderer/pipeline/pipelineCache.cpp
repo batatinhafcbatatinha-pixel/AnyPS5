@@ -29,6 +29,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -244,7 +245,21 @@ std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&         
 
 } // namespace
 
+namespace {
+
+// APS5_KYTY_X_RT with the letter w keeps every wave64 compute program on the lane-pair emission.
+bool WaveSplitAllowed() {
+	const char* value = std::getenv("APS5_KYTY_X_RT");
+	return value == nullptr || std::strchr(value, 'w') == nullptr;
+}
+
+} // namespace
+
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
+	// A one-wave wave64 workgroup on a device whose subgroups are always 32 wide (no size control
+	// range) is two full subgroups of 32: each one guest half (see the SPIR-V emitter).
+	const bool fixed_32 = graphics.subgroup_size == 32u && graphics.min_subgroup_size == 32u &&
+	                      graphics.max_subgroup_size == 32u;
 	// AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
 	// signed-zero results; GLSL.std.450 alone does not order -0 below +0.
 	return {.maintenance8           = graphics.maintenance8_enabled,
@@ -254,7 +269,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .r8_srgb_views          = graphics.r8_srgb_views,
 	        .r8g8_srgb_views        = graphics.r8g8_srgb_views,
 	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
-	        .ray_query              = graphics.ray_query_enabled};
+	        .ray_query              = graphics.ray_query_enabled,
+	        .wave_split             = fixed_32 && WaveSplitAllowed()};
 }
 
 std::filesystem::path ShaderStorePath() {

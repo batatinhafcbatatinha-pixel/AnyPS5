@@ -122,6 +122,13 @@ inline std::atomic<bool> g_exact_hot_pages {false};
 inline bool              ExactHotPagesEnabled() noexcept {
 	return g_exact_hot_pages.load(std::memory_order_relaxed) && !StickyPagesEnabled();
 }
+// Deferred protection (APS5_KYTY_X_CUT letter g): set by the buffer cache, which flushes the deferred
+// changes before each submission (BufferCache::FlushDeferredTracking). While set, marking pages
+// GPU-modified leaves their no-access protection to that flush.
+inline std::atomic<bool> g_deferred_protection {false};
+inline bool              DeferredProtectionEnabled() noexcept {
+	return g_deferred_protection.load(std::memory_order_relaxed);
+}
 
 class RegionManager final {
 public:
@@ -262,7 +269,10 @@ public:
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>(changed);
 		} else {
-			UpdateProtection<enable, true>(changed);
+			// Pages a GPU write is recorded for hold their current bytes in guest memory until the
+			// batch runs, so CPU reads need not fault before it is submitted: the no-access
+			// protection waits for the flush before the submission.
+			UpdateProtection<enable, true>(changed, enable && DeferredProtectionEnabled());
 		}
 		// A call that changes nothing (a buffer written by every draw, GPU-dirty already) keeps
 		// the generation, so upload memos of the region's other ranges stay valid.
@@ -378,7 +388,10 @@ public:
 	// splitting it. func(i, address, bytes) gets the pages each call would have reported, in the
 	// same order. Only while StickyPagesEnabled() is false (hot pages take the other path).
 	template <typename RangeAt, typename Func>
-	void ForEachCpuModifiedRangeBatch(size_t count, RangeAt&& range_at, Func&& func) {
+	// defer: the pages' write watch is protected by the next deferred flush; the caller copies
+	// the reported bytes after that flush (BufferCache::FlushDeferredTracking).
+	void ForEachCpuModifiedRangeBatch(size_t count, RangeAt&& range_at, Func&& func,
+	                                  bool defer = false) {
 		RegionBits mask;
 		bool       any = false;
 		for (size_t index = 0; index < count; index++) {
@@ -402,7 +415,7 @@ public:
 		for (const auto [first, last]: watch) {
 			m_cpu_dirty.UnsetRange(first, last);
 		}
-		UpdateProtection<true, false>(watch);
+		UpdateProtection<true, false>(watch, defer);
 		// Hot pages that only got compared change no state.
 		if (promoted || !watch.None()) {
 			Bump();
@@ -610,9 +623,9 @@ private:
 
 	// CPU-dirty pages are not write-watched; GPU-dirty pages are read-watched.
 	template <bool track, bool is_read>
-	void UpdateProtection(RegionBits& changed) {
+	void UpdateProtection(RegionBits& changed, bool defer = false) {
 		if (!changed.None()) {
-			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
+			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed, defer);
 		}
 	}
 

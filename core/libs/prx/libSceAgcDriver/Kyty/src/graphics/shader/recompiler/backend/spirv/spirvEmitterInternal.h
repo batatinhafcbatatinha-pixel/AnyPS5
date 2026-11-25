@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <spirv/unified1/GLSL.std.450.h>
@@ -113,6 +114,13 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
+	// A one-wave wave64 workgroup on two 32-wide host subgroups, one guest lane per invocation:
+	// lane = subgroup id * 32 + subgroup lane. Values that cross the halves go through
+	// wave_exchange_variable between workgroup barriers (see WaveExchangeWrite).
+	bool                                             wave_split              = false;
+	uint32_t                                         subgroup_id_variable    = 0;
+	uint32_t                                         wave_exchange_variable  = 0;
+	uint32_t                                         wave_exchange_parity    = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
@@ -269,6 +277,25 @@ inline uint32_t Select(EmitterState& state, uint32_t type, uint32_t condition, u
 	return result;
 }
 
+// Guest wave64 lanes that are not the host's own subgroup lanes (two halves per invocation or
+// one half per subgroup): half-local subgroup operations need the lane within its half.
+inline bool PairedWave64(const EmitterState& state) {
+	return state.lane_count == 2 || state.wave_split;
+}
+
+// Wave split: the guest lane of this invocation (0..63).
+uint32_t EmitWaveSplitLane(EmitterState& state);
+// Wave split: stores up to two words in this invocation's exchange slots and waits for the
+// workgroup (the guest wave); returns the base that WaveExchangeRead takes. Both halves run the
+// same guest control flow (every branch is wave-uniform), so they reach the same barriers.
+uint32_t WaveExchangeWrite(EmitterState& state, std::initializer_list<uint32_t> words);
+// Wave split: word `word` that guest lane `lane` (0..63) stored in the exchange at `base`.
+uint32_t WaveExchangeRead(EmitterState& state, uint32_t base, uint32_t word, uint32_t lane);
+// Wave split: a value that is uniform within each half, from the other half.
+uint32_t WaveExchangeOtherHalf(EmitterState& state, uint32_t value);
+// Wave split: whether this invocation is in the upper guest half (lanes 32..63).
+uint32_t EmitWaveSplitUpperHalf(EmitterState& state);
+
 struct ValueEmitContext {
 	explicit ValueEmitContext(EmitterState& state_): state(state_) {}
 
@@ -277,7 +304,9 @@ struct ValueEmitContext {
 	uint32_t              HalfArg(const IR::Inst& inst, size_t index, uint32_t half);
 	uint32_t              Ballot(IR::Value predicate);
 	uint32_t              FirstLane(uint32_t ballot);
-	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane);
+	// same_half: the caller guarantees that lane is in the caller's own 32-lane half.
+	uint32_t              Shuffle(const IR::Inst& inst, size_t index, uint32_t lane,
+	                              bool same_half = false);
 	uint32_t              Result(const IR::Inst& inst);
 	uint32_t              Define(const IR::Inst& inst, uint32_t value);
 	uint32_t              ResourceIndex(IR::Value value, IR::ValueOpcode opcode);

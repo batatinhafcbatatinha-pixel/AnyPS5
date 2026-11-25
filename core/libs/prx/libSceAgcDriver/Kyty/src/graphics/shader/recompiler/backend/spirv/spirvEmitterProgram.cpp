@@ -554,6 +554,19 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
 	                          other_half == nullptr || half == 0 ? Def(predicate)
 	                                                             : other_half->Def(predicate));
+	if (state.wave_split) {
+		// Each subgroup has its half's word; the other half's comes through the exchange.
+		const auto own    = state.builder.AllocateId();
+		const auto ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), own, low, 0);
+		const auto other = WaveExchangeOtherHalf(state, own);
+		const auto upper = EmitWaveSplitUpperHalf(state);
+		state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot,
+		                          Select(state, TypeU32(state), upper, other, own),
+		                          Select(state, TypeU32(state), upper, own, other),
+		                          ConstantU32(state, 0), ConstantU32(state, 0));
+		return ballot;
+	}
 	if (other_half == nullptr) {
 		return low;
 	}
@@ -591,9 +604,26 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	              low_first, high_lane);
 }
 
-uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
+uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane,
+                                   bool same_half) {
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
+	if (state.wave_split && same_half) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, result, scope,
+		                          Arg(inst, index),
+		                          EmitBinaryU32(state, spv::OpBitwiseAnd, lane,
+		                                        ConstantU32(state, 31)));
+		return result;
+	}
+	if (state.wave_split) {
+		// Any of the 64 lanes, as the lane pair reads lane & 31 of half (lane & 32).
+		if (type != TypeU32(state)) {
+			Fail(inst, "has a non-U32 cross-lane read in a split wave64");
+		}
+		const auto base = WaveExchangeWrite(state, {Arg(inst, index)});
+		return WaveExchangeRead(state, base, 0, lane);
+	}
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),

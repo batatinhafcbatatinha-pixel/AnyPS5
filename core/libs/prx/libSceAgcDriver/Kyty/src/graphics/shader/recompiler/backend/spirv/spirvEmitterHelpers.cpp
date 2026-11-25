@@ -106,10 +106,111 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
+	if (state.wave_split) {
+		return EmitWaveSplitLane(state);
+	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
 	                          state.subgroup_local_invocation_id_variable);
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
+}
+
+uint32_t EmitWaveSplitUpperHalf(EmitterState& state) {
+	if (state.subgroup_id_variable == 0) {
+		EXIT("SubgroupId was not declared before SPIR-V function emission\n");
+	}
+	const auto id = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), id, state.subgroup_id_variable);
+	return Binary(state, spv::OpINotEqual, TypeBool(state),
+	              Binary(state, spv::OpBitwiseAnd, TypeU32(state), id, ConstantU32(state, 1)),
+	              ConstantU32(state, 0));
+}
+
+uint32_t EmitWaveSplitLane(EmitterState& state) {
+	if (state.subgroup_id_variable == 0 || state.subgroup_local_invocation_id_variable == 0) {
+		EXIT("Wave split lane builtins were not declared before SPIR-V function emission\n");
+	}
+	const auto id   = state.builder.AllocateId();
+	const auto lane = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), id, state.subgroup_id_variable);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), lane,
+	                          state.subgroup_local_invocation_id_variable);
+	// The workgroup is two full subgroups of 32 (one guest wave), so this is 0..63.
+	const auto half = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+	                         Binary(state, spv::OpBitwiseAnd, TypeU32(state), id,
+	                                ConstantU32(state, 1)),
+	                         ConstantU32(state, 5));
+	return Binary(state, spv::OpBitwiseOr, TypeU32(state), half,
+	              Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31)));
+}
+
+namespace {
+
+// Two buffers of two words per guest lane. Exchange k uses buffer k & 1: an invocation stores into
+// it again (exchange k + 2) only after the barrier of exchange k + 1, which every invocation
+// reaches after its reads of exchange k.
+constexpr uint32_t WaveExchangeWords  = 2;
+constexpr uint32_t WaveExchangeDwords = 2 * WaveExchangeWords * 64;
+
+uint32_t WaveExchangePointer(EmitterState& state, uint32_t index) {
+	return Binary(state, spv::OpAccessChain,
+	              TypePointer(state, spv::StorageClassWorkgroup, TypeU32(state)),
+	              state.wave_exchange_variable, index);
+}
+
+} // namespace
+
+uint32_t WaveExchangeWrite(EmitterState& state, std::initializer_list<uint32_t> words) {
+	EXIT_IF(!state.wave_split || words.size() == 0 || words.size() > WaveExchangeWords);
+	if (state.wave_exchange_variable == 0) {
+		state.wave_exchange_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, WaveExchangeDwords),
+		    spv::StorageClassWorkgroup);
+		state.builder.AddName(state.wave_exchange_variable, "wave_exchange");
+		state.wave_exchange_parity = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeU32(state)),
+		    spv::StorageClassPrivate, ConstantU32(state, 0));
+		state.builder.AddName(state.wave_exchange_parity, "wave_exchange_parity");
+	}
+	const auto parity = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), parity, state.wave_exchange_parity);
+	state.builder.AddFunction(spv::OpStore, state.wave_exchange_parity,
+	                          Binary(state, spv::OpBitwiseXor, TypeU32(state), parity,
+	                                 ConstantU32(state, 1)));
+	const auto base = Binary(state, spv::OpIMul, TypeU32(state), parity,
+	                         ConstantU32(state, WaveExchangeWords * 64));
+	const auto lane = EmitWaveSplitLane(state);
+	uint32_t   word = 0;
+	for (const auto value: words) {
+		const auto index =
+		    EmitAddU32(state, EmitAddU32(state, base, ConstantU32(state, word * 64)), lane);
+		state.builder.AddFunction(spv::OpStore, WaveExchangePointer(state, index), value);
+		word++;
+	}
+	state.builder.AddFunction(
+	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
+	    ConstantU32(state, spv::ScopeWorkgroup),
+	    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+	                           spv::MemorySemanticsWorkgroupMemoryMask));
+	return base;
+}
+
+uint32_t WaveExchangeRead(EmitterState& state, uint32_t base, uint32_t word, uint32_t lane) {
+	const auto index = EmitAddU32(
+	    state, EmitAddU32(state, base, ConstantU32(state, word * 64)),
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 63)));
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
+	                          WaveExchangePointer(state, index));
+	return value;
+}
+
+uint32_t WaveExchangeOtherHalf(EmitterState& state, uint32_t value) {
+	const auto base = WaveExchangeWrite(state, {value});
+	// The same lane of the other half: one load per invocation, no shared address.
+	return WaveExchangeRead(state, base, 0,
+	                        Binary(state, spv::OpBitwiseXor, TypeU32(state),
+	                               EmitWaveSplitLane(state), ConstantU32(state, 32)));
 }
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
@@ -148,6 +249,10 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
+	}
+	if (state.wave_split) {
+		// One guest wave per workgroup: the guest's invocation index is its lane.
+		return EmitWaveSplitLane(state);
 	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);

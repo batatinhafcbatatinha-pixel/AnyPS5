@@ -111,6 +111,10 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
+	// Before a batch is submitted, and before guest memory leaves the GPU's mappings: applies
+	// the page protections the batch's uploads and GPU writes deferred, then copies the bytes of
+	// its deferred uploads (APS5_KYTY_X_CUT letter g). GPU thread, or a thread that submits its batch.
+	void               FlushDeferredTracking();
 	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
 	void SynchronizeBda(const RangeSet& mapped);
 	// The unwatched pages whose bytes changed since the last scan (thread-safe); a submission
@@ -202,8 +206,19 @@ private:
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer,
 	                                     uint64_t* generations_out = nullptr);
+	// defer: the staging bytes are copied by FlushDeferredTracking (see SynchronizeBda).
 	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
-	                  uint64_t total_size);
+	                  uint64_t total_size, bool defer = false);
+	// Uploads whose bytes wait for FlushDeferredTracking (GPU thread).
+	struct DeferredCopy {
+		uint64_t address;
+		uint8_t* destination;
+		uint64_t size;
+		Buffer*  staging;
+		uint64_t offset; // of destination in staging
+	};
+	std::vector<DeferredCopy> m_deferred_copies;
+	void                      MarkHotUploadsDeferred(uint64_t address, uint64_t size);
 	// Guest bytes for an upload of tracker-reported pages: CopySparseMemory, but exact hot pages
 	// (hotPages.h) through their shadow, which the copy refreshes.
 	[[nodiscard]] bool CopyGuestForUpload(uint64_t address, uint8_t* destination, uint64_t size);
@@ -265,7 +280,16 @@ private:
 		BufferId id {};
 		bool     written  = false;
 		bool     readback = false; // a written range on read-back pages (NoteReadbackWrite)
+		// m_gpu_modified_ranges.Removals() when it last held the written range (letter i).
+		uint64_t gpu_removals = 0;
+		// The read-back bookkeeping as the range's last NoteReadbackWrite left it (letter j):
+		// m_eager_writes.Removals(), m_readback_version and the program it named.
+		uint64_t eager_removals   = 0;
+		uint64_t readback_version = 0;
+		uint64_t program          = 0;
 	};
+	// Grows whenever NoteReadbackWrite changes m_eager_writes or m_readback_writers.
+	uint64_t m_readback_version = 0;
 	static constexpr size_t OBTAIN_MEMO_SLOTS = 2048;
 	[[nodiscard]] ObtainMemo& ObtainMemoSlot(uint64_t vaddr, uint64_t size, bool written);
 	// ObtainBuffer of a written range: queues the eager download of its bytes on read-back pages
@@ -303,6 +327,11 @@ private:
 	std::map<uint64_t, uint32_t> m_cp_known;
 	std::mutex                   m_cp_known_mutex; // AdoptGuestMemory may run on other threads.
 	std::atomic<bool>            m_cp_known_any {false};
+	// Bounds of the known words' addresses, [begin, end): grow while any are known (stores
+	// under the mutex), reset when none are.
+	std::atomic<uint64_t>        m_cp_known_begin {UINT64_MAX};
+	std::atomic<uint64_t>        m_cp_known_end {0};
+	void                         StoreCpKnown(uint64_t vaddr, const void* data, uint64_t size);
 	void                         ForgetCpKnownWords(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool           CpKnownWords(uint64_t vaddr, uint64_t size, void* data);
 	uint64_t                                          m_bda_reader_tick = 0;

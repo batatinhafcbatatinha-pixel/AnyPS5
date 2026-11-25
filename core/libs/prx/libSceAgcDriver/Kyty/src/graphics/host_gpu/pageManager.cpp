@@ -132,6 +132,10 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
+		// Pages whose OS protection may lag their watcher counts after a deferred change, and
+		// whether the region is in `deferred` (both under `lock`).
+		RegionBits pending;
+		bool       queued = false;
 	};
 
 	Impl() {
@@ -196,7 +200,7 @@ struct PageManager::Impl {
 
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
-	                          const RegionBits* mask = nullptr) {
+	                          const RegionBits* mask = nullptr, bool defer = false) {
 		SpinGuard lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
@@ -205,7 +209,18 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				if (defer) {
+					region.pending.SetRange(static_cast<size_t>(range_begin),
+					                        static_cast<size_t>(range_begin + range_bytes / PAGE_SIZE));
+					if (!region.queued) {
+						region.queued = true;
+						std::lock_guard deferred_lock(deferred_mutex);
+						deferred.emplace_back(&region, base_addr);
+						has_deferred.store(true, std::memory_order_release);
+					}
+				} else {
+					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				}
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -246,8 +261,60 @@ struct PageManager::Impl {
 		release_pending();
 	}
 
+	void FlushDeferred() {
+		std::vector<std::pair<Region*, uint64_t>> regions;
+		{
+			std::lock_guard deferred_lock(deferred_mutex);
+			regions.swap(deferred);
+			has_deferred.store(false, std::memory_order_release);
+		}
+		for (const auto& [region, base_addr]: regions) {
+			SpinGuard lock(region->lock);
+			region->queued = false;
+			if (region->pending.None()) {
+				continue;
+			}
+			// One call per run of pages with one protection that holds a pending page. Pages
+			// between pending ones whose protection is the run's already have it (only pending
+			// pages lag their counts), so they join the run instead of splitting it.
+			const auto lo   = region->pending.FirstRange().first;
+			const auto hi   = region->pending.LastRange().second;
+			size_t     run  = lo;
+			size_t     tail = lo; // one past the last pending page of the run
+			auto       mode = region->pages[lo].Perms();
+			const auto issue = [&] {
+				if (tail > run) {
+					Protect(base_addr + run * PAGE_SIZE, (tail - run) * PAGE_SIZE, mode);
+				}
+			};
+			for (size_t page = lo; page < hi; page++) {
+				const auto page_mode = region->pages[page].Perms();
+				const bool lagging   = region->pending.Get(page);
+				if (page_mode != mode) {
+					issue();
+					run  = page;
+					tail = page;
+					mode = page_mode;
+				}
+				if (lagging) {
+					tail = page + 1;
+				} else if (tail == run) {
+					// No pending page in the run yet: it starts later.
+					run  = page + 1;
+					tail = page + 1;
+				}
+			}
+			issue();
+			region->pending.Clear();
+		}
+	}
+
+	[[nodiscard]] bool HasDeferred() const noexcept {
+		return has_deferred.load(std::memory_order_acquire);
+	}
+
 	template <bool track, bool is_read>
-	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
+	void UpdatePageWatchers(uint64_t vaddr, uint64_t size, bool defer = false) {
 		ValidateRange(vaddr, size);
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
 		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
@@ -260,7 +327,8 @@ struct PageManager::Impl {
 			}
 			const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
 			const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
-			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last);
+			UpdateRegionWatchers<track, is_read, false>(*region, region_base, first, last, nullptr,
+			                                            defer);
 			chunk_begin = chunk_end;
 		}
 	}
@@ -306,6 +374,10 @@ struct PageManager::Impl {
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	Common::SrwMutex                        region_mutex;
+	// Regions with pending pages (see Region::pending).
+	std::mutex                                deferred_mutex;
+	std::vector<std::pair<Region*, uint64_t>> deferred;
+	std::atomic<bool>                         has_deferred {false};
 };
 
 static_assert(std::atomic<void*>::is_always_lock_free);
@@ -329,14 +401,14 @@ template void PageManager::UpdatePageWatchers<false, true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false, false>(uint64_t, uint64_t);
 
 template <bool track, bool is_read>
-void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
+void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask, bool defer) {
 	const auto start_range = mask.FirstRange();
 	const auto end_range   = mask.LastRange();
 	const auto first       = start_range.first;
 	const auto last        = end_range.second;
 	if (start_range.second == end_range.second) {
 		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
-		                                           (last - first) * PAGE_SIZE);
+		                                           (last - first) * PAGE_SIZE, defer);
 		return;
 	}
 
@@ -344,12 +416,21 @@ void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& ma
 	if (region == nullptr) {
 		Fatal("untracking unknown region 0x%016" PRIx64, base_addr);
 	}
-	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask);
+	m_impl->UpdateRegionWatchers<track, is_read, true>(*region, base_addr, first, last, &mask,
+	                                                   defer);
 }
 
-template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&);
-template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
-template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
-template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
+void PageManager::FlushDeferred() {
+	m_impl->FlushDeferred();
+}
+
+bool PageManager::HasDeferred() const noexcept {
+	return m_impl->HasDeferred();
+}
+
+template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, RegionBits&, bool);
+template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&, bool);
+template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&, bool);
+template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&, bool);
 
 } // namespace Libs::Graphics

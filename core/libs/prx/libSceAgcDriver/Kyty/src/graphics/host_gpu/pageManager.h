@@ -20,8 +20,17 @@ public:
 
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
+	// defer: the watcher counts change now, but the OS protection of the pages whose protection
+	// changes is applied by the next FlushDeferred, not here. Only for changes that make pages
+	// stricter, where the weaker protection meanwhile is harmless to the caller (see
+	// BufferCache::FlushDeferredTracking).
 	template <bool track, bool is_read = false>
-	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
+	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask, bool defer = false);
+
+	// Applies the protection the watcher counts give to every page a deferred change left
+	// behind, in as few calls as the pages' protections allow.
+	void               FlushDeferred();
+	[[nodiscard]] bool HasDeferred() const noexcept;
 
 	// Stores bytes at their guest addresses without raising guest faults: the pages are writable
 	// for the copy and get their watcher protection back. For GPU results in ranges the backing

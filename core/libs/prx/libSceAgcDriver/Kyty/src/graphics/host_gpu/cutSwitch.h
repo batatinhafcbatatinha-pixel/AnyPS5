@@ -16,7 +16,18 @@ namespace Libs::Graphics {
 //   d: eager read-back downloads share one copy list per batch
 //   e: pages the CPU rewrites every frame stay unwatched, compared with a shadow of their upload
 //   f: recorder thread reads the ring's write position once per burst, not per record
+//   g: page protections that make pages stricter (BDA re-watch, GPU-modified marks) and the
+//      BDA upload bytes behind them are applied once, before the batch is submitted. OFF unless
+//      APS5_KYTY_X_CUT_ON lists it: other watchers of a pending page (texture cache, image heap) skip
+//      the protection they need while it waits, so guest reads can miss a write-back.
+//   h: CP-known overlay skips written ranges outside the addresses of its words
+//   i: ObtainBuffer memos survive read-back downloads of other bytes and repeated marks
+//   j: ObtainBuffer memo hits skip read-back bookkeeping that would change nothing
 [[nodiscard]] inline bool CutEnabled(char letter) noexcept {
+	if (letter == 'g') {
+		const char* enabled = std::getenv("APS5_KYTY_X_CUT_ON");
+		return enabled != nullptr && std::strchr(enabled, letter) != nullptr;
+	}
 	const char* disabled = std::getenv("APS5_KYTY_X_CUT");
 	return disabled == nullptr || std::strchr(disabled, letter) == nullptr;
 }

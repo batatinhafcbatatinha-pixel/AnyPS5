@@ -17,7 +17,7 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
-	if (state.lane_count == 2) {
+	if (PairedWave64(state)) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
 	const auto shuffled = state.builder.AllocateId();
@@ -1962,7 +1962,7 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                          ConstantU32(state, 0), ConstantU32(state, 0));
 	const auto first = ctx.FirstLane(mask);
 	const auto source_lane =
-	    state.lane_count == 2
+	    PairedWave64(state)
 	        ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31))
 	        : first;
 	const auto is_first       = Binary(state, spv::OpIEqual, TypeBool(state),
@@ -2171,7 +2171,7 @@ uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state   = ctx.state;
 	auto       lane    = EmitSubgroupLocalInvocationId(state);
-	if (state.lane_count == 2) {
+	if (PairedWave64(state)) {
 		lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31));
 	}
 	const auto address = ctx.Arg(inst, 1);

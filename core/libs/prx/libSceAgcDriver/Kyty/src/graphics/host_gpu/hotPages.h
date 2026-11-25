@@ -66,6 +66,7 @@ public:
 		}
 		auto& entry = m_slots[slot];
 		entry.valid.store(false, std::memory_order_relaxed);
+		entry.deferred      = false;
 		entry.changed_frame = frame;
 		entry.page.store(page, std::memory_order_release);
 		m_live.fetch_add(1, std::memory_order_acq_rel);
@@ -97,6 +98,12 @@ public:
 	// counts as changed.
 	[[nodiscard]] bool Changed(uint16_t slot, uint64_t page, uint64_t frame) {
 		auto& entry = m_slots[slot];
+		if (entry.deferred) {
+			// An upload recorded earlier in this batch copies the page's bytes as they are when
+			// the batch is submitted (BufferCache::FlushDeferredTracking): every use recorded
+			// after it reads them, so the page is current for it.
+			return false;
+		}
 		m_compares++;
 		const auto* bytes = Read(page);
 		if (!entry.valid.load(std::memory_order_acquire) || bytes == nullptr ||
@@ -125,6 +132,22 @@ public:
 		// Part of a page leaves the rest of the shadow unknown: compared as changed.
 		entry.valid.store(size == TRACKER_PAGE_SIZE, std::memory_order_release);
 		return true;
+	}
+
+	// GPU thread: an upload of the slot's page waits for the deferred flush (see Changed).
+	void MarkDeferred(uint16_t slot) noexcept {
+		m_slots[slot].deferred = true;
+		m_any_deferred         = true;
+	}
+	// GPU thread, after the deferred uploads were filled.
+	void ClearDeferred() noexcept {
+		if (!m_any_deferred) {
+			return;
+		}
+		for (size_t slot = 0; slot < m_used; slot++) {
+			m_slots[slot].deferred = false;
+		}
+		m_any_deferred = false;
 	}
 
 	// GPU thread: for each live slot, func(slot, page).
@@ -169,7 +192,8 @@ private:
 	struct Slot {
 		std::atomic<uint64_t> page {0}; // 0: free or released
 		std::atomic<bool>     valid {false};
-		uint64_t              changed_frame = 0; // GPU thread
+		uint64_t              changed_frame = 0;     // GPU thread
+		bool                  deferred      = false; // GPU thread (MarkDeferred)
 	};
 
 	[[nodiscard]] uint8_t* Shadow(uint16_t slot) noexcept {
@@ -185,6 +209,7 @@ private:
 	std::vector<uint16_t>        m_released;          // guarded by m_release_mutex
 	std::atomic<bool>            m_any_released {false};
 	std::atomic<uint32_t>        m_live {0};
+	bool                         m_any_deferred    = false; // GPU thread
 	uint64_t                     m_compares        = 0; // GPU thread, this frame
 	uint64_t                     m_frame           = 0; // GPU thread
 	uint64_t                     m_suspended_until = 0; // GPU thread

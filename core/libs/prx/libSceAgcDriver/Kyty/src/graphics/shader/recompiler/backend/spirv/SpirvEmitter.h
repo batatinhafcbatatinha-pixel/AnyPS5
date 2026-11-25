@@ -24,6 +24,9 @@ struct Profile {
 	bool relaxed_float = false;
 	// Ray queries: recognized traversal loops trace the dispatch's host TLAS.
 	bool ray_query = false;
+	// Subgroups are always 32 invocations: a compute wave64 program whose workgroup is one wave
+	// may run one guest lane per invocation (two subgroups) instead of two lanes per invocation.
+	bool wave_split = false;
 };
 
 inline constexpr Profile DefaultProfile {};

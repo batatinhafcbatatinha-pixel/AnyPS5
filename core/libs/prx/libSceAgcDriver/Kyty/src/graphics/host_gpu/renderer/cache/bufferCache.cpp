@@ -201,8 +201,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
-	// GPU-written bytes left m_gpu_modified_ranges.
-	InvalidateObtainMemos();
+	// GPU-written bytes left m_gpu_modified_ranges: its removal count tells memos (letter i).
+	static const bool counted = CutEnabled('i');
+	if (!counted) {
+		InvalidateObtainMemos();
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 	if (Common::DebugCounters::g_aps5_stats) {
 		Common::DebugCounters::g_download_regions.Note((vaddr >> 20) << 1 | (async ? 1 : 0), total_size);
@@ -303,6 +306,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		m_memory_tracker.Hot().SetReader(&ReadBackedPage);
 		g_exact_hot_pages.store(true, std::memory_order_relaxed);
 	}
+	// Deferred protection (APS5_KYTY_X_CUT letter g), flushed before every submission. The host view
+	// decides page-table entries from the CPU state of pages at once, so it keeps the old way.
+	if (CutEnabled('g') && !m_host_view) {
+		g_deferred_protection.store(true, std::memory_order_relaxed);
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -318,7 +326,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	FlushDeferredTracking();
 	g_exact_hot_pages.store(false, std::memory_order_relaxed);
+	g_deferred_protection.store(false, std::memory_order_relaxed);
 	DestroyHostView();
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
@@ -378,9 +388,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		// Only small reads, such as faults and descriptor loads, predict later read-backs.
 		if (size <= 16 * TRACKER_PAGE_SIZE && IsRegionGpuModified(vaddr, size)) {
 			const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-			m_readback_pages.Add(page, Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - page);
-			// Written ranges on these pages now queue eager downloads.
-			InvalidateObtainMemos();
+			// Written ranges on pages new to the set now queue eager downloads.
+			static const bool only_new = CutEnabled('i');
+			if (m_readback_pages.Add(page, Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - page) ||
+			    !only_new) {
+				InvalidateObtainMemos();
+			}
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 		if (IsRegionGpuModified(vaddr, size)) {
@@ -560,8 +573,26 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+void BufferCache::FlushDeferredTracking() {
+	auto& pages = m_memory_tracker.Pages();
+	if (m_deferred_copies.empty() && !pages.HasDeferred()) {
+		return;
+	}
+	// Protection first, bytes after, as an upload that watches its pages at once: a guest write
+	// after the protection faults and queues its page again; one before it is in the bytes.
+	pages.FlushDeferred();
+	for (const auto& copy: m_deferred_copies) {
+		if (!CopyGuestForUpload(copy.address, copy.destination, copy.size)) {
+			EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+		}
+		copy.staging->Flush(copy.offset, copy.size);
+	}
+	m_deferred_copies.clear();
+	m_memory_tracker.Hot().ClearDeferred();
+}
+
 void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
-                               std::span<vk::BufferCopy> copies, uint64_t total_size) {
+                               std::span<vk::BufferCopy> copies, uint64_t total_size, bool defer) {
 	// An upload is a GPU write of its batch (early compute must not read ahead of it).
 	for (const auto& upload: uploads) {
 		upload.buffer->last_write_tick = m_scheduler.CurrentTick();
@@ -596,14 +627,22 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 		}
 	}
 
-	const auto source = UploadMemory(
+	// Deferred: the staging bytes are filled by FlushDeferredTracking, after the deferred
+	// protection of the pages (a stream-buffer wrap while mapping submits, and so flushes, only
+	// what earlier calls deferred).
+	const auto deferred_first = m_deferred_copies.size();
+	const auto source         = UploadMemory(
 	    m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
 		    size_t first = 0;
 		    for (const auto& upload: uploads) {
 			    for (auto& copy: copies.subspan(first, upload.end - first)) {
 				    const auto address = upload.buffer->CpuAddress() + copy.dstOffset;
-				    if (!CopyGuestForUpload(address, mapped + copy.srcOffset, copy.size)) {
+				    if (defer) {
+					    m_deferred_copies.push_back({address, mapped + copy.srcOffset, copy.size,
+					                                 nullptr, base_offset + copy.srcOffset});
+					    MarkHotUploadsDeferred(address, copy.size);
+				    } else if (!CopyGuestForUpload(address, mapped + copy.srcOffset, copy.size)) {
 					    EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 				    }
 				    // AnyPS5 diagnostic (APS5_KYTY_HOTCHECK=1): uploaded 4 KiB pages whose bytes did
@@ -625,6 +664,9 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 			    first = upload.end;
 		    }
 	    });
+	for (auto index = deferred_first; index < m_deferred_copies.size(); index++) {
+		m_deferred_copies[index].staging = source.first;
+	}
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	const auto              native = command.Handle();
@@ -680,11 +722,20 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	static const bool memo_enabled = CutEnabled('a');
 	const bool        memo_usable  = memo_enabled && !(is_texel_buffer && !is_written) &&
 	                         !StickyPagesEnabled() && !HostViewEnabled();
+	// A written range must still be in m_gpu_modified_ranges (the full path adds it): read-back
+	// downloads take bytes out of it all the time, mostly other ones, so the set's removal
+	// count answers first and a lookup only when it moved (APS5_KYTY_X_CUT letter i: every removal
+	// ends every memo instead, see DownloadBufferMemory and RecordEagerBatch).
+	// Repeating NoteReadbackWrite changes nothing while the download queue and the writer map
+	// are as its last call left them and the program is the same (letter j).
+	static const bool readback_skipped = CutEnabled('j');
 	if (memo_usable) {
-		const auto& memo = ObtainMemoSlot(vaddr, size, is_written);
+		auto& memo = ObtainMemoSlot(vaddr, size, is_written);
 		if (memo.state == m_obtain_state && memo.vaddr == vaddr && memo.size == size &&
 		    memo.written == is_written &&
-		    memo.generations == m_memory_tracker.RegionGenerations(vaddr, size)) {
+		    memo.generations == m_memory_tracker.RegionGenerations(vaddr, size) &&
+		    (!is_written || memo.gpu_removals == m_gpu_modified_ranges.Removals() ||
+		     m_gpu_modified_ranges.Contains(vaddr, size))) {
 			auto& buffer = m_slot_buffers[memo.id];
 			TouchBuffer(buffer);
 			// As SynchronizeBuffer's upload, which counts as a write of the batch even with
@@ -692,8 +743,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			buffer.last_write_tick = m_scheduler.CurrentTick();
 			if (!is_written) {
 				buffer.last_read_tick = m_scheduler.CurrentTick();
-			} else if (memo.readback) {
-				(void)NoteReadbackWrite(vaddr, size);
+			} else {
+				memo.gpu_removals = m_gpu_modified_ranges.Removals();
+				if (memo.readback &&
+				    (!readback_skipped || memo.eager_removals != m_eager_writes.Removals() ||
+				     memo.readback_version != m_readback_version ||
+				     memo.program != m_current_program)) {
+					(void)NoteReadbackWrite(vaddr, size);
+					memo.eager_removals   = m_eager_writes.Removals();
+					memo.readback_version = m_readback_version;
+					memo.program          = m_current_program;
+				}
 			}
 			return {&buffer, buffer.Offset(vaddr)};
 		}
@@ -772,32 +832,50 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (memo_usable && generations != 0) {
 		// The state after every change this call made (a buffer it created bumps it).
-		ObtainMemoSlot(vaddr, size, is_written) = {.vaddr       = vaddr,
-		                                           .size        = size,
-		                                           .generations = generations,
-		                                           .state       = m_obtain_state,
-		                                           .id          = id,
-		                                           .written     = is_written,
-		                                           .readback    = readback};
+		ObtainMemoSlot(vaddr, size, is_written) = {.vaddr            = vaddr,
+		                                           .size             = size,
+		                                           .generations      = generations,
+		                                           .state            = m_obtain_state,
+		                                           .id               = id,
+		                                           .written          = is_written,
+		                                           .readback         = readback,
+		                                           .gpu_removals     = m_gpu_modified_ranges.Removals(),
+		                                           .eager_removals   = m_eager_writes.Removals(),
+		                                           .readback_version = m_readback_version,
+		                                           .program          = m_current_program};
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
 bool BufferCache::NoteReadbackWrite(uint64_t vaddr, uint64_t size) {
-	bool any = false;
+	bool any     = false;
+	bool changed = false;
 	m_readback_pages.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) {
 		any = true;
-		m_eager_writes.Add(begin, end - begin);
+		changed |= m_eager_writes.Add(begin, end - begin);
 		auto it = m_readback_writers.lower_bound(begin);
 		if (it != m_readback_writers.begin() && std::prev(it)->second.first > begin) --it;
 		while (it != m_readback_writers.end() && it->first < end) {
 			// The entry at `begin` is overwritten below: kept, so a range written by every
 			// dispatch does not free and allocate its node each time.
-			if (it->first > begin && it->second.first <= end) it = m_readback_writers.erase(it);
-			else ++it;
+			if (it->first > begin && it->second.first <= end) {
+				it      = m_readback_writers.erase(it);
+				changed = true;
+			} else {
+				++it;
+			}
 		}
-		m_readback_writers[begin] = {end, m_current_program};
+		const std::pair<uint64_t, uint64_t> writer {end, m_current_program};
+		const auto [entry, inserted] = m_readback_writers.try_emplace(begin, writer);
+		if (!inserted && entry->second != writer) {
+			entry->second = writer;
+			changed       = true;
+		}
+		changed |= inserted;
 	});
+	if (changed) {
+		m_readback_version++;
+	}
 	return any;
 }
 
@@ -911,16 +989,29 @@ bool BufferCache::WriteInGpuOrder(uint64_t vaddr, const void* data, uint64_t siz
 	// The CPU knows these bytes: they come from the command, not from a shader. Until a later
 	// GPU write replaces them, walks read them here instead of waiting for the GPU to reach
 	// the update (TryCurrentWalkerLoad, ReadTable).
+	StoreCpKnown(vaddr, data, size);
+	return true;
+}
+
+void BufferCache::StoreCpKnown(uint64_t vaddr, const void* data, uint64_t size) {
 	std::lock_guard cp_lock(m_cp_known_mutex);
-	m_cp_known_any.store(true, std::memory_order_relaxed);
 	if (m_cp_known.size() + size / 4u > CpKnownLimit) {
 		m_cp_known.clear();
+		m_cp_known_begin.store(UINT64_MAX, std::memory_order_relaxed);
+		m_cp_known_end.store(0, std::memory_order_relaxed);
 	}
 	const auto* words = static_cast<const uint32_t*>(data);
 	for (uint64_t i = 0; i < size / 4u; ++i) {
 		m_cp_known[vaddr + i * 4u] = words[i];
 	}
-	return true;
+	if (vaddr < m_cp_known_begin.load(std::memory_order_relaxed)) {
+		m_cp_known_begin.store(vaddr, std::memory_order_relaxed);
+	}
+	if (vaddr + size > m_cp_known_end.load(std::memory_order_relaxed)) {
+		m_cp_known_end.store(vaddr + size, std::memory_order_relaxed);
+	}
+	// Published last: a reader that sees it sees the bounds.
+	m_cp_known_any.store(true, std::memory_order_release);
 }
 
 void BufferCache::NoteCpKnown(uint64_t vaddr, const void* data, uint64_t size) {
@@ -929,15 +1020,7 @@ void BufferCache::NoteCpKnown(uint64_t vaddr, const void* data, uint64_t size) {
 	    !GuestRange {vaddr, size}.Valid() || !m_gpu_modified_ranges.Contains(vaddr, size)) {
 		return;
 	}
-	std::lock_guard cp_lock(m_cp_known_mutex);
-	m_cp_known_any.store(true, std::memory_order_relaxed);
-	if (m_cp_known.size() + size / 4u > CpKnownLimit) {
-		m_cp_known.clear();
-	}
-	const auto* words = static_cast<const uint32_t*>(data);
-	for (uint64_t i = 0; i < size / 4u; ++i) {
-		m_cp_known[vaddr + i * 4u] = words[i];
-	}
+	StoreCpKnown(vaddr, data, size);
 }
 
 void BufferCache::NoteCpFill(uint64_t vaddr, uint64_t size, uint32_t value) {
@@ -963,12 +1046,25 @@ bool BufferCache::KnownBytes(uint64_t vaddr, uint64_t size, void* data) {
 }
 
 void BufferCache::ForgetCpKnownWords(uint64_t vaddr, uint64_t size) {
-	if (!m_cp_known_any.load(std::memory_order_relaxed)) {
+	// Every written binding asks: most lie outside the few words the command processor wrote.
+	// The bounds only grow while words are known (APS5_KYTY_X_CUT letter h: always look them up).
+	// A store racing with this call on another thread is ordered after it either way.
+	static const bool bounded = CutEnabled('h');
+	if (!m_cp_known_any.load(std::memory_order_acquire)) {
+		return;
+	}
+	if (bounded && (vaddr + size <= m_cp_known_begin.load(std::memory_order_relaxed) ||
+	                Common::AlignDown(vaddr, 4u) >= m_cp_known_end.load(std::memory_order_relaxed))) {
 		return;
 	}
 	std::lock_guard cp_lock(m_cp_known_mutex);
 	m_cp_known.erase(m_cp_known.lower_bound(Common::AlignDown(vaddr, 4u)),
 	                 m_cp_known.lower_bound(vaddr + size));
+	if (m_cp_known.empty()) {
+		m_cp_known_any.store(false, std::memory_order_relaxed);
+		m_cp_known_begin.store(UINT64_MAX, std::memory_order_relaxed);
+		m_cp_known_end.store(0, std::memory_order_relaxed);
+	}
 }
 
 bool BufferCache::CpKnownWords(uint64_t vaddr, uint64_t size, void* data) {
@@ -1008,12 +1104,16 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) {
-	// A written range over these bytes forgets the checks again.
-	InvalidateObtainMemos();
+	// A written range over new checks forgets them again.
+	static const bool only_new = CutEnabled('i');
+	bool              added    = !only_new;
 	for (uint32_t slot = 0; slot < m_checked_color_metadata.size(); slot++) {
 		if ((keys & (1u << slot)) != 0) {
-			m_checked_color_metadata[slot].Add(vaddr, size);
+			added |= m_checked_color_metadata[slot].Add(vaddr, size);
 		}
+	}
+	if (added) {
+		InvalidateObtainMemos();
 	}
 }
 
@@ -1315,8 +1415,11 @@ void BufferCache::RecordEagerBatch(const RangeSet& writes) {
 	if (copies.empty()) {
 		return;
 	}
-	// GPU-written bytes left m_gpu_modified_ranges.
-	InvalidateObtainMemos();
+	// GPU-written bytes left m_gpu_modified_ranges: its removal count tells memos (letter i).
+	static const bool counted = CutEnabled('i');
+	if (!counted) {
+		InvalidateObtainMemos();
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 	// A stream-buffer wrap can submit while mapping: the copies' batch is current after.
 	auto download =
@@ -1729,6 +1832,19 @@ void BufferCache::QueueUnwatchedPages(const RangeSet& pages) {
 	m_bda_sync_pending.store(true, std::memory_order_release);
 }
 
+void BufferCache::MarkHotUploadsDeferred(uint64_t address, uint64_t size) {
+	auto& hot = m_memory_tracker.Hot();
+	if (hot.Live() == 0) {
+		return;
+	}
+	for (auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE); page < address + size;
+	     page += TRACKER_PAGE_SIZE) {
+		if (const auto slot = m_memory_tracker.HotSlot(page); slot != HotPages::NO_SLOT) {
+			hot.MarkDeferred(slot);
+		}
+	}
+}
+
 bool BufferCache::CopyGuestForUpload(uint64_t address, uint8_t* destination, uint64_t size) {
 	auto& hot = m_memory_tracker.Hot();
 	if (hot.Live() == 0) {
@@ -1812,9 +1928,16 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 			}
 		});
 	});
-	// Reads follow every range's protection; a write in between re-queues its page.
+	// Reads follow every range's protection; a write in between re-queues its page. With
+	// deferred protection (APS5_KYTY_X_CUT letter g) both wait for the flush before the batch is
+	// submitted (FlushDeferredTracking): the batch reads these bytes only once it runs, so they
+	// may come from any moment between now and its submission, and a guest write in between,
+	// which raises no fault, is in them. Pages written again and again while the GPU thread
+	// records a batch then fault once per batch and are protected once, together.
+	const bool defer = DeferredProtectionEnabled() && !StickyPagesEnabled();
 	m_memory_tracker.ForEachUploadRangeBatch(
-	    pieces, [&](size_t piece, uint64_t address, uint64_t bytes) noexcept {
+	    pieces,
+	    [&](size_t piece, uint64_t address, uint64_t bytes) noexcept {
 		    auto& buffer = *owners[piece];
 		    if (uploads.empty() || uploads.back().buffer != &buffer) {
 			    uploads.push_back({&buffer, 0});
@@ -1822,8 +1945,9 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    uploads.back().end = copies.size();
 		    total_size += bytes;
-	    });
-	UploadCopies(uploads, copies, total_size);
+	    },
+	    defer);
+	UploadCopies(uploads, copies, total_size, defer);
 	if (m_host_view) {
 		// After the uploads, so pages they made current read their buffers at once.
 		const auto entries = [this] {

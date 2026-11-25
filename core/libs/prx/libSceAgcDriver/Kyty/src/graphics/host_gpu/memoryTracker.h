@@ -222,7 +222,9 @@ public:
 	// in the separate calls, every page is watched again before func sees it, so a guest write
 	// after that faults and queues the page again, and one before it is in the bytes copied later.
 	template <typename Func>
-	void ForEachUploadRangeBatch(std::span<const GuestRange> ranges, Func&& func) {
+	// defer: see RegionManager::ForEachCpuModifiedRangeBatch (not with the rewritten-page mode,
+	// whose uploads watch their pages at once).
+	void ForEachUploadRangeBatch(std::span<const GuestRange> ranges, Func&& func, bool defer = false) {
 		static_assert(std::is_nothrow_invocable_v<Func&, size_t, uint64_t, uint64_t>);
 		if (StickyPagesEnabled()) {
 			for (size_t index = 0; index < ranges.size(); index++) {
@@ -268,7 +270,8 @@ public:
 				    },
 				    [&](size_t chunk, uint64_t address, uint64_t bytes) {
 					    func(chunks[first + chunk].range, address, bytes);
-				    });
+				    },
+				    defer);
 			}
 			first = last;
 		}

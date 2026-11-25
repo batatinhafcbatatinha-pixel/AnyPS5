@@ -86,6 +86,11 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 }
 
 void GuestGpu::ProcessCommands() {
+	if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		// Commands from other threads may write guest memory: deferred uploads and protections
+		// first (see PacketKeepsGuestMemory).
+		m_renderer.GetBufferCache().FlushDeferredTracking();
+	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -498,6 +503,8 @@ void GuestGpu::ThreadRun(void* data) {
 			{
 				Common::DebugCounters::ScopedTimer busy(
 				    Common::DebugCounters::Counter::GpuThreadBusyNs);
+				// Commands may write guest memory (see PacketKeepsGuestMemory).
+				gpu->m_renderer.GetBufferCache().FlushDeferredTracking();
 				command();
 			}
 
@@ -607,6 +614,44 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// Packets whose processing writes no guest memory from the CPU: state, draws, dispatches and
+// chaining. Any other packet may (labels, WRITE_DATA, DMA, counters, flips): before it, the
+// uploads and protections recorded work deferred are applied (BufferCache::FlushDeferredTracking),
+// so a deferred upload never takes bytes the command processor writes after the work that reads
+// them, and a page the processor writes is watched again first, as without deferral.
+static bool PacketKeepsGuestMemory(uint32_t opcode, const uint32_t* packet) {
+	switch (opcode) {
+		case Pm4::IT_NOP:
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_CLEAR_STATE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_MULTI_INST:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_PFP_SYNC_ME:
+		case Pm4::IT_INDIRECT_BUFFER:
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT: return true;
+		// Flips and queue operations are tagged writes of one user-data register.
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX: return packet[1] != Pm4::SQ_THREAD_TRACE_USERDATA_2;
+		default: return false;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	const bool debug_dump = graphics_debug_dump_enabled();
 	while (!execution.m_buffer_stack.empty()) {
@@ -647,6 +692,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
+		if (!PacketKeepsGuestMemory(opcode, packet)) {
+			m_renderer.GetBufferCache().FlushDeferredTracking();
+		}
 		auto handler = g_cp_op_func[opcode];
 
 		if (handler == nullptr) {
