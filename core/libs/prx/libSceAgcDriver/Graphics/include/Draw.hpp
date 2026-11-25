@@ -68,8 +68,10 @@ struct DrawInputCopy {
     std::uint64_t registryGeneration = 0;
     Recorder::OwnedDrawInputProof owned;
 };
-DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t from = 0, bool hostOnly = false);
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t from = 0, bool hostOnly = false, std::size_t growLimit = 0);
 bool BindsIndexCopy(const State& state);
+std::size_t GrownVertexCopyBytes(std::size_t bytes, std::size_t growLimit);
+std::uint64_t VertexCopyGrowEnd(const State& state, std::uint64_t end, std::uint64_t limit);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived, std::uint32_t lowest = 0);
 inline constexpr std::uint64_t InPlaceDrawInputMaxReads = 512;
@@ -77,10 +79,9 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
 // Binds the range in place even where draw inputs are copied (GPU-written ranges, buffer cache fallbacks).
 inline const HostImport* ForcedInPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     return InPlaceDrawInput(context, address, bytes, alignment, behindGpuWrite, std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::uint64_t>::max(), true);
-}
-enum class IndexBehindWriter : std::uint8_t { Taken, Off, NoWriter, VertexAttributes, IndexLimit, MeshStage, PrimitiveRestart, VertexOffset, UnitShadow, PendingStorage, LabelOrStore, CopiedWriter, NoImport, Refused, Count };
+enum class IndexBehindWriter : std::uint8_t { Taken, Off, NoWriter, IndexLimit, MeshStage, PrimitiveRestart, VertexOffset, UnitShadow, PendingStorage, LabelOrStore, CopiedWriter, NoImport, Refused, Count };
 std::array<std::uint64_t, static_cast<std::size_t>(IndexBehindWriter::Count)> IndexBehindWriterCounts();
-const HostImport* InPlaceIndexBehindWriter(const Context& context, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool vertexAttributes, bool meshStage, bool primitiveRestart, std::uint32_t firstVertex, IndexBehindWriter* outcome = nullptr);
+const HostImport* InPlaceIndexBehindWriter(const Context& context, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool meshStage, bool primitiveRestart, std::uint32_t firstVertex, IndexBehindWriter* outcome = nullptr);
 struct InPlaceIndices {
     std::optional<std::uint32_t> highest;
     std::uint32_t lowest = 0;
