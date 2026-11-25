@@ -404,6 +404,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		options.input_info.compute = &input_info;
 		runtime.workgroup_counts   = input_info.workgroup_counts;
 		runtime.indirect_args_address = input_info.indirect_args_address;
+		if (input_info.dispatch_extent_address) runtime.indirect_group_size = input_info.indirect_group_size;
 	}
 	m_lookup_key.stage           = options.stage;
 	m_lookup_key.hash            = params.hash;

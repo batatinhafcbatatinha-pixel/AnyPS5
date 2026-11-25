@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/fastTls.h"
+#include "../shader/recompiler/ThreadOwned.hpp"
 #include "common/assert.h"
 #include "common/srwLock.h"
 #include "graphics/host_gpu/pageManager.h"
@@ -13,7 +14,9 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -141,9 +144,74 @@ public:
 		        .written     = is_written};
 	}
 
+	// ForEachUploadRange(range, false, ...) for each of `ranges` with an empty upload callback,
+	// func(index, address, bytes) getting the runs of ranges[index] in the same order. The ranges
+	// of one tracker region are re-watched with one protection change: the separate calls make
+	// one protection call per run at least, the batch one per run of pages it leaves watched. As
+	// in the separate calls, every page is watched again before func sees it, so a guest write
+	// after that faults and queues the page again, and one before it is in the bytes copied later.
+	template <typename Func>
+	void ForEachUploadRangeBatch(std::span<const GuestRange> ranges, Func&& func) {
+		static_assert(std::is_nothrow_invocable_v<Func&, size_t, uint64_t, uint64_t>);
+		if (StickyPagesEnabled()) {
+			for (size_t index = 0; index < ranges.size(); index++) {
+				ForEachUploadRange(
+				    ranges[index].address, ranges[index].size, false,
+				    [&](uint64_t address, uint64_t bytes) noexcept { func(index, address, bytes); },
+				    []() noexcept {});
+			}
+			return;
+		}
+		auto& chunks = ::ShaderRecompiler::ThreadOwned(s_batch_chunks);
+		chunks.clear();
+		for (size_t index = 0; index < ranges.size(); index++) {
+			Iterate<true>(ranges[index].address, ranges[index].size,
+			              [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				              chunks.push_back({manager, index, offset, bytes});
+			              });
+		}
+		for (size_t first = 0; first < chunks.size();) {
+			auto* manager = chunks[first].manager;
+			auto  last    = first + 1;
+			while (last < chunks.size() && chunks[last].manager == manager) {
+				last++;
+			}
+			// Lock-free like ForEachUploadRange: a region with nothing CPU-dirty in the ranges
+			// changes nothing.
+			bool modified = false;
+			for (auto chunk = first; chunk < last && !modified; chunk++) {
+				modified = manager->IsModified<DirtySource::Cpu>(chunks[chunk].offset,
+				                                                 chunks[chunk].bytes);
+			}
+			if (modified) {
+				std::scoped_lock lock(manager->lock);
+				manager->ForEachCpuModifiedRangeBatch(
+				    last - first,
+				    [&](size_t chunk) {
+					    return std::pair<uint64_t, uint64_t> {chunks[first + chunk].offset,
+					                                          chunks[first + chunk].bytes};
+				    },
+				    [&](size_t chunk, uint64_t address, uint64_t bytes) {
+					    func(chunks[first + chunk].range, address, bytes);
+				    });
+			}
+			first = last;
+		}
+	}
+
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	static_assert(REGION_COUNT % 64 == 0);
+
+	// ForEachUploadRangeBatch's ranges cut at tracker regions, per thread.
+	struct BatchChunk {
+		RegionManager* manager;
+		size_t         range;
+		uint64_t       offset;
+		uint64_t       bytes;
+	};
+	// AnyPS5: no thread_local with a destructor in this module (emulated TLS on MinGW).
+	inline static thread_local std::vector<BatchChunk>* s_batch_chunks = nullptr;
 
 	// ForEachUploadRange's last call per range, per thread.
 	struct UploadMemo {

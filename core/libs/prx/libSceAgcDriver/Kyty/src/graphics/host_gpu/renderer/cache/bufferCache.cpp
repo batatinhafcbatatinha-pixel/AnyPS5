@@ -175,12 +175,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
-		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+		    m_gpu_modified_ranges.Extract(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Start each packed range on its own 64-byte cache line.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
-		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
 	if (copies.empty()) {
@@ -894,6 +893,13 @@ bool BufferCache::TryCurrentWalkerLoad(uint64_t vaddr, uint32_t& value) {
 	       LibKernel::Memory::TryReadBacking(vaddr, &value, sizeof(value));
 }
 
+bool BufferCache::HasPendingGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (m_eager_pending.Intersects(vaddr, size)) {
+		CompleteEagerDownloads(vaddr, size, true);
+	}
+	return m_gpu_modified_ranges.Intersects(vaddr, size) || m_eager_pending.Intersects(vaddr, size);
+}
+
 bool BufferCache::ReadTable(uint64_t vaddr, uint64_t size, void* data) {
 	if (m_eager_pending.Intersects(vaddr, size)) {
 		CompleteEagerDownloads(vaddr, size, false, true);
@@ -1063,13 +1069,12 @@ void BufferCache::RecordEagerBatch(const RangeSet& writes) {
 			    address, last - address, [&](uint64_t start, uint64_t bytes) noexcept {
 				    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, start, bytes,
 				                                           "buffer download");
-				    m_gpu_modified_ranges.ForEachInRange(start, bytes, [&](uint64_t from, uint64_t to) {
+				    m_gpu_modified_ranges.Extract(start, bytes, [&](uint64_t from, uint64_t to) {
 					    copies.emplace_back(from - buffer_address, total_size, to - from);
 					    piece_bytes += to - from;
 					    // Start each packed range on its own 64-byte cache line.
 					    total_size += Common::AlignUp(to - from, 64);
 				    });
-				    m_gpu_modified_ranges.Subtract(start, bytes);
 				    ForgetColorMetadataChecks(start, bytes);
 			    });
 			if (copies.size() != first_copy) {
@@ -1175,7 +1180,8 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 	// A side download published here, ahead of the priority thread, goes after every older download
 	// of overlapping bytes: those land first (or the side one waits for a later call), so an older
 	// copy never overwrites a newer one.
-	std::vector<uint8_t> side_ready(m_eager_downloads.size(), 0);
+	// Sized at the first side download: most calls have none and allocate nothing.
+	std::vector<uint8_t> side_ready;
 	// The newest tick whose priority operations are known to have run.
 	uint64_t   published_tick = 0;
 	const auto published      = [&](uint64_t tick) {
@@ -1186,7 +1192,13 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 	};
 	for (size_t index = 0; index < m_eager_downloads.size(); ++index) {
 		const auto& side = m_eager_downloads[index];
-		if (side.side == 0 || side.end <= vaddr || end <= side.begin ||
+		if (side.side == 0) {
+			continue;
+		}
+		if (side_ready.empty()) {
+			side_ready.resize(m_eager_downloads.size(), 0);
+		}
+		if (side.end <= vaddr || end <= side.begin ||
 		    (finished_only && !m_scheduler.IsSideFree(side.side))) {
 			continue;
 		}
@@ -1276,15 +1288,18 @@ void BufferCache::CompleteEagerDownloads(uint64_t vaddr, uint64_t size, bool fin
 		m_eager_pending.Add(download.begin, download.end - download.begin);
 		keep.Add(first, bytes);
 	}
+	// The released pages outside `keep`: the gaps between its ascending pieces in each range.
 	released.ForEach([&](uint64_t begin, uint64_t last) {
-		RangeSet clean;
-		clean.Add(begin, last - begin);
+		auto clean = begin;
 		keep.ForEachInRange(begin, last - begin, [&](uint64_t first, uint64_t stop) {
-			clean.Subtract(first, stop - first);
+			if (clean < first) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(clean, first - clean);
+			}
+			clean = stop;
 		});
-		clean.ForEach([&](uint64_t first, uint64_t stop) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(first, stop - first);
-		});
+		if (clean < last) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(clean, last - clean);
+		}
 	});
 }
 
@@ -1473,6 +1488,10 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	std::vector<vk::BufferCopy> copies;
 	std::vector<BufferUpload>   uploads;
 	uint64_t                    total_size = 0;
+	// The queued ranges cut at mapped ranges and buffers, then re-watched together: one
+	// protection change per tracker region instead of one per piece.
+	std::vector<GuestRange> pieces;
+	std::vector<Buffer*>    owners;
 	queued.ForEach([&](uint64_t begin, uint64_t end) {
 		mapped.ForEachInRange(begin, end - begin, [&](uint64_t start, uint64_t finish) {
 			auto it = m_buffers.upper_bound(start);
@@ -1484,22 +1503,23 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 				const auto first  = std::max(buffer.CpuAddress(), start);
 				const auto last   = std::min(buffer.CpuAddress() + buffer.Size(), finish);
 				if (first < last) {
-					// Reads follow every range's protection; a write in between re-queues its page.
-					m_memory_tracker.ForEachUploadRange(
-					    first, last - first, false,
-					    [&](uint64_t address, uint64_t bytes) noexcept {
-						    if (uploads.empty() || uploads.back().buffer != &buffer) {
-							    uploads.push_back({&buffer, 0});
-						    }
-						    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-						    uploads.back().end = copies.size();
-						    total_size += bytes;
-					    },
-					    []() noexcept {});
+					pieces.push_back({first, last - first});
+					owners.push_back(&buffer);
 				}
 			}
 		});
 	});
+	// Reads follow every range's protection; a write in between re-queues its page.
+	m_memory_tracker.ForEachUploadRangeBatch(
+	    pieces, [&](size_t piece, uint64_t address, uint64_t bytes) noexcept {
+		    auto& buffer = *owners[piece];
+		    if (uploads.empty() || uploads.back().buffer != &buffer) {
+			    uploads.push_back({&buffer, 0});
+		    }
+		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+		    uploads.back().end = copies.size();
+		    total_size += bytes;
+	    });
 	UploadCopies(uploads, copies, total_size);
 	if (m_host_view) {
 		// After the uploads, so pages they made current read their buffers at once.

@@ -170,8 +170,14 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           workgroup_counts[3]        = {0, 0, 0};
 	uint64_t           indirect_args_address       = 0;
+	// Group size of an indirect dispatch with thread-count arguments, which the arguments are
+	// divided by to give the group counts.
+	uint32_t           indirect_group_size[3]     = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	// The thread extents are not known to the host: shader data holds the device address of the
+	// three counts instead of the counts.
+	bool               dispatch_extent_address    = false;
 	bool               lds_storage                = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;

@@ -1019,11 +1019,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			// which the check below binds as null).
 			if ((size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) &&
 			    GuestRange {address, 1}.Valid()) {
-				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+				// 0 for a base outside committed memory: a branch the walk did not decide may bind
+				// a range no buffer can cover, which binds as null below instead of exiting.
+				size = Libs::LibKernel::Memory::TryClampRangeSize(address, size);
 			}
 			// AnyPS5: an address outside the guest windows (host memory, or a stale descriptor) is
 			// bound like a null buffer instead of ending the process.
-			if (!GuestRange {address, size}.Valid()) {
+			if (size == 0 || !GuestRange {address, size}.Valid()) {
 				static std::atomic<uint32_t> reported {0};
 				if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
 					Log::WriteToConsoleAndLog(fmt::format(

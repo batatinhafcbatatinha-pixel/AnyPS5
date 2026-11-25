@@ -774,6 +774,19 @@ uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst
 	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() || inst.Arg(0).U32() >= 3u) {
 		ctx.Fail(inst, "invalid dispatch thread extent");
 	}
+	if (DispatchExtentByAddress(ctx.state)) {
+		// The counts of an indirect dispatch stay in GPU memory; shader data holds their address.
+		auto&      s       = ctx.state;
+		const auto address = PackU64(s, EmitShaderDataDwordLoad(s, start), EmitShaderDataDwordLoad(s, start + 1));
+		const auto at      = Binary(s, spv::OpIAdd, TypeU64(s), address,
+		                            ConstantU64(s, uint64_t {inst.Arg(0).U32()} * sizeof(uint32_t)));
+		const auto pointer = Unary(s, spv::OpConvertUToPtr,
+		                           TypePointer(s, spv::StorageClassPhysicalStorageBuffer, TypeU32(s)), at);
+		const auto value   = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpLoad, TypeU32(s), value, pointer, spv::MemoryAccessAlignedMask,
+		                      uint32_t {sizeof(uint32_t)});
+		return value;
+	}
 	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
 }
 

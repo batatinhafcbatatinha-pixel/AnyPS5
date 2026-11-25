@@ -14,14 +14,23 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 
+// Failures of a walk that may be retried are kept here, and reported only when it is not retried.
+thread_local std::vector<std::string>* t_specialization_failures = nullptr;
+
 bool SpecializationFail(std::string_view message) {
+	if (t_specialization_failures != nullptr) {
+		t_specialization_failures->emplace_back(message);
+		return false;
+	}
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
 	return false;
@@ -1726,8 +1735,12 @@ bool HybridWalkAllowed(const ResourcePlan& program) {
 
 } // namespace
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+// defer_conditions: walker loads that only decide branches do not wait for GPU writes (see
+// SetWalkerDefersGpuConditions); deferred tells whether one of them did not.
+static bool MaterializeWalk(const ResourcePlan& program, const SrtRuntime& runtime,
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                            bool defer_conditions, bool& deferred) {
+	deferred = false;
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
@@ -1741,10 +1754,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SetWalkedProgram(program.shader_hash);
 	const bool hybrid = runtime.image_heap != nullptr && HybridWalkAllowed(program);
 	SetWalkerSkipsGpuWritten(hybrid);
+	SetWalkerDefersGpuConditions(defer_conditions);
 	(void)TakeWalkerTaint();
+	std::vector<uint64_t> deferred_words;
+	(void)TakeWalkerDeferredConditions(deferred_words);
 	const bool walked = WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr);
+	SetWalkerDefersGpuConditions(false);
 	SetWalkerSkipsGpuWritten(false);
 	SetWalkedProgram(0);
+	deferred = TakeWalkerDeferredConditions(deferred_words);
+	// The results do not depend on a deferred word, but the reads list it as a waiting walk
+	// would have captured it, for the checks that bound buffer writes by what the walk read.
+	if (capture_reads) {
+		for (const auto word: deferred_words) reads.emplace_back(word, uint64_t {sizeof(uint32_t)});
+	}
 	// A tainted walk read zeros for GPU-written words: global descriptors use the shader path.
 	const bool runtime_descriptors = !hybrid || TakeWalkerTaint();
 	const auto global_entry = [&](uint32_t source, uint32_t words, uint32_t profile) {
@@ -1779,6 +1802,14 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if ((runtime.indirect_args_address & 3u) != 0u ||
 			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
 			               observed, workgroup_counts)) return false;
+			if (runtime.indirect_group_size.size() == 3u) {
+				// Thread counts: the groups that cover them, as the dispatch runs.
+				for (uint32_t axis = 0; axis < 3u; ++axis) {
+					const auto size = std::max(runtime.indirect_group_size[axis], 1u);
+					const auto threads = workgroup_counts[axis];
+					workgroup_counts[axis] = threads / size + (threads % size != 0u ? 1u : 0u);
+				}
+			}
 			observed.workgroup_counts = workgroup_counts;
 			break;
 		}
@@ -1998,6 +2029,25 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	// The first walk does not wait for GPU writes that only decide branches: such a branch
+	// reaches both successors and binds the resources of both. When that wider walk fails (a
+	// scalar read or descriptor of a branch the shader may not take is unknown or unusable), the
+	// walk runs again and waits for the writes, as before.
+	std::vector<std::string> failures;
+	bool                     deferred = false;
+	t_specialization_failures         = &failures;
+	const bool done = MaterializeWalk(program, runtime, snapshot, specialization, true, deferred);
+	t_specialization_failures = nullptr;
+	if (done) return true;
+	if (deferred) {
+		return MaterializeWalk(program, runtime, snapshot, specialization, false, deferred);
+	}
+	for (const auto& failure: failures) (void)SpecializationFail(failure);
+	return false;
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {

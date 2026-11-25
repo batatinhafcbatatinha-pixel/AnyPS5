@@ -127,6 +127,9 @@ public:
 	// SRT-walker load on the GPU thread from a GPU-modified page: the guest word, when no GPU
 	// write covers it, so the walk needs no read-back.
 	[[nodiscard]] bool TryCurrentWalkerLoad(uint64_t vaddr, uint32_t& value);
+	// GPU thread: whether the bytes hold a GPU write guest memory does not have yet, after
+	// publishing the finished eager downloads that cover them. Never waits for the GPU.
+	[[nodiscard]] bool HasPendingGpuWrite(uint64_t vaddr, uint64_t size);
 	// GPU thread: reads a small table of guest memory the GPU may have written (see
 	// LibKernel::Memory::ReadGpuTable).
 	[[nodiscard]] bool ReadTable(uint64_t vaddr, uint64_t size, void* data);

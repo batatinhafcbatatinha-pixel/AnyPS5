@@ -270,17 +270,12 @@ static void PrepareRayQuery(RenderContext& context, const ShaderStageRuntime& st
 }
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
-                             PreparedBindings& bindings, uint64_t indirect_args = 0) {
+                             PreparedBindings& bindings, bool indirect = false) {
 	if (input.stage.module->info.bindings.descriptor_counts[
 	        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory)] == 0) {
 		return;
 	}
 	auto& cache = context.GetBufferCache();
-	if (indirect_args != 0) {
-		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
-		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
-		            sizeof(input.workgroup_counts));
-	}
 	// LDS has no contents to preserve between dispatches. The existing shader hazard
 	// barriers also order other users of this GPU-only utility buffer.
 	auto& storage = context.GetCommandScheduler().InSide() ? cache.GetSideSharedMemoryBuffer()
@@ -288,7 +283,12 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	const auto limit = std::min<uint64_t>(storage.Size(),
 	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
 	uint64_t size = sizeof(uint32_t);
-	if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
+	if (indirect) {
+		// The group counts stay in GPU memory, so the binding is the largest one a dispatch with
+		// host-known counts may get: every group finds its LDS at the same offset as there.
+		EXIT_IF(input.lds_size_dwords == 0 || uint64_t {input.lds_size_dwords} * sizeof(uint32_t) > limit);
+		size = limit & ~uint64_t {3};
+	} else if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
 		size = uint64_t {input.lds_size_dwords} * sizeof(uint32_t);
 		EXIT_IF(size == 0 || size > limit);
 		for (const auto count: input.workgroup_counts) {
@@ -611,6 +611,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 // AnyPS5: the group counts of an indirect dispatch the GPU reads pass through a one-thread copy that
 // zeroes more than 2^31 groups (counts read from bytes that are not dispatch arguments kept the
 // device busy until the driver reset it). Returns the buffer and offset the dispatch reads.
+// With group sizes the arguments are thread counts: the copy turns them into the groups that
+// cover them and also stores them as the program's thread extents, at the returned address.
 namespace {
 struct DispatchClamp {
 	vk::PipelineLayout      layout;
@@ -618,18 +620,28 @@ struct DispatchClamp {
 	std::unique_ptr<Buffer> ring;
 	uint32_t                next = 0;
 };
+struct DispatchClampPush {
+	uint64_t source = 0, target = 0;
+	uint32_t group_size[3] {};
+	uint32_t limit[3] {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+};
+static_assert(sizeof(DispatchClampPush) == 40);
+struct IndirectCounts {
+	vk::Buffer buffer;
+	uint64_t   offset  = 0;
+	uint64_t   extents = 0; // Device address of the thread counts; 0 for group counts.
+};
 constexpr uint32_t DispatchClampSlots = 4096;
+// Groups at the start of a slot, thread extents 16 bytes in.
+constexpr uint64_t DispatchClampSlotSize = 32;
 } // namespace
 
-static std::pair<vk::Buffer, uint64_t> ClampIndirectCounts(RenderContext& context, CommandBuffer& buffer,
-                                                           const Buffer& args, uint64_t offset) {
+static IndirectCounts ClampIndirectCounts(RenderContext& context, CommandBuffer& buffer, const Buffer& args,
+                                          uint64_t offset, const uint32_t* group_size = nullptr) {
 	static DispatchClamp clamp;
 	auto&                graphics = context.GetGraphics();
 	if (!clamp.pipeline) {
-		struct Push {
-			uint64_t source, target;
-		};
-		const vk::PushConstantRange  range {vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push)};
+		const vk::PushConstantRange  range {vk::ShaderStageFlagBits::eCompute, 0, sizeof(DispatchClampPush)};
 		vk::PipelineLayoutCreateInfo layout_info {};
 		layout_info.pushConstantRangeCount = 1;
 		layout_info.pPushConstantRanges    = &range;
@@ -641,9 +653,9 @@ static std::pair<vk::Buffer, uint64_t> ClampIndirectCounts(RenderContext& contex
 		    graphics, context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
 		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer |
 		        vk::BufferUsageFlagBits::eShaderDeviceAddress,
-		    uint64_t {DispatchClampSlots} * 16u);
+		    uint64_t {DispatchClampSlots} * DispatchClampSlotSize);
 	}
-	const uint64_t slot = uint64_t {clamp.next++ % DispatchClampSlots} * 16u;
+	const uint64_t slot = uint64_t {clamp.next++ % DispatchClampSlots} * DispatchClampSlotSize;
 	buffer.EndRendering();
 	const auto native = buffer.Handle();
 	// The counts' writers and an earlier indirect read of the slot come first.
@@ -653,23 +665,39 @@ static std::pair<vk::Buffer, uint64_t> ClampIndirectCounts(RenderContext& contex
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eComputeShader,
 	                       {}, 1, &before, 0, nullptr, 0, nullptr);
 	native.bindPipeline(vk::PipelineBindPoint::eCompute, clamp.pipeline);
-	const struct {
-		uint64_t source, target;
-	} push {args.BufferDeviceAddress() + offset, clamp.ring->BufferDeviceAddress() + slot};
+	DispatchClampPush push;
+	push.source = args.BufferDeviceAddress() + offset;
+	push.target = clamp.ring->BufferDeviceAddress() + slot;
+	if (group_size != nullptr) {
+		const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+		for (uint32_t axis = 0; axis < 3u; ++axis) {
+			push.group_size[axis] = std::max(group_size[axis], 1u);
+			push.limit[axis]      = limits.maxComputeWorkGroupCount[axis];
+		}
+	}
 	native.pushConstants(clamp.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	native.dispatch(1, 1, 1);
 	vk::MemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eDrawIndirect,
-	                       {}, 1, &after, 0, nullptr, 0, nullptr);
-	return {clamp.ring->Handle(), slot};
+	auto dst_stages     = vk::PipelineStageFlags {vk::PipelineStageFlagBits::eDrawIndirect};
+	if (group_size != nullptr) {
+		// The program reads its extents.
+		after.dstAccessMask |= vk::AccessFlagBits::eShaderRead;
+		dst_stages |= vk::PipelineStageFlagBits::eComputeShader;
+	}
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, dst_stages, {}, 1, &after, 0,
+	                       nullptr, 0, nullptr);
+	return {clamp.ring->Handle(), slot,
+	        group_size != nullptr ? clamp.ring->BufferDeviceAddress() + slot + 16u : uint64_t {0}};
 }
 
 void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
                                       bool async_compute) {
-	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0);
+	// Thread-count arguments the GPU wrote: the groups and the program's thread extents are
+	// derived from them on the GPU (ClampIndirectCounts), so the host never reads them.
+	const bool thread_dimensions = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
@@ -685,6 +713,14 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
+	const uint32_t group_size[3] = {std::max(cs_regs.cs_regs.num_thread_x, 1u),
+	                                std::max(cs_regs.cs_regs.num_thread_y, 1u),
+	                                std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+	if (thread_dimensions) {
+		input_info.dispatch_thread_dimensions = true;
+		input_info.dispatch_extent_address    = true;
+		std::copy(std::begin(group_size), std::end(group_size), input_info.indirect_group_size);
+	}
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
 	if (SkippedCompute(input_info.stage.module->info.shader_hash)) return;
@@ -700,7 +736,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		m_context.PrepareBda();
 	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);
-	BindSharedMemory(m_context, input_info, bindings, args_addr);
+	BindSharedMemory(m_context, input_info, bindings, true);
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
@@ -709,8 +745,16 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF((args_offset & 3u) != 0);
-	const auto [counts_buffer, counts_offset] =
-	    ClampIndirectCounts(m_context, buffer, *args_buffer, args_offset);
+	const auto counts = ClampIndirectCounts(m_context, buffer, *args_buffer, args_offset,
+	                                        thread_dimensions ? &group_size[0] : nullptr);
+	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		// Compiled with dispatch_extent_address: the program loads its extents from this address.
+		EXIT_IF(counts.extents == 0);
+		const auto dword                = program.bindings.dispatch_thread_dword;
+		bindings.shader_data[dword]     = static_cast<uint32_t>(counts.extents);
+		bindings.shader_data[dword + 1] = static_cast<uint32_t>(counts.extents >> 32u);
+		bindings.shader_data[dword + 2] = 0;
+	}
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -725,7 +769,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		GpuDiag::Checkpoint(m_context.GetGraphics(), vk_buffer, input_info.stage.module->info.shader_hash, 'c',
 		                    m_context.GetCommandScheduler().CurrentTick());
 	}
-	vk_buffer.dispatchIndirect(counts_buffer, counts_offset);
+	vk_buffer.dispatchIndirect(counts.buffer, counts.offset);
 	if (gpu_time) GpuTime::After(m_context, vk_buffer, input_info.stage.module->info.shader_hash,
 	                              GpuTime::Kind(input_info.stage.module->info, 'c'));
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

@@ -5,6 +5,11 @@
 // Copies the group counts of an indirect dispatch the GPU reads, zeroing a dispatch of more than
 // 2^31 groups: such counts are bytes that are not dispatch arguments, and executing them keeps the
 // device busy until the driver resets it.
+//
+// With a nonzero group size the arguments are thread counts instead: the groups are the ones that
+// cover them, and the thread counts are stored 16 bytes after the groups as the extents the
+// program masks its threads with. A group count above the device limit of its axis zeroes the
+// dispatch, as a dispatch with host-known counts is skipped then.
 
 layout(local_size_x = 1) in;
 
@@ -13,14 +18,34 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer Counts { uin
 layout(push_constant) uniform Push {
 	uint64_t source;
 	uint64_t target;
+	uint     size_x;
+	uint     size_y;
+	uint     size_z;
+	uint     limit_x;
+	uint     limit_y;
+	uint     limit_z;
 }
 push;
+
+uint Groups(uint threads, uint size) {
+	return threads / size + (threads % size != 0u ? 1u : 0u);
+}
 
 void main() {
 	Counts source = Counts(push.source);
 	Counts target = Counts(push.target);
-	const uint x = source.value[0], y = source.value[1], z = source.value[2];
-	const bool skip = uint64_t(x) * uint64_t(y) > (1ul << 31) / max(uint64_t(z), 1ul);
+	uint x = source.value[0], y = source.value[1], z = source.value[2];
+	if (push.size_x != 0u) {
+		Counts extent = Counts(push.target + 16ul);
+		extent.value[0] = x;
+		extent.value[1] = y;
+		extent.value[2] = z;
+		x = Groups(x, push.size_x);
+		y = Groups(y, push.size_y);
+		z = Groups(z, push.size_z);
+	}
+	const bool skip = x > push.limit_x || y > push.limit_y || z > push.limit_z ||
+	                  uint64_t(x) * uint64_t(y) > (1ul << 31) / max(uint64_t(z), 1ul);
 	target.value[0] = skip ? 0u : x;
 	target.value[1] = skip ? 0u : y;
 	target.value[2] = skip ? 0u : z;

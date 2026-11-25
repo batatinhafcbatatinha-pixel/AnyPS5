@@ -859,7 +859,7 @@ struct CommittedCache {
 };
 Common::FastTls<CommittedCache*> t_committed_cache;
 
-uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	// Vertex ranges are clamped at every draw: a range known committed needs no VirtualQuery.
 	if (Common::DebugCounters::g_aps5_stats) AgcDriver::VramBackend::g_clamp_calls.fetch_add(1, std::memory_order_relaxed);
 	const auto generation = AgcDriver::VramBackend::g_commit_generation.load(std::memory_order_acquire);
@@ -910,6 +910,11 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (committed != 0) {
 		t_committed[cache->next++ % 16] = {vaddr, vaddr + committed, committed != size};
 	}
+	return committed;
+}
+
+uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+	const uint64_t committed = TryClampRangeSize(vaddr, size);
 	if (committed == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",

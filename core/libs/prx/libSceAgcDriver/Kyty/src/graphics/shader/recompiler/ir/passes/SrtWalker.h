@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -47,6 +48,8 @@ struct SrtRuntime {
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
+	// Nonempty when the indirect arguments are thread counts: the group size they are divided by.
+	std::span<const uint32_t> indirect_group_size;
 	ImageHeapSource*          image_heap            = nullptr;
 };
 
@@ -98,6 +101,16 @@ void SetWalkerSkipsGpuWritten(bool skip);
 bool WalkerSkipsGpuWritten();
 void MarkWalkerTainted();
 bool TakeWalkerTaint();
+// Walker loads whose values only decide branches (no descriptor, scalar read or output depends
+// on them) first ask this function whether their word holds a GPU write guest memory does not
+// have yet. While deferral is enabled on this thread such a load reads as unknown, so the walk
+// reaches both successors of the branches it decides instead of waiting for the write; the
+// shader takes its branch at run time. False means do the load as before.
+using WalkerGpuPending = bool (*)(uint64_t address);
+void SetWalkerGpuPending(WalkerGpuPending function);
+void SetWalkerDefersGpuConditions(bool defer);
+// Whether a walk on this thread deferred a load since the last call; addresses receives their words.
+bool TakeWalkerDeferredConditions(std::vector<uint64_t>& addresses);
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.

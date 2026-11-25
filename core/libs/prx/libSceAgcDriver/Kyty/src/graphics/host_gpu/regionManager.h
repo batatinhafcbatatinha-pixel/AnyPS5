@@ -165,6 +165,8 @@ public:
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t offset, uint64_t size) {
 		const auto [start, end] = GetPageRange(offset, size);
+		// Hot pages change below even when no dirty bit does.
+		const bool had_hot = m_has_hot;
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (m_gpu_dirty.Any(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
@@ -233,7 +235,11 @@ public:
 		} else {
 			UpdateProtection<enable, true>(changed);
 		}
-		Bump();
+		// A call that changes nothing (a buffer written by every draw, GPU-dirty already) keeps
+		// the generation, so upload memos of the region's other ranges stay valid.
+		if (had_hot || !changed.None()) {
+			Bump();
+		}
 	}
 
 	template <DirtySource source, bool clear, typename Func>
@@ -310,6 +316,45 @@ public:
 				}
 			}
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// ForEachModifiedRange<DirtySource::Cpu, true> for `count` ranges of this region, range_at(i)
+	// giving the i-th as {offset, size}, with one protection change for all of them: pages left
+	// between the ranges that are watched already join the same protection call instead of
+	// splitting it. func(i, address, bytes) gets the pages each call would have reported, in the
+	// same order. Only while StickyPagesEnabled() is false (hot pages take the other path).
+	template <typename RangeAt, typename Func>
+	void ForEachCpuModifiedRangeBatch(size_t count, RangeAt&& range_at, Func&& func) {
+		RegionBits mask;
+		bool       any = false;
+		for (size_t index = 0; index < count; index++) {
+			const auto [offset, size] = range_at(index);
+			const auto [start, end]   = GetPageRange(offset, size);
+			if (!m_cpu_dirty.Any(start, end)) {
+				continue;
+			}
+			for (const auto [first, last]: RegionBits(m_cpu_dirty, start, end)) {
+				mask.SetRange(first, last);
+			}
+			m_cpu_dirty.UnsetRange(start, end);
+			any = true;
+		}
+		if (!any) {
+			return;
+		}
+		UpdateProtection<true, false>(mask);
+		Bump();
+		for (size_t index = 0; index < count; index++) {
+			const auto [offset, size] = range_at(index);
+			const auto [start, end]   = GetPageRange(offset, size);
+			// A page two ranges share is reported once, for the first, as separate calls would.
+			RegionBits own(mask, start, end);
+			mask.UnsetRange(start, end);
+			for (const auto [first, last]: own) {
+				func(index, m_cpu_addr + first * TRACKER_PAGE_SIZE,
+				     (last - first) * TRACKER_PAGE_SIZE);
+			}
 		}
 	}
 

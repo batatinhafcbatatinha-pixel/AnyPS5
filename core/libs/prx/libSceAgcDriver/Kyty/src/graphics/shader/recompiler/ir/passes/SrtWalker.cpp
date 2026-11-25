@@ -15,6 +15,8 @@
 #include <deque>
 #include <map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -177,6 +179,57 @@ std::atomic<WalkerFastLoad> g_walker_fast_load {nullptr};
 uint64_t WalkerFastLoadEntry(uint64_t address) {
 	const auto function = g_walker_fast_load.load(std::memory_order_relaxed);
 	return function != nullptr ? function(address) : 0;
+}
+
+std::atomic<WalkerGpuPending> g_walker_gpu_pending {nullptr};
+// AnyPS5: Windows TLS slots, no thread_local with a destructor (emulated TLS on MinGW). The deferred
+// list lives as long as its thread's walks (the GPU thread's); it is not freed at thread exit.
+Common::FastTls<bool>                   t_walker_defers_conditions;
+Common::FastTls<std::vector<uint64_t>*> t_walker_deferred_list;
+
+std::vector<uint64_t>& WalkerDeferred() {
+	auto* list = t_walker_deferred_list.Get();
+	if (list == nullptr) {
+		list = new std::vector<uint64_t>();
+		t_walker_deferred_list.Set(list);
+	}
+	return *list;
+}
+
+// 1 when a branch-only load at address reads as unknown, else 0.
+uint64_t WalkerConditionPendingEntry(uint64_t address) {
+	if (!t_walker_defers_conditions) return 0;
+	const auto function = g_walker_gpu_pending.load(std::memory_order_relaxed);
+	if (function == nullptr || !function(address)) return 0;
+	WalkerDeferred().push_back(address);
+	return 1;
+}
+
+// Jumps to unknown when the branch-only load at r10 reads as unknown. Every register the walker
+// uses but rax keeps its value; the flags do not (none is live across a guest load).
+void PendingCheck(Xbyak::CodeGenerator& code, const Xbyak::Label& unknown) {
+	for (const auto& reg: {code.rcx, code.rdx, code.r8, code.r9, code.r10, code.r11}) {
+		code.push(reg);
+	}
+	code.sub(code.rsp, 32);
+	code.movdqu(code.ptr[code.rsp], code.xmm0);
+	code.movdqu(code.ptr[code.rsp + 16], code.xmm1);
+	code.mov(code.r11, code.rsp);
+	code.and_(code.rsp, -16);
+	code.sub(code.rsp, 48);
+	code.mov(code.ptr[code.rsp + 32], code.r11);
+	code.mov(code.rcx, code.r10);
+	code.mov(code.rax, reinterpret_cast<uint64_t>(&WalkerConditionPendingEntry));
+	code.call(code.rax);
+	code.mov(code.rsp, code.ptr[code.rsp + 32]);
+	code.movdqu(code.xmm0, code.ptr[code.rsp]);
+	code.movdqu(code.xmm1, code.ptr[code.rsp + 16]);
+	code.add(code.rsp, 32);
+	for (const auto& reg: {code.r11, code.r10, code.r9, code.r8, code.rdx, code.rcx}) {
+		code.pop(reg);
+	}
+	code.test(code.eax, code.eax);
+	code.jnz(unknown, Xbyak::CodeGenerator::T_NEAR);
 }
 
 // Pages walker loads faulted on recently (4 KiB page numbers; hints only, races are harmless).
@@ -471,6 +524,8 @@ private:
 		uint32_t             slot = 0, state = 0;
 		Xbyak::Label         label;
 		bool                 pending = true, referenced = false, masked = false, called = false;
+		// A read only branch conditions depend on: a GPU write it lacks makes it unknown.
+		bool                 condition_only = false;
 	};
 	// An out-of-line thunk call for a walk body reference to a value the body referenced before.
 	struct Stub {
@@ -1095,6 +1150,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		}
 		// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read;
 		// pages that faulted recently ask the fast load first.
+		if (node.condition_only) PendingCheck(c, m_ret);
 		LoadGuest(c, c.r10);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1349,6 +1405,37 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		}
 	}
 	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
+	if (resources) {
+		// Reads no descriptor, scalar read or output depends on only decide branches. An unknown
+		// branch reaches both successors, which over-approximates the shader's own choice: the
+		// resources of both stay bound and the shader picks at run time.
+		std::vector<uint8_t>  strict(m_nodes.size(), 0);
+		std::vector<uint32_t> pending;
+		const auto visit = [&](const Operand& operand) {
+			if (operand.kind != Kind::Node || operand.value >= strict.size() || strict[operand.value] != 0) return;
+			strict[operand.value] = 1;
+			pending.push_back(static_cast<uint32_t>(operand.value));
+		};
+		for (const auto& read: reads) visit(read);
+		for (const auto& words: descriptors) {
+			for (const auto& word: words) visit(word);
+		}
+		for (const auto& output: outputs) visit(output);
+		while (!pending.empty()) {
+			const auto index = pending.back();
+			pending.pop_back();
+			const auto& node = m_nodes[index];
+			for (const auto& arg: node.args) visit(arg);
+			visit(node.result);
+		}
+		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
+			auto&      node = m_nodes[index];
+			const auto op   = node.inst->GetOpcode();
+			node.condition_only = strict[index] == 0 &&
+			    (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+			     op == ValueOpcode::LoadBufferU32);
+		}
+	}
 	Layout();
 
 	Xbyak::Label pass, fail, reset;
@@ -1623,6 +1710,20 @@ void SrtWalkerNoteProtectedPage(uint64_t address) {
 
 void SetWalkerFastLoad(WalkerFastLoad function) {
 	g_walker_fast_load.store(function, std::memory_order_relaxed);
+}
+
+void SetWalkerGpuPending(WalkerGpuPending function) {
+	g_walker_gpu_pending.store(function, std::memory_order_relaxed);
+}
+
+void SetWalkerDefersGpuConditions(bool defer) {
+	t_walker_defers_conditions = defer;
+}
+
+bool TakeWalkerDeferredConditions(std::vector<uint64_t>& addresses) {
+	addresses.clear();
+	std::swap(addresses, WalkerDeferred());
+	return !addresses.empty();
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

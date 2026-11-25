@@ -73,6 +73,15 @@ uint64_t WalkerFastLoad(uint64_t vaddr) {
 	return (uint64_t {1} << 32u) | value;
 }
 
+// SRT-walker loads that only decide branches: whether the word holds a GPU write guest memory
+// lacks, in which case the walk takes both branches instead of waiting for a read-back (KytyPS5
+// src/kernel/memory.cpp WalkerGpuPending, commit 8ebe9a09).
+bool WalkerGpuPending(uint64_t vaddr) {
+	auto* renderer = g_published.load(std::memory_order_acquire);
+	return (vaddr & 3u) == 0 && renderer != nullptr && Libs::Graphics::GuestGpu::IsGpuThread() &&
+	       renderer->GetBufferCache().HasPendingGpuWrite(vaddr, sizeof(uint32_t));
+}
+
 vk::SurfaceKHR CreateSurface(const WindowDesc& window) {
 	if (window.createSurface == nullptr || window.context == nullptr) {
 		return nullptr;
@@ -153,6 +162,7 @@ void Core::Start(const WindowDesc* window) {
 	g_video_out = std::make_unique<Libs::VideoOut::VideoOutDriver>();
 	MapGuestRanges(*g_renderer);
 	Libs::Graphics::ShaderRecompiler::IR::SetWalkerFastLoad(&WalkerFastLoad);
+	Libs::Graphics::ShaderRecompiler::IR::SetWalkerGpuPending(&WalkerGpuPending);
 	g_published.store(g_renderer.get(), std::memory_order_release);
 	GuestArena::GuestArenaSetAccessObserver_nid_postfix(&MappedThunk);
 	GuestArena::GuestArenaSetReleaseObserver_nid_no_patch(&ReleasedThunk);

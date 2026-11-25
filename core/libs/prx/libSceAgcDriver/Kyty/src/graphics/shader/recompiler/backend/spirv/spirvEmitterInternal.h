@@ -242,6 +242,13 @@ inline uint32_t Unary(EmitterState& state, spv::Op opcode, uint32_t type, uint32
 	return result;
 }
 
+// A compute program of an indirect dispatch with thread-count arguments: GetDispatchThreadExtent
+// loads the counts from the device address in shader data.
+inline bool DispatchExtentByAddress(const EmitterState& state) {
+	return state.program.stage == ShaderType::Compute && state.input_info.compute != nullptr &&
+	       state.input_info.compute->dispatch_extent_address;
+}
+
 inline uint32_t PackU64(EmitterState& state, uint32_t low, uint32_t high) {
 	const auto pair = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 2), pair, low, high);

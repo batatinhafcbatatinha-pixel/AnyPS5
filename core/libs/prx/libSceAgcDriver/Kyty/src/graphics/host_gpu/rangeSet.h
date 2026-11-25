@@ -4,17 +4,45 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <iterator>
 #include <map>
+#include <utility>
 
 namespace Libs::Graphics {
 
 class RangeSet final {
 public:
+	RangeSet()                           = default;
+	RangeSet(const RangeSet&)            = default;
+	RangeSet& operator=(const RangeSet&) = default;
+	// A moved-from set is empty, so its recent ranges go with the ranges.
+	RangeSet(RangeSet&& other) noexcept
+	    : m_ranges(std::move(other.m_ranges)), m_recent(other.m_recent),
+	      m_recent_next(other.m_recent_next) {
+		other.Reset();
+	}
+	RangeSet& operator=(RangeSet&& other) noexcept {
+		if (this != &other) {
+			m_ranges      = std::move(other.m_ranges);
+			m_recent      = other.m_recent;
+			m_recent_next = other.m_recent_next;
+			other.Reset();
+		}
+		return *this;
+	}
+
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
-		auto       it  = m_ranges.lower_bound(address);
+		// The same ranges are added again and again (a buffer every draw writes): one inside a
+		// range added lately is in the set already.
+		for (const auto& [begin, last]: m_recent) {
+			if (begin <= address && end <= last) {
+				return;
+			}
+		}
+		auto it = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
 			it = std::prev(it);
 		}
@@ -22,6 +50,7 @@ public:
 			it = m_ranges.emplace_hint(it, address, end);
 		} else {
 			if (it->second >= end) {
+				Remember(it->first, it->second);
 				return;
 			}
 			it->second = end;
@@ -31,23 +60,35 @@ public:
 			it->second = std::max(it->second, next->second);
 			next       = m_ranges.erase(next);
 		}
+		Remember(it->first, it->second);
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
+		Extract(address, size, [](uint64_t, uint64_t) {});
+	}
+
+	// ForEachInRange followed by Subtract of the same range, in one walk.
+	template <typename Func>
+	void Extract(uint64_t address, uint64_t size, Func&& func) {
 		const auto end = End(address, size);
-		auto       it  = m_ranges.lower_bound(address);
+		if (m_ranges.empty()) {
+			return;
+		}
+		auto it = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
 			it = std::prev(it);
 		}
 		while (it != m_ranges.end() && it->first < end) {
 			const auto begin = it->first;
 			const auto last  = it->second;
-			it               = m_ranges.erase(it);
+			Forget();
+			func(std::max(begin, address), std::min(last, end));
+			it = m_ranges.erase(it);
 			if (begin < address) {
-				m_ranges.emplace(begin, address);
+				m_ranges.emplace_hint(it, begin, address);
 			}
 			if (last > end) {
-				m_ranges.emplace(end, last);
+				m_ranges.emplace_hint(it, end, last);
 				break;
 			}
 		}
@@ -105,7 +146,24 @@ private:
 		return address + size;
 	}
 
-	std::map<uint64_t, uint64_t> m_ranges;
+	// Ranges each inside one range of the set; a removal forgets them. Empty slots are {0, 0}.
+	void Remember(uint64_t begin, uint64_t end) {
+		m_recent[m_recent_next] = {begin, end};
+		m_recent_next           = (m_recent_next + 1) % m_recent.size();
+	}
+	void Forget() {
+		m_recent      = {};
+		m_recent_next = 0;
+	}
+	void Reset() noexcept {
+		m_ranges.clear();
+		m_recent      = {};
+		m_recent_next = 0;
+	}
+
+	std::map<uint64_t, uint64_t>                 m_ranges;
+	std::array<std::pair<uint64_t, uint64_t>, 4> m_recent {};
+	size_t                                       m_recent_next = 0;
 };
 
 } // namespace Libs::Graphics
