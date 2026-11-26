@@ -34,21 +34,179 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <link.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/uio.h>
+#include <ucontext.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+
+#ifndef _WIN32
+// Linux: a page protection is the mprotect flag set (PROT_NONE, PROT_READ, PROT_READ | PROT_WRITE, ...).
+using DWORD = std::uint32_t;
+#endif
 
 namespace AgcDriver::VramBackend {
 
 namespace {
 
 constexpr uint64_t PageBytes = 0x1000;
+
+// One run of address space with equal state, as VirtualQuery (Windows) or /proc/self/maps (Linux) tell.
+struct Region {
+	uint64_t base      = 0;
+	uint64_t size      = 0;
+	bool     committed = false; // Linux: mapped with some access (PROT_NONE counts as not committed)
+	bool     readable  = false;
+	bool     writable  = false;
+	DWORD    protect   = 0;
+};
+
+#ifdef _WIN32
+bool QueryRegion(uint64_t address, Region& out) {
+	MEMORY_BASIC_INFORMATION memory {};
+	if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) == 0) {
+		return false;
+	}
+	out.base      = reinterpret_cast<uint64_t>(memory.BaseAddress);
+	out.size      = memory.RegionSize;
+	out.committed = memory.State == MEM_COMMIT;
+	out.protect   = memory.Protect;
+	out.readable  = out.committed && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+	out.writable  = (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
+	                                   PAGE_EXECUTE_WRITECOPY)) != 0;
+	return true;
+}
+#else
+// Parses one /proc/self/maps line; true when it decides the answer for `address`.
+bool ParseMapsLine(const char* line, const char* end, uint64_t address, Region& out) {
+	const char* cursor = line;
+	const auto  hex    = [&](uint64_t& value) {
+        value             = 0;
+        const char* first = cursor;
+        while (cursor < end) {
+            const char c     = *cursor;
+            const int  digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+            if (digit < 0) {
+                break;
+            }
+            value = value * 16 + static_cast<uint64_t>(digit);
+            ++cursor;
+        }
+        return cursor != first;
+	};
+	uint64_t start = 0, stop = 0;
+	if (!hex(start) || cursor == end || *cursor++ != '-' || !hex(stop) || cursor == end || *cursor++ != ' ' ||
+	    end - cursor < 4) {
+		return false; // not a mapping line: keep reading
+	}
+	const bool r = cursor[0] == 'r', w = cursor[1] == 'w', x = cursor[2] == 'x';
+	if (address >= stop) {
+		return false;
+	}
+	out = {};
+	if (address < start) { // a gap before this mapping
+		out.base = address;
+		out.size = start - address;
+		return true;
+	}
+	out.base      = start;
+	out.size      = stop - start;
+	out.committed = r || w || x;
+	out.readable  = r;
+	out.writable  = w;
+	out.protect   = (r ? 1u : 0u) | (w ? 2u : 0u) | (x ? 4u : 0u);
+	return true;
+}
+
+// Reads /proc/self/maps with plain read(2) (no allocation: the tracker may ask from a fault handler).
+bool QueryRegion(uint64_t address, Region& out) {
+	const int file = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+	if (file < 0) {
+		return false;
+	}
+	constexpr uint64_t UserEnd = uint64_t {1} << 47;
+	char               buffer[4096];
+	size_t             kept = 0;
+	bool               done = false;
+	while (!done) {
+		const auto got = ::read(file, buffer + kept, sizeof(buffer) - kept);
+		if (got <= 0) {
+			break;
+		}
+		const char* end  = buffer + kept + got;
+		const char* line = buffer;
+		for (const char* scan = buffer; scan < end && !done; ++scan) {
+			if (*scan != '\n') {
+				continue;
+			}
+			done = ParseMapsLine(line, scan, address, out);
+			line = scan + 1;
+		}
+		kept = static_cast<size_t>(end - line);
+		if (kept == sizeof(buffer)) {
+			kept = 0; // one absurdly long line: drop it
+		}
+		std::memmove(buffer, line, kept);
+	}
+	::close(file);
+	if (!done) { // past the last mapping
+		out      = {};
+		out.base = address;
+		out.size = address < UserEnd ? UserEnd - address : PageBytes;
+	}
+	return true;
+}
+#endif
+
+// Base address of the loaded module (executable or library) that holds `inside`, or of the executable
+// when null (the memory statistics print addresses relative to them).
+uint64_t ModuleBase(const void* inside) {
+#ifdef _WIN32
+	if (inside == nullptr) {
+		return reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	}
+	HMODULE module = nullptr;
+	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                   reinterpret_cast<LPCWSTR>(inside), &module);
+	return reinterpret_cast<uint64_t>(module);
+#else
+	if (inside == nullptr) {
+		uint64_t base = 0;
+		dl_iterate_phdr(
+		    [](dl_phdr_info* info, size_t, void* data) -> int {
+			    uint64_t low = UINT64_MAX;
+			    for (int index = 0; index < info->dlpi_phnum; ++index) {
+				    if (info->dlpi_phdr[index].p_type == PT_LOAD) {
+					    low = std::min<uint64_t>(low, info->dlpi_addr + info->dlpi_phdr[index].p_vaddr);
+				    }
+			    }
+			    *static_cast<uint64_t*>(data) = low == UINT64_MAX ? 0 : low;
+			    return 1;
+		    },
+		    &base);
+		return base;
+	}
+	Dl_info info {};
+	return dladdr(inside, &info) != 0 ? reinterpret_cast<uint64_t>(info.dli_fbase) : 0;
+#endif
+}
 
 Common::SrwMutex& ProtectionMutex() {
 	static Common::SrwMutex mutex;
@@ -68,6 +226,14 @@ std::unordered_map<uint64_t, DWORD>& Known() {
 	return known;
 }
 
+#ifndef _WIN32
+DWORD Reduce(DWORD original, Common::VirtualMemory::Mode mode) {
+	if (mode == Common::VirtualMemory::Mode::NoAccess) {
+		return PROT_NONE;
+	}
+	return original & ~static_cast<DWORD>(PROT_WRITE); // read-only (write watched), execute kept
+}
+#else
 DWORD Reduce(DWORD original, Common::VirtualMemory::Mode mode) {
 	if (mode == Common::VirtualMemory::Mode::NoAccess) {
 		return PAGE_NOACCESS;
@@ -81,6 +247,7 @@ DWORD Reduce(DWORD original, Common::VirtualMemory::Mode mode) {
 		default: return original;
 	}
 }
+#endif
 
 std::atomic<uint64_t> g_protect_calls {0}, g_protect_pages {0};
 
@@ -89,8 +256,12 @@ bool Protect(uint64_t address, uint64_t bytes, DWORD protection) {
 		g_protect_calls.fetch_add(1, std::memory_order_relaxed);
 		g_protect_pages.fetch_add(bytes / PageBytes, std::memory_order_relaxed);
 	}
+#ifdef _WIN32
 	DWORD previous = 0;
 	return VirtualProtect(reinterpret_cast<void*>(address), bytes, protection, &previous) != 0;
+#else
+	return ::mprotect(reinterpret_cast<void*>(address), bytes, static_cast<int>(protection)) == 0;
+#endif
 }
 
 // A run VirtualProtect refused as a whole spans mappings (separate views): protect it one memory
@@ -99,14 +270,13 @@ std::atomic<uint64_t> g_split_runs {0};
 void ProtectByRegion(uint64_t begin, uint64_t end, DWORD protection) {
 	if (Common::DebugCounters::g_aps5_stats) g_split_runs.fetch_add(1, std::memory_order_relaxed);
 	for (uint64_t address = begin; address < end;) {
-		MEMORY_BASIC_INFORMATION memory {};
-		if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) == 0) {
+		Region memory;
+		if (!QueryRegion(address, memory)) {
 			(void)Protect(address, PageBytes, protection);
 			address += PageBytes;
 			continue;
 		}
-		const auto stop =
-		    std::min(end, reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize);
+		const auto stop = std::min(end, memory.base + memory.size);
 		if (!Protect(address, stop - address, protection)) {
 			for (uint64_t page = address; page < stop; page += PageBytes) (void)Protect(page, PageBytes, protection);
 		}
@@ -210,19 +380,30 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 	}
 	uint64_t address = begin;
 	while (address < end) {
-		MEMORY_BASIC_INFORMATION memory {};
-		if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) == 0) {
+		Region memory;
+		if (!QueryRegion(address, memory)) {
 			return;
 		}
-		const auto region_end =
-		    std::min(end, reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize);
-		if (memory.State != MEM_COMMIT) {
+		const auto region_end = std::min(end, memory.base + memory.size);
+#ifdef _WIN32
+		if (!memory.committed) {
 			for (uint64_t page = address; page < region_end; page += PageBytes) {
 				originals.erase(page);
 			}
 			address = region_end;
 			continue;
 		}
+#else
+		// A page the tracker took to PROT_NONE still counts as committed, so its protection is known.
+		bool tracked = memory.committed;
+		for (uint64_t page = address; page < region_end && !tracked; page += PageBytes) {
+			tracked = originals.contains(page);
+		}
+		if (!tracked) {
+			address = region_end;
+			continue;
+		}
+#endif
 		uint64_t run_begin  = address;
 		DWORD    run_target = 0;
 		bool     run_open   = false;
@@ -234,6 +415,12 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 		};
 		for (uint64_t page = address; page < region_end; page += PageBytes) {
 			DWORD target = 0;
+#ifndef _WIN32
+			if (!memory.committed && !originals.contains(page)) {
+				flush(page);
+				continue;
+			}
+#endif
 			if (mode == Common::VirtualMemory::Mode::ReadWrite) {
 				const auto found = originals.find(page);
 				if (found == originals.end()) {
@@ -243,7 +430,7 @@ void ApplyLocked(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode)
 				target = found->second;
 				originals.erase(found);
 			} else {
-				const auto [found, inserted] = originals.try_emplace(page, memory.Protect);
+				const auto [found, inserted] = originals.try_emplace(page, memory.protect);
 				target                       = Reduce(found->second, mode);
 			}
 			if (!run_open || target != run_target) {
@@ -304,9 +491,7 @@ void NoteCaller(void* at, uint64_t bytes) {
 	}
 }
 void ReportCallers() {
-	HMODULE self = nullptr;
-	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-	                   reinterpret_cast<LPCWSTR>(&ReportCallers), &self);
+	const uint64_t self = ModuleBase(reinterpret_cast<const void*>(&ReportCallers));
 	struct Row {
 		uint64_t at, calls, bytes;
 	};
@@ -321,31 +506,27 @@ void ReportCallers() {
 	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.bytes > b.bytes; });
 	std::string text = "[memstats] callers (rva in libSceAgcDriver: calls, MiB):";
 	for (size_t index = 0; index < rows.size() && index < 8; ++index) {
-		text += fmt::format(" {:#x}: {} {}", rows[index].at - reinterpret_cast<uint64_t>(self), rows[index].calls,
+		text += fmt::format(" {:#x}: {} {}", rows[index].at - self, rows[index].calls,
 		                    rows[index].bytes >> 20);
 	}
 	Log::WriteToConsoleAndLog(text + std::string(1, char(10)));
 }
 void ReportWaitSites() {
-	HMODULE self = nullptr;
-	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-	                   reinterpret_cast<LPCWSTR>(&ReportWaitSites), &self);
+	const uint64_t self = ModuleBase(reinterpret_cast<const void*>(&ReportWaitSites));
 	std::string text = "[memstats] scheduler waits (rva: count, ms):";
 	for (auto& site: Common::DebugCounters::g_wait_sites) {
 		const auto at = site.at.load(std::memory_order_relaxed);
 		const auto count = site.count.exchange(0);
 		const auto ns = site.ns.exchange(0);
 		if (at != 0 && count != 0) {
-			text += fmt::format(" {:#x}: {} {}", at - reinterpret_cast<uint64_t>(self), count, ns / 1'000'000);
+			text += fmt::format(" {:#x}: {} {}", at - self, count, ns / 1'000'000);
 		}
 	}
 	Log::WriteToConsoleAndLog(text + std::string(1, char(10)));
 }
 template <size_t Slots>
 void ReportSites(const char* title, Common::DebugCounters::SiteTable<Slots>& table, bool rva, bool region_flag, int mode = 0) {
-	HMODULE self = nullptr;
-	GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-	                   reinterpret_cast<LPCWSTR>(&ReportCallers), &self);
+	const uint64_t self = ModuleBase(reinterpret_cast<const void*>(&ReportCallers));
 	struct Row {
 		uint64_t key, count, bytes;
 	};
@@ -361,7 +542,7 @@ void ReportSites(const char* title, Common::DebugCounters::SiteTable<Slots>& tab
 		const auto& row = rows[index];
 		if (rva && mode == 0) {
 			text += row.key == 1 ? fmt::format(" guest-fault: {} {}KiB", row.count, row.bytes >> 10)
-			                     : fmt::format(" {:#x}: {} {}KiB", row.key - reinterpret_cast<uint64_t>(self), row.count, row.bytes >> 10);
+			                     : fmt::format(" {:#x}: {} {}KiB", row.key - self, row.count, row.bytes >> 10);
 		} else if (mode == 3) {
 			text += fmt::format(" {}{}{}{}: {} {}ms", (row.key & 8) ? "gpu" : "guest", (row.key & 4) ? "+bytes" : "",
 			                    (row.key & 2) ? "+eager" : "", (row.key & 1) ? "+sync" : "", row.count, row.bytes / 1000000);
@@ -375,7 +556,7 @@ void ReportSites(const char* title, Common::DebugCounters::SiteTable<Slots>& tab
 		} else if (mode == 6) {
 			text += fmt::format(" {}: {}", row.key, row.count);
 		} else if (mode == 5) {
-			const auto exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+			const auto exe = ModuleBase(nullptr);
 			text += fmt::format(" app+{:#x}: {}", row.key - exe, row.count);
 		} else if (region_flag) {
 			text += fmt::format(" {:#x}{}: {} {}KiB", (row.key >> 1) << 20, (row.key & 1) ? "e" : "s", row.count, row.bytes >> 10);
@@ -498,6 +679,31 @@ bool GuardedRead(uint64_t address, void* data, uint64_t bytes) {
 	return copied;
 }
 
+// Copies to or from the shared backing of a guest range, ignoring the guest page protections; false
+// where the range has no single backing (the caller then opens the pages).
+bool BackingCopy(uint64_t address, void* buffer, uint64_t bytes, bool write) {
+#ifdef _WIN32
+	return GuestArena::GuestArenaBackingCopy_nid_no_patch(address, buffer, bytes, write);
+#else
+	int      file   = -1;
+	uint64_t offset = 0;
+	if (!GuestArena::GuestArenaSharedBacking_nid_postfix(address, bytes, &file, &offset) || file < 0) {
+		return false;
+	}
+	auto*    data = static_cast<uint8_t*>(buffer);
+	uint64_t done = 0;
+	while (done < bytes) {
+		const auto got = write ? ::pwrite(file, data + done, bytes - done, static_cast<off_t>(offset + done))
+		                       : ::pread(file, data + done, bytes - done, static_cast<off_t>(offset + done));
+		if (got <= 0) {
+			return false;
+		}
+		done += static_cast<uint64_t>(got);
+	}
+	return true;
+#endif
+}
+
 bool Tracked(uint64_t address) {
 	std::lock_guard lock(ProtectionMutex());
 	return Originals().contains(address & ~(PageBytes - 1));
@@ -506,12 +712,11 @@ bool Tracked(uint64_t address) {
 bool Readable(uint64_t address, uint64_t bytes) {
 	const auto end = address + bytes;
 	while (address < end) {
-		MEMORY_BASIC_INFORMATION memory {};
-		if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) == 0 ||
-		    memory.State != MEM_COMMIT || (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+		Region memory;
+		if (!QueryRegion(address, memory) || !memory.readable) {
 			return false;
 		}
-		address = reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize;
+		address = memory.base + memory.size;
 	}
 	return true;
 }
@@ -548,17 +753,26 @@ bool CopyOpened(uint64_t address, void* data, uint64_t bytes, bool write) {
 	// The protection a reduced page opens to, or 0 for a page the tracker left alone.
 	const auto target = [&](uint64_t page) -> DWORD {
 		const auto found = originals.find(page);
-		return found == originals.end() ? 0 : write ? PAGE_READWRITE : found->second;
+#ifdef _WIN32
+		const DWORD writable = PAGE_READWRITE;
+#else
+		const DWORD writable = PROT_READ | PROT_WRITE;
+#endif
+		return found == originals.end() ? 0 : write ? writable : found->second;
 	};
 	for (uint64_t page = begin; page < end;) {
-		MEMORY_BASIC_INFORMATION memory {};
-		if (VirtualQuery(reinterpret_cast<void*>(page), &memory, sizeof(memory)) == 0 ||
-		    memory.State != MEM_COMMIT) {
+		Region memory;
+#ifdef _WIN32
+		const bool queried = QueryRegion(page, memory) && memory.committed;
+#else
+		// A page the tracker took to PROT_NONE is still the guest's: only unmapped space refuses.
+		const bool queried = QueryRegion(page, memory) && (memory.committed || originals.contains(page));
+#endif
+		if (!queried) {
 			restore();
 			return false;
 		}
-		const auto region_end =
-		    std::min(end, reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize);
+		const auto region_end = std::min(end, memory.base + memory.size);
 		while (page < region_end) {
 			const DWORD opened = target(page);
 			uint64_t    last   = page + PageBytes;
@@ -568,10 +782,8 @@ bool CopyOpened(uint64_t address, void* data, uint64_t bytes, bool write) {
 					restore();
 					return false;
 				}
-				reduced.push_back({page, last - page, memory.Protect});
-			} else if (write ? (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
-			                                      PAGE_EXECUTE_WRITECOPY)) == 0
-			                 : (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+				reduced.push_back({page, last - page, memory.protect});
+			} else if (write ? !memory.writable : !memory.readable) {
 				restore();
 				return false;
 			}
@@ -590,23 +802,32 @@ bool CopyOpened(uint64_t address, void* data, uint64_t bytes, bool write) {
 
 } // namespace
 
-bool Core::HandleFault(void* exception_pointers) noexcept {
-	auto* const info   = static_cast<EXCEPTION_POINTERS*>(exception_pointers);
-	const auto* record = info->ExceptionRecord;
-	auto*       context = info->ContextRecord;
+namespace {
+
+// What the tracker needs of a fault, whatever the system reports it as: the access kind (0 read, 1 write,
+// 8 execute), the address, and the registers the SRT walker's loads are skipped through.
+struct FaultState {
+	uint64_t  kind    = 0;
+	uint64_t  address = 0;
+	uint64_t* rip     = nullptr;
+	uint64_t* rax     = nullptr;
+	uint64_t  r10     = 0;
+};
+
+bool HandleFaultState(const FaultState& state) noexcept {
+	const auto kind    = state.kind;
+	const auto address = state.address;
 	auto*       renderer = Internal::Renderer();
 	if (renderer == nullptr || t_guarded_read) {
 		return false;
 	}
-	const auto kind    = record->ExceptionInformation[0];
-	const auto address = static_cast<uint64_t>(record->ExceptionInformation[1]);
 	namespace IR       = Libs::Graphics::ShaderRecompiler::IR;
-	const auto skip_load = [context](uint32_t length, uint32_t value) {
-		context->Rax = value;
-		context->Rip += length;
+	const auto skip_load = [&state](uint32_t length, uint32_t value) {
+		*state.rax = value;
+		*state.rip += length;
 	};
 	if (kind == 0) {
-		const auto length = IR::SrtWalkerLoadLength(context->Rip);
+		const auto length = IR::SrtWalkerLoadLength(*state.rip);
 		if (length != 0 && IR::WalkerSkipsGpuWritten()) {
 			skip_load(length, 0);
 			IR::MarkWalkerTainted();
@@ -614,10 +835,10 @@ bool Core::HandleFault(void* exception_pointers) noexcept {
 		}
 		uint32_t value = 0;
 		if (length != 0) {
-			IR::SrtWalkerNoteProtectedPage(context->R10);
+			IR::SrtWalkerNoteProtectedPage(state.r10);
 		}
 		if (length != 0 && Libs::Graphics::GuestGpu::IsGpuThread() &&
-		    renderer->GetBufferCache().TryCurrentWalkerLoad(context->R10, value)) {
+		    renderer->GetBufferCache().TryCurrentWalkerLoad(state.r10, value)) {
 			skip_load(length, value);
 			return true;
 		}
@@ -625,7 +846,7 @@ bool Core::HandleFault(void* exception_pointers) noexcept {
 		// and the shader loads the word itself, instead of waiting for a read-back (KytyPS5
 		// b386cf25).
 		if (length != 0) {
-			if (const auto skip = IR::SrtWalkerDeferLoad(context->Rip, context->R10); skip != 0) {
+			if (const auto skip = IR::SrtWalkerDeferLoad(*state.rip, state.r10); skip != 0) {
 				skip_load(skip, 0);
 				return true;
 			}
@@ -637,7 +858,7 @@ bool Core::HandleFault(void* exception_pointers) noexcept {
 	if (Common::DebugCounters::g_aps5_stats) {
 		const bool gpu = Libs::Graphics::GuestGpu::IsGpuThread();
 		Common::DebugCounters::g_fault_regions.Note((address >> 20) << 2 | (gpu ? 2u : 0u) | (kind == 1 ? 1u : 0u), 0);
-		if (!gpu) Common::DebugCounters::g_fault_rips.Note(context->Rip, 0);
+		if (!gpu) Common::DebugCounters::g_fault_rips.Note(*state.rip, 0);
 	}
 	const auto access = kind == 1   ? Libs::Graphics::PageFaultAccess::Write
 	                    : kind == 8 ? Libs::Graphics::PageFaultAccess::Execute
@@ -661,12 +882,47 @@ bool Core::HandleFault(void* exception_pointers) noexcept {
 			return true;
 		}
 	}
-	if (const auto length = IR::SrtWalkerLoadLength(context->Rip); length != 0) {
+	if (const auto length = IR::SrtWalkerLoadLength(*state.rip); length != 0) {
 		skip_load(length, 0);
 		return true;
 	}
 	return false;
 }
+
+} // namespace
+
+#ifdef _WIN32
+bool Core::HandleFault(void* exception_pointers) noexcept {
+	auto* const info   = static_cast<EXCEPTION_POINTERS*>(exception_pointers);
+	const auto* record = info->ExceptionRecord;
+	auto*       context = info->ContextRecord;
+	FaultState  state;
+	state.kind    = record->ExceptionInformation[0];
+	state.address = static_cast<uint64_t>(record->ExceptionInformation[1]);
+	state.rip     = reinterpret_cast<uint64_t*>(&context->Rip);
+	state.rax     = reinterpret_cast<uint64_t*>(&context->Rax);
+	state.r10     = context->R10;
+	return HandleFaultState(state);
+}
+#else
+bool Core::HandleFault(void* signal_info, void* signal_context) noexcept {
+	const auto* info    = static_cast<const siginfo_t*>(signal_info);
+	auto*       context = static_cast<ucontext_t*>(signal_context);
+	if (info == nullptr || context == nullptr) {
+		return false;
+	}
+	auto&       regs = context->uc_mcontext.gregs;
+	// x86 page-fault error code: bit 1 write, bit 4 instruction fetch.
+	const auto  error = static_cast<uint64_t>(regs[REG_ERR]);
+	FaultState  state;
+	state.kind    = (error & 2u) != 0 ? 1 : (error & 16u) != 0 ? 8 : 0;
+	state.address = reinterpret_cast<uint64_t>(info->si_addr);
+	state.rip     = reinterpret_cast<uint64_t*>(&regs[REG_RIP]);
+	state.rax     = reinterpret_cast<uint64_t*>(&regs[REG_RAX]);
+	state.r10     = static_cast<uint64_t>(regs[REG_R10]);
+	return HandleFaultState(state);
+}
+#endif
 
 void Core::NoteMapped(std::uint64_t address, std::size_t bytes) {
 	g_commit_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -725,6 +981,20 @@ void Core::NoteHostRead(std::uint64_t address, std::size_t bytes) {
 void Core::NoteHostWrite(std::uint64_t address, std::size_t bytes) {
 	if (bytes != 0) {
 		Libs::LibKernel::Memory::InvalidateMemory(address, bytes);
+#ifndef _WIN32
+		// A system call writing into a page the tracker reduced fails with EFAULT instead of faulting:
+		// the pages of the range go back to the guest's protection first (the write invalidated them).
+		std::lock_guard lock(ProtectionMutex());
+		const auto      begin = address & ~(PageBytes - 1);
+		const auto      end   = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
+		bool            any   = false;
+		for (uint64_t page = begin; page < end && !any; page += PageBytes) {
+			any = Originals().contains(page);
+		}
+		if (any) {
+			ApplyLocked(begin, end, Common::VirtualMemory::Mode::ReadWrite);
+		}
+#endif
 	}
 }
 
@@ -750,7 +1020,7 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	if (size == 0) {
 		return true;
 	}
-	if (GuestArena::GuestArenaBackingCopy_nid_no_patch(vaddr, const_cast<void*>(data), size, true)) {
+	if (AgcDriver::VramBackend::BackingCopy(vaddr, const_cast<void*>(data), size, true)) {
 		return true;
 	}
 	return AgcDriver::VramBackend::CopyOpened(vaddr, const_cast<void*>(data), size, true);
@@ -767,7 +1037,7 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	}
 	AgcDriver::VramBackend::Stats().slow.fetch_add(1, std::memory_order_relaxed);
 	AgcDriver::VramBackend::Stats().slow_bytes.fetch_add(size, std::memory_order_relaxed);
-	if (GuestArena::GuestArenaBackingCopy_nid_no_patch(vaddr, data, size, false)) {
+	if (AgcDriver::VramBackend::BackingCopy(vaddr, data, size, false)) {
 		return true;
 	}
 	if (AgcDriver::VramBackend::Readable(vaddr, size)) {
@@ -828,16 +1098,17 @@ static bool CopySparse(uint64_t vaddr, void* data, uint64_t size, bool zero_unma
 	auto*      out = static_cast<std::byte*>(data);
 	const auto end = vaddr + size;
 	while (vaddr < end) {
-		MEMORY_BASIC_INFORMATION memory {};
-		if (VirtualQuery(reinterpret_cast<void*>(vaddr), &memory, sizeof(memory)) == 0) {
+		AgcDriver::VramBackend::Region memory;
+		if (!AgcDriver::VramBackend::QueryRegion(vaddr, memory)) {
 			return false;
 		}
-		const auto region_end =
-		    std::min(end, reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize);
+		const auto region_end = std::min(end, memory.base + memory.size);
 		const auto bytes = region_end - vaddr;
 		// As KytyPS5: gaps (reserved, free or inaccessible guest pages) read as zero.
 		static_cast<void>(zero_unmapped);
-		if (memory.State != MEM_COMMIT || !TryReadBacking(vaddr, out, bytes)) {
+		// Linux: a page the tracker took to PROT_NONE is still the guest's (TryReadBacking opens it).
+		const bool mapped = memory.committed || AgcDriver::VramBackend::Tracked(vaddr);
+		if (!mapped || !TryReadBacking(vaddr, out, bytes)) {
 			std::memset(out, 0, bytes);
 		}
 		out += bytes;
@@ -905,14 +1176,13 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	const uint64_t end       = vaddr + size;
 	uint64_t       address   = vaddr;
 	while (address < end) {
-		MEMORY_BASIC_INFORMATION memory {};
+		AgcDriver::VramBackend::Region memory;
 		if (Common::DebugCounters::g_aps5_stats) AgcDriver::VramBackend::g_clamp_queries.fetch_add(1, std::memory_order_relaxed);
-		if (VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) == 0 ||
-		    memory.State != MEM_COMMIT) {
+		if (!AgcDriver::VramBackend::QueryRegion(address, memory) ||
+		    !(memory.committed || AgcDriver::VramBackend::Tracked(address))) {
 			break;
 		}
-		const auto region_end =
-		    std::min(end, reinterpret_cast<uint64_t>(memory.BaseAddress) + memory.RegionSize);
+		const auto region_end = std::min(end, memory.base + memory.size);
 		committed += region_end - address;
 		address = region_end;
 	}
@@ -974,6 +1244,7 @@ bool GuestBackingOffset(uint64_t /*vaddr*/, uint64_t* /*offset*/) {
 
 namespace Libs::LibKernel {
 
+#ifdef _WIN32
 uint64_t KernelGetTscFrequency() {
 	LARGE_INTEGER frequency {};
 	QueryPerformanceFrequency(&frequency);
@@ -985,6 +1256,18 @@ uint64_t KernelReadTsc() {
 	QueryPerformanceCounter(&counter);
 	return static_cast<uint64_t>(counter.QuadPart);
 }
+#else
+// Nanoseconds of the monotonic clock.
+uint64_t KernelGetTscFrequency() {
+	return 1'000'000'000ull;
+}
+
+uint64_t KernelReadTsc() {
+	timespec now {};
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return static_cast<uint64_t>(now.tv_sec) * 1'000'000'000ull + static_cast<uint64_t>(now.tv_nsec);
+}
+#endif
 
 } // namespace Libs::LibKernel
 

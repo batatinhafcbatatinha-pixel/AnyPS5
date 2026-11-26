@@ -10,14 +10,58 @@
 #include <cstring>
 #include <type_traits>
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <intrin.h>
+#else
+#include <pthread.h>
+#endif
 
 namespace Common {
 
+#ifndef _WIN32
+// Linux: a pthread key per value (nullptr, false or 0 in every new thread). Values are kept in the
+// key's pointer slot; no destructor runs at thread exit, as for the Windows slots.
+template <typename T>
+class FastTls final {
+	static_assert(sizeof(T) <= sizeof(void*) && std::is_trivially_copyable_v<T>);
+
+public:
+	FastTls() noexcept { pthread_key_create(&m_key, nullptr); }
+	~FastTls() { pthread_key_delete(m_key); }
+	FastTls(const FastTls&)            = delete;
+	FastTls& operator=(const FastTls&) = delete;
+
+	[[nodiscard]] T Get() const noexcept {
+		const auto raw = reinterpret_cast<uintptr_t>(pthread_getspecific(m_key));
+		T          value {};
+		std::memcpy(&value, &raw, sizeof(T));
+		return value;
+	}
+	void Set(T value) noexcept {
+		uintptr_t raw = 0;
+		std::memcpy(&raw, &value, sizeof(T));
+		pthread_setspecific(m_key, reinterpret_cast<void*>(raw));
+	}
+
+	operator T() const noexcept { return Get(); } // NOLINT(google-explicit-constructor)
+	FastTls& operator=(T value) noexcept {
+		Set(value);
+		return *this;
+	}
+	T operator->() const noexcept
+	    requires std::is_pointer_v<T>
+	{
+		return Get();
+	}
+
+private:
+	pthread_key_t m_key {};
+};
+#else
 template <typename T>
 class FastTls final {
 	static_assert(sizeof(T) <= sizeof(void*) && std::is_trivially_copyable_v<T>);
@@ -60,6 +104,7 @@ public:
 private:
 	DWORD m_slot;
 };
+#endif
 
 } // namespace Common
 

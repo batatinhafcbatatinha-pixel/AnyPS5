@@ -8,6 +8,12 @@
 // AnyPS5: Common::File on top of the C stdio streams (KytyPS5's archive-aware file layer is not
 // needed by the GPU stack, which only writes caches and dumps).
 
+#if !defined(_WIN32)
+// 64-bit stream offsets under the names the Windows runtime gives them.
+#define _ftelli64 ftello
+#define _fseeki64 fseeko
+#endif
+
 namespace Common {
 
 struct File::FilePrivate {

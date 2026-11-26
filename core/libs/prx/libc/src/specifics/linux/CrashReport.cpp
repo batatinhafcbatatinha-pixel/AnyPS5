@@ -4,6 +4,8 @@
 #include "prx/libc/include/LogFile.hpp"
 #include "prx/libc/include/specifics/linux/GuestFaultCopy.hpp"
 
+#include "prx/libc/include/HostFault.hpp"
+
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -11,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <ucontext.h>
@@ -39,6 +42,7 @@ std::size_t g_mappingCount = 0;
 bool g_mappingsTruncated = false;
 std::atomic<bool> g_reporting{false};
 alignas(16) unsigned char g_alternateStack[64 * 1024];
+std::atomic<LibcGpuFaultHandler> g_gpuFaultHandler{nullptr};
 
 class ReportLine {
 public:
@@ -283,6 +287,19 @@ void ReportCallTrace() {
 
 void OnFatalSignal(int signal, siginfo_t* info, void* context) {
     if (GuestFaultCopy::Resume(info, context)) return;
+    if (signal == SIGSEGV && info != nullptr && info->si_code > 0) {
+        if (const auto handler = g_gpuFaultHandler.load(std::memory_order_acquire)) {
+            // The handler may fault itself (it reads guest memory through guarded copies); keep SIGSEGV deliverable.
+            sigset_t segv;
+            sigemptyset(&segv);
+            sigaddset(&segv, SIGSEGV);
+            pthread_sigmask(SIG_UNBLOCK, &segv, nullptr);
+            const int savedErrno = errno;
+            const bool handled = handler(info, context);
+            errno = savedErrno;
+            if (handled) return;
+        }
+    }
     const int savedErrno = errno;
     if (!g_reporting.exchange(true, std::memory_order_acq_rel)) {
         Report(signal, info, static_cast<const ucontext_t*>(context));
@@ -310,6 +327,14 @@ void OnFatalSignal(int signal, siginfo_t* info, void* context) {
     sigaction(signal, &fallback, nullptr);
     if (info->si_code <= 0) raise(signal);
 }
+
+}
+
+extern "C" void LibcSetGpuFaultHandler_nid_no_patch(LibcGpuFaultHandler handler) noexcept {
+    g_gpuFaultHandler.store(handler, std::memory_order_release);
+}
+
+namespace {
 
 const bool g_installed = [] {
     stack_t alternate{};

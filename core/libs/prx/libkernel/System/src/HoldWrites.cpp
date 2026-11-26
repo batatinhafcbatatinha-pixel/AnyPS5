@@ -1,7 +1,8 @@
 // Held game-patch writes (recomp-patches "offset" writes with "hold": true): values the game
 // computes after start, in its main module's data. ps5port passes them as
 //   APS5_HOLD_WRITES=<rva hex>:<off hex bytes>:<on hex bytes>,...
-// (rva from the start of app.exe's image). Whenever "off" is found there it is replaced by "on".
+// (rva from the start of app.exe's image; Linux: from the address 0x400000 of the converted executable).
+// Whenever "off" is found there it is replaced by "on".
 //
 // Two ways:
 // - Write watchpoints (Windows, opt-in: APS5_HOLD_WATCH=all or a list of writes): the 8-byte slots holding the values get a hardware write
@@ -292,10 +293,16 @@ void Hold() {
 
 struct Starter {
     Starter() {
-#ifdef _WIN32
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
         const char* text = std::getenv("APS5_HOLD_WRITES");
         if (text == nullptr || *text == '\0') return;
+#ifdef _WIN32
         const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+#else
+        // Linux (polling only): the relinker places the executable's virtual address 0 at 0x400000
+        // (no --linux-fixed-base), and the rva counts from there.
+        const std::uintptr_t base = 0x400000;
+#endif
         g_writes = Parse(text, base);
         if (g_writes.empty()) return;
         std::fprintf(stderr, "[patch] holding %zu game values\n", g_writes.size());

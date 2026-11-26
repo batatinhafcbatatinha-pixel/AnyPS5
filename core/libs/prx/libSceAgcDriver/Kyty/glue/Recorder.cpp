@@ -19,11 +19,20 @@
 #include "graphics/host_gpu/cutSwitch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <intrin.h>
+#else
+#include <immintrin.h>
+#include <pthread.h>
+
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#endif
 
 #include <array>
 #include <atomic>
@@ -51,8 +60,12 @@ public:
 		uint32_t unused; // keeps the closure 16-byte aligned
 	};
 
+#ifdef _WIN32
 	Ring(): m_data(static_cast<uint8_t*>(_aligned_malloc(Bytes, 64))) {
 		m_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+#else
+	Ring(): m_data(static_cast<uint8_t*>(std::aligned_alloc(64, Bytes))) {
+#endif
 		m_thread = std::thread([this] { Run(); });
 	}
 
@@ -128,21 +141,51 @@ public:
 		}
 	}
 
+#ifdef _WIN32
 	[[nodiscard]] bool OnRecorderThread() const noexcept { return GetCurrentThreadId() == m_thread_id.load(); }
+#else
+	[[nodiscard]] bool OnRecorderThread() const noexcept { return t_on_recorder; }
+#endif
 
 private:
+#ifdef _WIN32
 	void Kick() { SetEvent(m_wake); }
+	void WaitWake() { WaitForSingleObject(m_wake, 2); }
+#else
+	// Auto-reset event: Kick() sets it, WaitWake() waits up to 2 ms and clears it.
+	void Kick() {
+		{
+			std::lock_guard lock(m_wake_mutex);
+			m_wake_set = true;
+		}
+		m_wake_cv.notify_one();
+	}
+	void WaitWake() {
+		std::unique_lock lock(m_wake_mutex);
+		m_wake_cv.wait_for(lock, std::chrono::milliseconds(2), [this] { return m_wake_set; });
+		m_wake_set = false;
+	}
+#endif
 
 	static void SpinOrYield() {
 		for (int i = 0; i < 64; ++i) {
 			_mm_pause();
 		}
+#ifdef _WIN32
 		SwitchToThread();
+#else
+		std::this_thread::yield();
+#endif
 	}
 
 	void Run() {
+#ifdef _WIN32
 		m_thread_id.store(GetCurrentThreadId());
 		SetThreadDescription(GetCurrentThread(), L"Kyty_Recorder");
+#else
+		t_on_recorder = true;
+		pthread_setname_np(pthread_self(), "Kyty_Recorder");
+#endif
 		// Reading the write position after every record pulls its cache line away from the
 		// producer, whose next publish then waits for it back: during a burst the position is
 		// read again only once the records seen are done (APS5_KYTY_X_CUT=f: after every record).
@@ -160,7 +203,7 @@ private:
 				if (!got) {
 					m_sleeping.store(true, std::memory_order_seq_cst);
 					if (m_write.load(std::memory_order_seq_cst) == read) {
-						WaitForSingleObject(m_wake, 2);
+						WaitWake();
 					}
 					m_sleeping.store(false, std::memory_order_relaxed);
 				}
@@ -188,7 +231,14 @@ private:
 	}
 
 	uint8_t* m_data;
-	HANDLE   m_wake = nullptr;
+#ifdef _WIN32
+	HANDLE m_wake = nullptr;
+#else
+	std::mutex                      m_wake_mutex;
+	std::condition_variable         m_wake_cv;
+	bool                            m_wake_set = false;
+	static inline thread_local bool t_on_recorder = false;
+#endif
 	// One cache line per writer: the producer's (written every record), the consumer's (every
 	// 32 records) and the sleep flag (written when the consumer sleeps, read every record).
 	// Sharing a line made every record of one thread wait for the line the other just wrote.
@@ -200,8 +250,10 @@ private:
 	std::atomic<uint64_t>             m_done {0};
 	uint64_t                          m_ran = 0; // consumer only
 	alignas(64) std::atomic<bool>     m_sleeping {false};
-	std::atomic<DWORD>                m_thread_id {0};
-	alignas(64) std::thread           m_thread;
+#ifdef _WIN32
+	std::atomic<DWORD> m_thread_id {0};
+#endif
+	alignas(64) std::thread m_thread;
 };
 
 Ring* g_ring = nullptr;

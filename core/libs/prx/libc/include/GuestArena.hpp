@@ -96,6 +96,9 @@ void GuestArenaSetSharedBackingHostFallback_nid_no_patch(SharedBackingHostFallba
 bool GuestArenaSharedBackingHostFallback_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 bool GuestArenaOverlapsHostRegion_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaReleaseHostRegion_nid_no_patch(const void* pointer, std::size_t bytes);
+// Linux: copies guest bytes into host memory and returns false, without faulting, when a page is not readable
+// (Windows has the same function with the same meaning).
+bool GuestArenaCopyOwned_nid_no_patch(std::uintptr_t source, void* destination, std::size_t bytes);
 #endif
 bool GuestArenaArmOwned_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags);
 bool GuestArenaOwnedUnchanged_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count);

@@ -79,8 +79,13 @@ void NoteReleased(std::uint64_t address, std::size_t bytes);
 void NoteHostWrite(std::uint64_t address, std::size_t bytes);
 // The host is about to read the range (file writes, sockets): GPU-written bytes come back first.
 void NoteHostRead(std::uint64_t address, std::size_t bytes);
+#ifdef _WIN32
 // Vectored-exception hook (EXCEPTION_POINTERS*): true when the fault was the tracker's.
 bool HandleFault(void* exceptionPointers) noexcept;
+#else
+// SIGSEGV hook (siginfo_t*, ucontext_t*): true when the fault was the tracker's.
+bool HandleFault(void* signalInfo, void* signalContext) noexcept;
+#endif
 
 } // namespace Core
 

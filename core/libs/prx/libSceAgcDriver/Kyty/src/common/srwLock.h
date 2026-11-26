@@ -7,12 +7,22 @@
 // usable with std::lock_guard, std::unique_lock, std::scoped_lock, std::shared_lock and
 // std::condition_variable_any.
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <shared_mutex>
+#endif
 
 namespace Common {
+
+#ifndef _WIN32
+// Linux: the C library's reader/writer lock is already a thin futex lock.
+using SrwMutex       = std::shared_mutex;
+using SrwSharedMutex = std::shared_mutex;
+#else
 
 class SrwMutex final {
 public:
@@ -33,6 +43,7 @@ private:
 };
 
 using SrwSharedMutex = SrwMutex;
+#endif
 
 } // namespace Common
 
