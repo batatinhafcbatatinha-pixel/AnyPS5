@@ -2,8 +2,9 @@
 # renderer (buffer/texture caches, page tracker, pipeline cache) and shader recompiler, plus the
 # glue to AnyPS5 (glue/). Included from libSceAgcDriver's CMakeLists.txt after the target exists.
 
-# Windows only (the stack uses the Win32 API). Elsewhere the stub in glue_stub/ reports the backend as unavailable.
-if(NOT WIN32)
+# Windows, and Linux with ANYPS5_KYTY_GPU_LINUX=ON (experimental). Elsewhere (macOS, and Linux by default)
+# the stub in glue_stub/ reports the backend as unavailable.
+if(NOT WIN32 AND NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ANYPS5_KYTY_GPU_LINUX))
     target_sources(libSceAgcDriver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/glue_stub/BackendStub.cpp)
     return()
 endif()

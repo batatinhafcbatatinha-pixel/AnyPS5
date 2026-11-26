@@ -71,6 +71,12 @@ endfunction()
 
 option(BUILD_TESTING "Build and register relinker tests" OFF)
 option(ANYPS5_RELINKER_ONLY "Build the relinker without system libraries or third-party dependencies" OFF)
+# The VRAM-resident GPU backend (KytyPS5 renderer) is the default on Windows. On Linux it is built only with
+# this option and used only with APS5_GPU_BACKEND=vram; it has not been run there yet.
+option(ANYPS5_KYTY_GPU_LINUX "Build the VRAM-resident GPU backend on Linux (experimental)" OFF)
+if(ANYPS5_KYTY_GPU_LINUX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_compile_definitions(APS5_KYTY_LINUX=1)
+endif()
 option(ANYPS5_BUILD_WASM "Build the browser relinker" OFF)
 option(ANYPS5_RELINKER_CLI "Build the native relinker command line" ON)
 if(ANYPS5_BUILD_WASM)

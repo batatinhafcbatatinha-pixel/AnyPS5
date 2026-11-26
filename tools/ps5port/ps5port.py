@@ -1,42 +1,60 @@
-"""PS5 dumps to Windows programs with the AnyPS5 relinker, for the port launcher (tools/port-installer).
+"""PS5 dumps to native programs with the AnyPS5 relinker, for the port launcher (tools/port-installer).
 
-A port folder (<repo>/.local/ports/<title id>/, made by the launcher) holds setup.json, installer.json, Play.cmd and
-game_files/ (a junction to the player's dump: nothing of the game is copied). Commands:
+A port folder (<repo>/.local/ports/<title id>/, made by the launcher) holds setup.json, installer.json, Play.cmd
+(Play.sh on Linux / macOS) and game_files/ (a junction or symbolic link to the player's dump: nothing of the game is
+copied). Commands:
 
   build --port <dir>   unwrap the decrypted SELF containers (eboot.bin and every .prx/.sprx module), relink them for
-                       Windows into <port>/build/out (app.exe, app0/ with the converted modules, libs/ = the AnyPS5
-                       system libraries) and fill app0/ with links to the dump.
-  play --port <dir>    start build/out/app.exe with the PC settings of <port>/pc-settings.ini as AnyPS5 variables.
-                       The patches chosen in the launcher (<port>/patches/*.json) are applied to the converted
-                       modules first; a patch whose file is gone is undone.
+                       this system into <port>/build/out (Windows: app.exe, Linux: app.elf, macOS: app; app0/ with
+                       the converted modules, libs/ = the AnyPS5 system libraries) and fill app0/ with links to the
+                       dump.
+  play --port <dir>    start the program of build/out with the PC settings of <port>/pc-settings.ini as AnyPS5
+                       variables. The patches chosen in the launcher (<port>/patches/*.json) are applied to the
+                       converted modules first; a patch whose file is gone is undone.
   env --port <dir>     print the variables play would set (a check of the PC settings without starting the game).
 
 Saves, trophies and screenshots stay in build/out (the game's working folder); a new build keeps them.
-The AnyPS5 relinker and system libraries come from an AnyPS5 release, pinned by SHA-256, into <repo>/.local/tools.
+The AnyPS5 relinker and system libraries come from an AnyPS5 release, pinned by SHA-256, into <repo>/.local/tools
+(Windows and Linux). macOS has no release: they are built from this repository's sources (tools/ps5port/build-runtime.sh).
+Linux is x86-64 only; the converted game runs natively, so the CPU needs AVX2 (see docs/LINUX_MACOS.md).
 """
 import argparse
-import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import urllib.request
 import zipfile
+
+WINDOWS = os.name == 'nt'
+MACOS = sys.platform == 'darwin'
+LINUX = sys.platform.startswith('linux')
+# The converted program in build/out.
+PROGRAM = 'app.exe' if WINDOWS else 'app' if MACOS else 'app.elf'
 
 REPO = Path(__file__).resolve().parents[2]
 TOOLS = REPO / '.local' / 'tools'
 sys.path.insert(0, str(REPO / 'tools'))
 
-# The AnyPS5 runtime for Windows: relinker + system libraries of one release.
+# The AnyPS5 runtime: relinker + system libraries of one release, per system (SHA-256 from the release's asset list).
+# There is no macOS release: macOS builds both from this repository (tools/ps5port/build-runtime.sh).
 RUNTIME = {
     'version': 'v0.1.4',
     'base': 'https://github.com/boykopovar/AnyPS5/releases/download/v0.1.4/',
-    'relinker': ('relinker-v0.1.4.exe', '6f6d49e3613ea7fce859621265068bfd64161a729a8051c83150f2d45ec193e0'),
-    'libs': ('prx-windows-v0.1.4.zip', 'cbd61c521d555614dbcddc62cdabf45acfe409c520307cdb58732c8486dd0d7a'),
+    'windows': {
+        'relinker': ('relinker-v0.1.4.exe', '6f6d49e3613ea7fce859621265068bfd64161a729a8051c83150f2d45ec193e0'),
+        'libs': ('prx-windows-v0.1.4.zip', 'cbd61c521d555614dbcddc62cdabf45acfe409c520307cdb58732c8486dd0d7a'),
+    },
+    'linux': {
+        'relinker': ('relinker-v0.1.4', '9e5afd1313520906a9af43c468d6e31a5d2237879a85c0984134d628348e92a8'),
+        'libs': ('prx-linux-v0.1.4.tar.gz', '805ba3f455924a9fc2ca9dae7b398f9c9d4e4b88b6251d738d64afed98f8e6ef'),
+    },
 }
 ELF = b'\x7fELF'
 SELF = (b'\x4f\x15\x3d\x1d', b'\x54\x14\xf5\xee')   # fSELF / SELF containers (PS4-style and PS5)
@@ -66,7 +84,7 @@ def download(url, target, expected):
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_name(target.name + '.part')
-    curl = shutil.which('curl.exe')
+    curl = shutil.which('curl.exe' if WINDOWS else 'curl')
     log(f'Downloading {url}')
     if not (curl and subprocess.run([curl, '-L', '--fail', '--retry', '3', '-sS', '-o', str(part), url]).returncode == 0):
         request = urllib.request.Request(url, headers={'User-Agent': 'ps5port'})
@@ -78,24 +96,45 @@ def download(url, target, expected):
     part.replace(target)
 
 
+def extract(archive, target):
+    """Unpacks a .zip or .tar.gz into the new folder `target`."""
+    if archive.name.endswith('.zip'):
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(target)
+        return
+    with tarfile.open(archive) as t:
+        try:
+            t.extractall(target, filter='data')   # Python 3.12 (and 3.11.4+): refuse links and paths outside target
+        except TypeError:
+            t.extractall(target)
+
+
 def runtime():
-    """(relinker.exe, libs folder) of the pinned AnyPS5 release; ANYPS5_RELINKER / ANYPS5_LIBS use a local build instead."""
+    """(relinker, libs folder) of the pinned AnyPS5 release; ANYPS5_RELINKER / ANYPS5_LIBS use a local build instead.
+    macOS has no release: it builds both from this repository's sources."""
     if os.environ.get('ANYPS5_RELINKER') and os.environ.get('ANYPS5_LIBS'):
         return Path(os.environ['ANYPS5_RELINKER']), Path(os.environ['ANYPS5_LIBS'])
-    home = TOOLS / f'anyps5-{RUNTIME["version"]}'
-    relinker, libs = home / 'relinker.exe', home / 'libs'
+    if MACOS:
+        return source_runtime()
+    if not WINDOWS and platform.machine().lower() not in ('x86_64', 'amd64'):
+        raise SystemExit(f'This machine is {platform.machine()}: AnyPS5 converts PS5 games to x86-64 programs, '
+                         'which need an x86-64 CPU with AVX2.')
+    assets = RUNTIME['windows' if WINDOWS else 'linux']
+    home = TOOLS / (f'anyps5-{RUNTIME["version"]}' if WINDOWS else f'anyps5-{RUNTIME["version"]}-linux')
+    relinker, libs = home / ('relinker.exe' if WINDOWS else 'relinker'), home / 'libs'
     if relinker.is_file() and (libs / 'libkernel.prx').is_file():
         return relinker, libs
-    name, digest = RUNTIME['relinker']
+    name, digest = assets['relinker']
     download(RUNTIME['base'] + name, relinker, digest)
-    name, digest = RUNTIME['libs']
+    if not WINDOWS:
+        relinker.chmod(0o755)
+    name, digest = assets['libs']
     archive = home / name
     download(RUNTIME['base'] + name, archive, digest)
     log('Unpacking the AnyPS5 system libraries ...')
     temp = home / 'libs.extracting'
     remove_tree(temp)
-    with zipfile.ZipFile(archive) as z:
-        z.extractall(temp)
+    extract(archive, temp)
     found = next((p for p in temp.rglob('libkernel.prx')), None)
     if found is None:
         raise SystemExit(f'{name}: libkernel.prx missing')
@@ -134,18 +173,28 @@ def remove_tree(path):
 
 
 def junction(target, link):
-    import _winapi
-    _winapi.CreateJunction(str(target), str(link))
+    """A folder link: a junction on Windows (no privilege needed), a symbolic link elsewhere."""
+    if WINDOWS:
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(str(target), str(link), target_is_directory=True)
 
 
 def link_file(target, link):
-    """Hard link on the same drive, else a copy (small files) or a symbolic link (large ones; needs Developer
-    Mode), else a copy."""
+    """Hard link on the same drive (Linux/macOS: else a symbolic link), else a copy (small files) or a symbolic
+    link (large ones; on Windows this needs Developer Mode), else a copy."""
     try:
         os.link(target, link)
         return
     except OSError:
         pass
+    if not WINDOWS:
+        try:
+            os.symlink(str(target), str(link))
+            return
+        except OSError:
+            pass
     if os.path.getsize(target) > (256 << 20):
         try:
             os.symlink(target, link)
@@ -172,6 +221,43 @@ def overlay(source, dest):
             if entry.name.endswith('.esbak'):
                 continue
             link_file(entry.resolve(), target)
+
+
+# ---------------------------------------------------------------- the target system
+
+def cpu_vendor():
+    try:
+        for line in Path('/proc/cpuinfo').read_text(errors='replace').splitlines():
+            if line.startswith('vendor_id'):
+                return line.split(':', 1)[1].strip()
+    except OSError:
+        pass
+    return ''
+
+
+def target_flags():
+    """Relinker switches for this system: Windows output on Windows, Linux ELF by default on Linux (plus --to-intel on
+    an Intel CPU, which lacks the AMD-only instructions the console's code uses), x86-64 Mach-O on macOS."""
+    if WINDOWS:
+        return ['--windows']
+    if MACOS:
+        return ['--macos', '--to-rosetta' if platform.machine().lower() == 'arm64' else '--to-intel']
+    return ['--to-intel'] if cpu_vendor() == 'GenuineIntel' else []
+
+
+def source_runtime():
+    """macOS: the relinker and the system libraries built from this repository (a long first build; later runs reuse it)."""
+    build = TOOLS / 'anyps5-source'
+    relinker, libs = build / 'relinker' / 'core' / 'relinker' / 'relinker', build / 'full' / 'core' / 'libs' / 'libs'
+    if relinker.is_file() and (libs / 'libkernel.prx').is_file():
+        return relinker, libs
+    script = REPO / 'tools' / 'ps5port' / 'build-runtime.sh'
+    log('Building the AnyPS5 relinker and system libraries from source (this takes a long time) ...')
+    if subprocess.run(['bash', str(script), str(build)], cwd=REPO).returncode != 0:
+        raise SystemExit('Building AnyPS5 failed (see above). docs/LINUX_MACOS.md lists what macOS needs.')
+    if not (relinker.is_file() and (libs / 'libkernel.prx').is_file()):
+        raise SystemExit(f'The build finished without {relinker} and {libs}.')
+    return relinker, libs
 
 
 # ---------------------------------------------------------------- the dump
@@ -247,28 +333,30 @@ def build(port):
 
     # The previous conversion goes; saves (_sd), trophies, data/ and screenshots in out/ stay.
     out.mkdir(parents=True, exist_ok=True)
-    for old in list(out.glob('app*.json')) + [out / 'app.exe', out / 'app.exe.orig', out / 'app0', out / 'libs']:
+    for old in list(out.glob('app*.json')) + [out / PROGRAM, out / (PROGRAM + '.orig'), out / 'app0', out / 'libs']:
         remove_tree(old)
-    cmd = [str(relinker), '--windows'] + os.environ.get('PS5PORT_RELINK_FLAGS', '').split()
+    cmd = [str(relinker)] + target_flags() + os.environ.get('PS5PORT_RELINK_FLAGS', '').split()
     for d in extra:
         cmd += ['--module-dir', d if d != '' else '.']
     for name in sorted(replaced):
         log(f"{name}: the title's copy is replaced by the AnyPS5 library")
         cmd += ['--exclude-sce-module', name]
-    cmd += [str((src / 'eboot.elf').resolve()), 'app.exe']
-    log('Relinking for Windows (AnyPS5 relinker) ...')
+    cmd += [str((src / 'eboot.elf').resolve()), PROGRAM]
+    log(f'Relinking for {"Windows" if WINDOWS else "macOS" if MACOS else "Linux"} (AnyPS5 relinker) ...')
     result = subprocess.run(cmd, cwd=out, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     lines = [l for l in result.stdout.replace('\r', '\n').splitlines() if l.strip() and '%' not in l]
     print('\n'.join(lines[-40:]), flush=True)
-    if result.returncode != 0 or not (out / 'app.exe').is_file():
+    if result.returncode != 0 or not (out / PROGRAM).is_file():
         raise SystemExit(f'The relinker failed (code {result.returncode}).')
+    if not WINDOWS:
+        (out / PROGRAM).chmod(0o755)
 
     log('Linking the game files into app0 (nothing is copied but small files from another drive) ...')
     overlay(game, out / 'app0')
     junction(libs.resolve(), out / 'libs')
     info = title_info(game)
     (out / 'ps5port.json').write_text(json.dumps({**info, 'anyps5': RUNTIME['version'], 'module_dirs': sorted(module_dirs)}, indent=2))
-    log(f'Done: {info["name"]} ({info["titleId"]}) -> {out / "app.exe"}')
+    log(f'Done: {info["name"]} ({info["titleId"]}) -> {out / PROGRAM}')
 
 
 # ---------------------------------------------------------------- PC settings -> AnyPS5 variables
@@ -281,13 +369,24 @@ LANGUAGES = {
 }
 
 
-def windows_language():
-    try:
-        buf = ctypes.create_unicode_buffer(85)
-        ctypes.windll.kernel32.GetUserDefaultLocaleName(buf, 85)
-        name = buf.value.lower()
-    except (AttributeError, OSError):
-        return None
+def system_language():
+    """The console language number of the system's language (Windows locale, or the LC_ALL / LC_MESSAGES / LANG
+    variables elsewhere); None when unknown."""
+    name = ''
+    if WINDOWS:
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(85)
+            ctypes.windll.kernel32.GetUserDefaultLocaleName(buf, 85)
+            name = buf.value.lower()
+        except (AttributeError, OSError):
+            return None
+    else:
+        for variable in ('LC_ALL', 'LC_MESSAGES', 'LANGUAGE', 'LANG'):
+            value = os.environ.get(variable, '').split(':')[0]
+            if value and value not in ('C', 'POSIX'):
+                name = value.split('.')[0].split('@')[0].replace('_', '-').lower()
+                break
     parts = name.split('-')
     for key in (name, '-'.join(parts[:2]), parts[0]):
         if key in LANGUAGES:
@@ -349,7 +448,7 @@ def settings_env(port, game):
         env['ANYPS5_MUTE_ON_FOCUS_LOSS'] = '1'
     language = number(v, 'language', -1)
     if language < 0:
-        language = windows_language()
+        language = system_language()
     if language is not None and language != 1:
         env['ANYPS5_LANGUAGE'] = str(language)
     # A dump without PlayGo data (sce_sys/playgo-chunk.dat) is complete: every chunk is installed.
@@ -374,7 +473,7 @@ def apply_patches(port):
     "offset" writes (values in the loaded main module) with "hold": true are replaced at run time whenever the game
     writes them (APS5_HOLD_WRITES); without "hold" they are written once into app.exe before start (app.exe.orig)."""
     app0 = port / 'build' / 'out' / 'app0'
-    exe = port / 'build' / 'out' / 'app.exe'
+    exe = port / 'build' / 'out' / PROGRAM
     for original in list(app0.rglob('*.guest.prx.orig')) + [Path(str(exe) + '.orig')]:
         if original.is_file():
             shutil.copy2(original, str(original)[:-5])
@@ -396,7 +495,7 @@ def apply_patches(port):
                 name = write['module'].lower().removesuffix('.guest.prx') + '.guest.prx'
                 modules = [p for p in app0.rglob('*.guest.prx') if p.name.lower() == name and not is_link(p)]
                 if not modules and name == 'eboot.bin.guest.prx':
-                    modules = [exe]  # the main module is relinked into app.exe (its data sections included)
+                    modules = [exe]  # the main module is relinked into the program (its data sections included)
                 if len(modules) != 1:
                     raise ValueError(f'{write["module"]}: {len(modules)} converted modules with that name')
                 data = modules[0].read_bytes()
@@ -418,8 +517,25 @@ def apply_patches(port):
 
 # GoldHEN/KytyPS5 memory offsets count from the main module's load address, at which the first
 # loadable segment (ELF vaddr 0) lies 0x10010000 above (PS5 cheat convention, checked on a title
-# with a pattern anchor). The relinker places ELF vaddr v at app.exe's section .elf0 + v.
+# with a pattern anchor). The relinker places ELF vaddr v at app.exe's section .elf0 + v (Windows) or at
+# 0x400000 + v (Linux, without --linux-fixed-base).
 GOLDHEN_MAIN_BASE = 0x10010000
+LINUX_IMAGE_BASE = 0x400000
+
+
+def elf_segments(exe):
+    """(virtual address, memory size, file offset, file size) of each PT_LOAD segment of an ELF64 file."""
+    data = exe.read_bytes()
+    if data[:4] != ELF or len(data) < 0x40:
+        raise ValueError(f'{exe.name} is not an ELF file')
+    phoff, = struct.unpack_from('<Q', data, 0x20)
+    phentsize, phnum = struct.unpack_from('<HH', data, 0x36)
+    segments = []
+    for index in range(phnum):
+        kind, _, offset, vaddr, _, filesz, memsz = struct.unpack_from('<IIQQQQQ', data, phoff + index * phentsize)
+        if kind == 1:
+            segments.append((vaddr, memsz, offset, filesz))
+    return segments
 
 
 def image_section_rva(exe, name):
@@ -454,7 +570,18 @@ def image_write(port, write):
     find, new = patch_bytes(write, 'find'), patch_bytes(write, 'write')
     if len(find) != len(new):
         raise ValueError('find and write sizes differ')
-    exe = port / 'build' / 'out' / 'app.exe'
+    exe = port / 'build' / 'out' / PROGRAM
+    if MACOS:
+        raise ValueError(f'{write["module"]}: memory writes are not supported on macOS')
+    if not WINDOWS:
+        address = LINUX_IMAGE_BASE + int(write['offset'], 16) - GOLDHEN_MAIN_BASE
+        for vaddr, _, offset, filesz in elf_segments(exe):
+            if vaddr <= address and address + len(new) <= vaddr + filesz:
+                where = offset + address - vaddr
+                if exe.read_bytes()[where:where + len(find)] != find:
+                    raise ValueError(f'offset {write["offset"]}: the value to replace is not there (another game version?)')
+                return exe, where, new
+        raise ValueError(f'offset {write["offset"]}: not in the file data of {PROGRAM}')
     rva = image_section_rva(exe, '.elf0') + int(write['offset'], 16) - GOLDHEN_MAIN_BASE
     for _, start, size, raw, raw_size in image_sections(exe):
         if start <= rva and rva + len(new) <= start + min(size, raw_size):
@@ -472,15 +599,24 @@ def memory_write(port, write):
     off, on = patch_bytes(write, 'find'), patch_bytes(write, 'write')
     if len(off) != len(on):
         raise ValueError('find and write sizes differ')
-    rva = image_section_rva(port / 'build' / 'out' / 'app.exe', '.elf0') + int(write['offset'], 16) - GOLDHEN_MAIN_BASE
+    if MACOS:
+        raise ValueError(f'{write["module"]}: held memory writes are not supported on macOS')
+    if WINDOWS:
+        rva = image_section_rva(port / 'build' / 'out' / PROGRAM, '.elf0') + int(write['offset'], 16) - GOLDHEN_MAIN_BASE
+    else:   # the runtime adds 0x400000 (polling only on Linux)
+        rva = int(write['offset'], 16) - GOLDHEN_MAIN_BASE
+        if rva < 0:
+            raise ValueError(f'offset {write["offset"]}: below the main module')
     return f'{rva:x}:{off.hex()}:{on.hex()}'
 
 
 def play(port):
     out = port / 'build' / 'out'
-    exe = out / 'app.exe'
+    exe = out / PROGRAM
     if not exe.is_file():
         raise SystemExit('Not built yet: install the game in the launcher first.')
+    if not WINDOWS and not os.access(exe, os.X_OK):
+        exe.chmod(0o755)
     held = apply_patches(port)
     game = (port / 'game_files').resolve() if (port / 'game_files').exists() else None
     env = dict(os.environ)

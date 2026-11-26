@@ -1,0 +1,167 @@
+name: Linux and macOS (fork)
+
+# What the fork adds for Linux and macOS (docs/LINUX_MACOS.md): the launcher files and tools/ps5port, the relinker
+# and its tests on both systems, and the system libraries on Linux (and, when asked, macOS). No game content is
+# involved: there is no title, dump or converted code in this repository or in these jobs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'tools/ps5port/**'
+      - 'launcher.json'
+      - 'Launcher.sh'
+      - 'docs/LINUX_MACOS.md'
+      - 'core/libs/prx/libSceAgcDriver/Kyty/**'
+      - 'core/libs/prx/libc/include/GuestArena.hpp'
+      - 'core/libs/prx/libc/include/HostFault.hpp'
+      - 'core/libs/prx/libc/include/GpuBackend.hpp'
+      - 'core/libs/prx/libc/src/specifics/linux/**'
+      - 'core/libs/prx/libkernel/System/src/HoldWrites.cpp'
+      - '.github/workflows/linux-macos.yml'
+  workflow_dispatch:
+    inputs:
+      macos_runtime:
+        description: Also build the system libraries on macOS (long, never run before)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  files:
+    name: launcher files and ps5port
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Shell scripts
+        run: |
+          bash -n Launcher.sh
+          bash -n tools/ps5port/build-runtime.sh
+          shellcheck -S error Launcher.sh tools/ps5port/build-runtime.sh
+      - name: Shell scripts have LF line endings and a bash shebang
+        run: |
+          for file in Launcher.sh tools/ps5port/build-runtime.sh; do
+            head -n 1 "$file" | grep -qx '#!/usr/bin/env bash'
+            if grep -q $'\r' "$file"; then echo "::error file=$file::CRLF line endings"; exit 1; fi
+          done
+      - name: launcher.json
+        run: |
+          python3 - <<'PY'
+          import json
+          config = json.load(open('launcher.json', encoding='utf-8'))
+          for system in ('linux', 'macos'):
+              block = config[system]
+              assert block['exe'] and block['generic']['play_sh'].startswith('#!/usr/bin/env bash'), system
+              assert block['generic']['exe'] == block['exe'], system
+          assert config['linux']['packages']['apt-get'], 'linux packages'
+          print('launcher.json: linux and macos blocks present')
+          PY
+      - name: ps5port
+        run: |
+          python3 -m py_compile tools/ps5port/ps5port.py
+          python3 -m unittest tools/ps5port/test_ps5port.py -v
+      - name: The pinned Linux assets still match the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import importlib.util, json, subprocess
+          spec = importlib.util.spec_from_file_location('ps5port', 'tools/ps5port/ps5port.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          release = json.loads(subprocess.check_output(
+              ['gh', 'api', 'repos/boykopovar/AnyPS5/releases/tags/' + module.RUNTIME['version']]))
+          digests = {asset['name']: asset.get('digest') for asset in release['assets']}
+          for system in ('windows', 'linux'):
+              for kind, (name, sha) in module.RUNTIME[system].items():
+                  assert digests.get(name) == 'sha256:' + sha, (name, digests.get(name))
+                  print('ok', name)
+          PY
+
+  relinker:
+    name: relinker (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: g++
+          - os: macos-15
+            compiler: clang++
+          - os: macos-15-intel
+            compiler: clang++
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Ninja
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build; else brew install ninja; fi
+      - run: cmake -S . -B build-relinker -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON
+      - run: cmake --build build-relinker --parallel 3
+      - run: ctest --test-dir build-relinker --output-on-failure --timeout 120 --parallel 4 --no-tests=error
+
+  runtime-linux:
+    name: system libraries, Linux${{ matrix.gpu == 'on' && ' with the VRAM-resident GPU backend' || '' }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    continue-on-error: ${{ matrix.gpu == 'on' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: ['off', 'on']
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 10G
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ccache ninja-build pkg-config libvulkan-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libx11-dev libxext-dev libxrandr-dev libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev
+      - uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: fork-linux-ccache-${{ matrix.gpu }}-${{ github.sha }}
+          restore-keys: fork-linux-ccache-${{ matrix.gpu }}-
+      - name: Configure
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DANYPS5_KYTY_GPU_LINUX=${{ matrix.gpu == 'on' && 'ON' || 'OFF' }}
+      - name: Build the system libraries
+        run: cmake --build build --target libs --parallel -- -k 0
+      - name: The libraries exist
+        run: |
+          test -f build/core/libs/libs/libkernel.prx
+          test -f build/core/libs/libs/libSceAgcDriver.prx
+          ls build/core/libs/libs | head -n 50
+
+  runtime-macos:
+    name: system libraries, macOS (experimental)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.macos_runtime }}
+    runs-on: macos-15
+    timeout-minutes: 180
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install the build tools
+        run: brew install cmake ninja pkg-config
+      - name: Build the relinker and the system libraries
+        run: bash tools/ps5port/build-runtime.sh "$RUNNER_TEMP/anyps5"
