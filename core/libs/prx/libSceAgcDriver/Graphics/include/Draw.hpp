@@ -79,6 +79,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
 // Binds the range in place even where draw inputs are copied (GPU-written ranges, buffer cache fallbacks).
 inline const HostImport* ForcedInPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     return InPlaceDrawInput(context, address, bytes, alignment, behindGpuWrite, std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::uint64_t>::max(), true);
+}
 enum class IndexBehindWriter : std::uint8_t { Taken, Off, NoWriter, IndexLimit, MeshStage, PrimitiveRestart, VertexOffset, UnitShadow, PendingStorage, LabelOrStore, CopiedWriter, NoImport, Refused, Count };
 std::array<std::uint64_t, static_cast<std::size_t>(IndexBehindWriter::Count)> IndexBehindWriterCounts();
 const HostImport* InPlaceIndexBehindWriter(const Context& context, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool meshStage, bool primitiveRestart, std::uint32_t firstVertex, IndexBehindWriter* outcome = nullptr);
