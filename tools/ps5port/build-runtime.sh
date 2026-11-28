@@ -4,7 +4,8 @@
 # a build of their own instead of the pinned release.
 #
 #   tools/ps5port/build-runtime.sh [build-dir]      default: <repo>/.local/tools/anyps5-source
-#   JOBS=4 tools/ps5port/build-runtime.sh           parallel jobs (default: all CPUs)
+#   JOBS=4 tools/ps5port/build-runtime.sh           parallel jobs (default: PORT_JOBS from the launcher, else all CPUs;
+#                                                   under the launcher's worker monitor the jobserver decides)
 #   ANYPS5_EXTRA_CMAKE_ARGS="-DANYPS5_KYTY_GPU_LINUX=ON" tools/ps5port/build-runtime.sh   extra CMake options
 #
 # Result:  <build-dir>/relinker/core/relinker/relinker      the relinker
@@ -21,7 +22,9 @@ case "$(uname -s)" in
   Darwin) cpus="$(sysctl -n hw.ncpu 2>/dev/null || echo 2)" ;;
   *) cpus="$(nproc 2>/dev/null || echo 2)" ;;
 esac
-jobs="${JOBS:-$cpus}"
+jobs="${JOBS:-${PORT_JOBS:-$cpus}}"
+parallel="--parallel $jobs"
+if [ "${PORT_WORKERS_AUTO:-}" = 1 ] && [ -n "${MAKEFLAGS:-}" ]; then parallel=""; fi
 
 need() {
   command -v "$1" >/dev/null 2>&1 || { echo "build-runtime: '$1' is missing. $2" >&2; exit 1; }
@@ -48,11 +51,11 @@ extra=(${ANYPS5_EXTRA_CMAKE_ARGS:-})
 
 echo "build-runtime: relinker ..."
 cmake -S "$repo" -B "$build/relinker" -G Ninja -DCMAKE_BUILD_TYPE=Release -DANYPS5_RELINKER_ONLY=ON
-cmake --build "$build/relinker" --parallel "$jobs"
+cmake --build "$build/relinker" $parallel
 
 echo "build-runtime: system libraries (long) ..."
 cmake -S "$repo" -B "$build/full" -G Ninja -DCMAKE_BUILD_TYPE=Release ${extra[@]+"${extra[@]}"}
-cmake --build "$build/full" --target libs --parallel "$jobs"
+cmake --build "$build/full" --target libs $parallel
 
 test -x "$build/relinker/core/relinker/relinker"
 test -f "$build/full/core/libs/libs/libkernel.prx"
